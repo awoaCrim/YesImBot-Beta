@@ -172,6 +172,36 @@ describe("send_message tool", () => {
     expect((tool.terminal as (input: unknown) => boolean)({ messages: ["hi"], continue: true })).toBe(false);
   });
 
+  it.each([
+    [{ messages: [] }, "messages is empty"],
+    [{ messages: [""] }, "messages must be non-empty strings"],
+    [{ messages: ["valid", 1] }, "messages must be non-empty strings"],
+    [{ messages: ["valid"], mode: "invalid" }, 'mode must be "element" or "raw"'],
+  ])("rejects invalid input before delivery (%j)", async (input, message) => {
+    const resources = await createResources();
+    const sendMessage = vi.fn(async () => ["message-1"]);
+    const tool = createSendMessageTool({ bot: { sendMessage } as never, channelId: "room", resources, pacing: PACING, innerThought: false });
+
+    await expect(tool.execute(input as never, { toolCallId: "call-1", turnId: "turn-1", abortSignal: undefined } as never)).resolves.toEqual({
+      ok: false,
+      error: { name: "InvalidInput", message },
+      sent: [],
+      failedAt: 0,
+    });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("uses the current channel when an empty channel is supplied", async () => {
+    const resources = await createResources();
+    const sendMessage = vi.fn(async () => ["message-1"]);
+    const tool = createSendMessageTool({ bot: { sendMessage } as never, channelId: "room", resources, pacing: PACING, innerThought: false });
+
+    await expect(
+      tool.execute({ messages: ["hello"], channel: "" } as never, { toolCallId: "call-1", turnId: "turn-1", abortSignal: undefined } as never),
+    ).resolves.toMatchObject({ ok: true });
+    expect(sendMessage).toHaveBeenCalledWith("room", expect.any(Array));
+  });
+
   it("omits the inner_thought field when the monologue protocol is disabled", async () => {
     const resources = await createResources();
     const tool = createSendMessageTool({
