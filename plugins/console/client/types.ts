@@ -1,6 +1,8 @@
 export interface ConversationRequest {
   channel: string;
   session: string;
+  limit?: number;
+  cursor?: string;
 }
 
 export interface ConversationSessionSummary {
@@ -90,7 +92,8 @@ export interface ConversationDetail {
   channel: string;
   session: string;
   entries: ConversationEntryView[];
-  truncated: boolean;
+  hasMore: boolean;
+  nextCursor?: string;
   summary: {
     messageCount: number;
     thoughtCount: number;

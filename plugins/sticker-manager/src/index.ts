@@ -65,10 +65,22 @@ export default class StickerManagerPlugin {
 
   private createAgentPlugin(scope: ChannelContext, bot: Bot, resources: ChannelResources, classifier: ModelStickerClassifier): AgentPlugin {
     const artifactIds = new Map<string, string>();
+    const sentTurnIds = new Set<string>();
     return {
       name: "sticker-manager",
       tools: () =>
-        createStickerTools({ store: this.store, classifier, sender: new BotStickerSender(bot, scope), assets: resources.assets, scope, config: this.config }),
+        createStickerTools({
+          store: this.store,
+          classifier,
+          sender: new BotStickerSender(bot, scope),
+          assets: resources.assets,
+          scope,
+          config: this.config,
+          sentTurnIds,
+        }),
+      onTurnFinish: (_result, context) => {
+        sentTurnIds.delete(context.turnId);
+      },
       onAppend: (entries) =>
         projectStickerElements(entries, {
           store: this.store,
@@ -105,15 +117,14 @@ function formatStickerPrompt(config: StickerConfig): string {
     "表情包能力由当前插件提供：",
     "- sticker_categories 查询分类和数量；",
     "- sticker_search 搜索可用表情包；",
-    "- sticker_steal 收藏当前消息中的图片；",
+    ...(config.enableSteal ? ["- sticker_steal 收藏当前消息中的图片；"] : []),
     "- sticker_send 发送指定或随机表情包。",
+    "同一轮最多实际发送一张表情包；成功调用 sticker_send 后，本轮不能再次发送。",
+    "如果本轮同时发送文字和表情包，先调用 send_message 并设置 continue=true，再调用 sticker_send；只发表情包时直接调用 sticker_send。",
     "不要自己编造或直接输出 artifact://、asset://、workspace:// 等资源 URI；这些 URI 只能由系统生成。",
     ...(config.tagMode ? ["- sticker_tags 查询实验性标签；sticker_send 可传多个 tags，并会从匹配分随机范围内发送。"] : []),
-    ...(config.stickerElement
-      ? ['也可以直接输出 <sticker id="..."/>、<sticker category="..."/> 或 <sticker tags="可爱,猫"/> 发送表情，不需要调用 sticker_send。']
-      : []),
-    config.stickerElement ? "需要发图时可直接输出 <sticker/>，或调用 sticker_send。" : "需要发图时调用 sticker_send。",
-    'sticker_search 返回的 id 只能用于 sticker_send 或 <sticker id="..."/>，不能拼成任何 URI。',
+    "发送表情包必须调用 sticker_send；不要直接输出 <sticker/>，它只用于内部历史投影，不会发送到平台。",
+    "sticker_search 返回的 id 只能传给 sticker_send，不能拼成任何 URI。",
     ...(config.sendStaticAsGif ? ["发送静态图片表情包时会自动转为单帧 GIF。"] : []),
     "不需要把返回的 id 当成可读内容发给用户。",
   ].join("\n");

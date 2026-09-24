@@ -10,8 +10,8 @@ Workspace tools for YesImBot agents, backed by `just-bash` and `bash-tool`.
 
 The default writable workspace is channel-isolated. On channel initialization
 the plugin obtains `ChannelResources` through `ctx.yesimbot.resource.get(scope)`
-and creates its `workspace/` child below `resources.path`. Shared scopes use
-`platform + channelId`; direct scopes also include `selfId`.
+and creates its `workspace/` child below `resources.path`. Set `sharedPath` when
+all enabled channels should intentionally use the same writable workspace.
 
 This plugin no longer exposes the previous default tool names
 `grep`, `glob`, `edit_file`, `read_file`, `write_file`, or `execute_command`.
@@ -22,6 +22,7 @@ tool-name-specific prompts to use `bash`, `readFile`, and `writeFile`.
 
 | Option          | Meaning                                                                                                 |
 | --------------- | ------------------------------------------------------------------------------------------------------- |
+| `sharedPath`    | Optional host path used as `/home/workspace` by every enabled channel.                                 |
 | `cwd`           | Virtual working directory used by `bash-tool`. Default: `/home/workspace`.                              |
 | `persistPaths`  | Extra writable host-backed mounts. Changes persist on the host.                                         |
 | `readOnlyPaths` | Read-only host-backed mounts. Reads succeed, writes fail.                                               |
@@ -29,10 +30,23 @@ tool-name-specific prompts to use `bash`, `readFile`, and `writeFile`.
 | `timeoutMs`     | Bash command timeout in milliseconds. Default: `30000`.                                                 |
 | `enableNetwork` | Enables `just-bash` network support. Default: `false`.                                                  |
 
-The writable workspace root comes from `ChannelResources.path`; the plugin
-does not derive a parallel channel identity.
+Without `sharedPath`, the writable workspace root comes from
+`ChannelResources.path`. With `sharedPath`, the configured path is resolved
+against Koishi's base directory and reused by every channel runtime.
 
 ## Examples
+
+### Shared workspace across channels
+
+```yaml
+sharedPath: data/yesimbot/shared-workspace
+bash:
+  cwd: /home/workspace
+```
+
+Every enabled channel can read and modify the same files. Do not place account
+credentials here unless every user who can invoke the agent in those channels
+is trusted.
 
 ### Private or group channel workspace
 

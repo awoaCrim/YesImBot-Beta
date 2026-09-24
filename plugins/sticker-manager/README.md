@@ -26,7 +26,7 @@ node scripts/setup-koishi.mjs --create-app ../my-koishi --start
 
 机器人自己会用这些能力：
 
-- 看到合适的图片时，自动收藏并分类。
+- 看到合适的图片时，自动收藏并分类（可用 `enableSteal` 关闭）。
 - 聊天需要表情包时，自动从库里找一张发出来。
 - 找不到分类时会告诉你，或问管理员先导入。
 
@@ -78,8 +78,11 @@ yesimbot.sticker.cleanup
 
 ## 常用设置
 
-一般只需要关心这两项：
+一般只需要关心这几项：
 
+- `enableSteal`
+  - `true`：默认值。机器人看到消息里的图片时，可以调用 `sticker_steal` 自己收藏、自动分类。
+  - `false`：关闭自动收藏。机器人仍可查询、搜索、发送已导入的表情包，管理员手动 `add` / `import` 等命令不受影响。
 - `scope`
   - `global`：所有频道共用一套表情包，默认值。
   - `channel`：每个频道各有一套表情包。
@@ -94,7 +97,7 @@ yesimbot.sticker.cleanup
 
 `tagMode` 默认关闭，属于实验性功能。开启后：
 
-- `sticker_steal` 收藏时会按分类自动打 tag。
+- `sticker_steal` 收藏时会按分类自动打 tag（`enableSteal` 关闭时该工具不提供）。
 - 新增 `sticker_tags` 工具，用于查询当前标签和数量。
 - `sticker_send` 可传多个 `tags`，会从匹配最多标签的表情包中随机发送。
 - `sticker_search` 支持按 `tags` 过滤。

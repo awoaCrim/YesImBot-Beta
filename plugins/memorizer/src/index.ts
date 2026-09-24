@@ -1,20 +1,21 @@
 import { resolve } from "node:path";
 
 import type { AgentPlugin } from "@yesimbot/agent-runtime";
-import { Schema, type Bot, type Context } from "koishi";
+import { Schema, type Bot, type Context, type Logger } from "koishi";
 import type { ChannelContext } from "koishi-plugin-yesimbot";
 
 import { runMaintenance } from "./maintainer.js";
 import { createChannelTools } from "./plugin.js";
 import { MemoryScheduler } from "./scheduler.js";
 import { runSearch } from "./searcher.js";
+import { createEmbeddingIndexer } from "./semantic.js";
 import { EvidenceStore } from "./store/evidence.js";
 import { MemoryStore } from "./store/memory.js";
 import { PendingStore } from "./store/pending.js";
 import type { MemorizerConfig } from "./types.js";
 
 export const Config: Schema<MemorizerConfig> = Schema.object({
-  model: Schema.dynamic("registry.chatModels").required(),
+  model: Schema.dynamic("registry.chatModels").default("").description("已弃用：记忆维护和搜索统一使用 YesImBot auxiliaryModel"),
   embeddingModel: Schema.dynamic("registry.embeddingModels").default(""),
   dataPath: Schema.string().default("data/yesimbot/memorizer"),
   batchDelayMs: Schema.number()
@@ -28,6 +29,11 @@ export const Config: Schema<MemorizerConfig> = Schema.object({
   halfLifeDays: Schema.number().min(1).default(90),
   forgottenGraceDays: Schema.number().min(1).default(30),
   maxActivePerScope: Schema.natural().min(1).default(1_000),
+  semanticMinSimilarity: Schema.number().min(0).max(1).default(0.35).description("语义召回的最低余弦相似度；低于该值且关键词未命中的记忆不会被召回"),
+  semanticBoostWeight: Schema.number().min(0).default(1).description("相似度对排序的影响强度：score = retention × confidence × (1 + weight × similarity)"),
+  semanticQueryPrefix: Schema.string().description(
+    "查询侧指令前缀。留空则按 embedding 模型自动选择（bge-*-zh 系列会自动加官方检索指令），显式填写空字符串可强制关闭。",
+  ),
 });
 
 const CHANNEL_MEMORY_PROMPT = `## 长期记忆工具
@@ -39,6 +45,7 @@ const CHANNEL_MEMORY_PROMPT = `## 长期记忆工具
 - 回复前快速获取相关背景（某人的偏好、身份、历史）
 - 确认某个事实是否已知
 - 参数建议：query 用关键名词，types 缩小范围，limit 控制数量
+- 换了说法、同义词或存在错别字时关键词会漏，此时加 semantic: true 做语义召回（会消耗一次 embedding 调用）
 
 ### remember — 提交记忆整理请求
 当对话中出现值得长期记住的信息时调用。后台 Maintainer 会批量处理。
@@ -75,6 +82,7 @@ export default class MemoryAgentPlugin {
   private readonly config: MemorizerConfig;
   private readonly pending: PendingStore;
   private readonly scheduler: MemoryScheduler;
+  private readonly logger: Logger;
   private disposeAgentPlugin?: () => void;
   private started = false;
 
@@ -83,8 +91,25 @@ export default class MemoryAgentPlugin {
     config: MemorizerConfig,
   ) {
     this.config = config;
+    this.logger = ctx.logger("yesimbot.memorizer");
     const root = resolve(ctx.baseDir, config.dataPath || "data/yesimbot/memorizer");
-    this.store = new MemoryStore(ctx);
+    const embeddingModelId = config.embeddingModel?.trim();
+    const indexer = embeddingModelId
+      ? createEmbeddingIndexer({
+          modelId: embeddingModelId,
+          queryPrefix: config.semanticQueryPrefix,
+          resolve: () => this.ctx.yesimbot.model.resolveEmbedding(embeddingModelId),
+          warn: (event, fields) => this.logger.warn(event, fields),
+        })
+      : undefined;
+    this.store = new MemoryStore(ctx, {
+      indexer,
+      halfLifeDays: config.halfLifeDays ?? 90,
+      semantic: {
+        minSimilarity: config.semanticMinSimilarity ?? 0.35,
+        boostWeight: config.semanticBoostWeight ?? 1,
+      },
+    });
     this.evidence = new EvidenceStore(root);
     this.pending = new PendingStore(root);
     this.scheduler = new MemoryScheduler(
@@ -97,7 +122,7 @@ export default class MemoryAgentPlugin {
           limit: this.config.maxMessagesPerBatch,
         });
         await runMaintenance({
-          model: this.ctx.yesimbot.model.resolveChatModel(this.config.model, channel).model,
+          model: this.ctx.yesimbot.model.resolveAuxiliaryModel("memory-summary", channel).model,
           context: channel,
           messages,
           store: this.store,
@@ -108,15 +133,20 @@ export default class MemoryAgentPlugin {
       },
       { maxPending: config.maxPendingPerBatch ?? 10, maxMessages: config.maxMessagesPerBatch ?? 300 },
       () =>
-        this.store.sweep(
-          Date.now(),
-          {
-            halfLifeDays: this.config.halfLifeDays ?? 90,
-            forgottenGraceDays: this.config.forgottenGraceDays ?? 30,
-            maxActivePerScope: this.config.maxActivePerScope ?? 1_000,
-          },
-          (id) => this.evidence.remove(id),
-        ),
+        this.store
+          .sweep(
+            Date.now(),
+            {
+              halfLifeDays: this.config.halfLifeDays ?? 90,
+              forgottenGraceDays: this.config.forgottenGraceDays ?? 30,
+              maxActivePerScope: this.config.maxActivePerScope ?? 1_000,
+            },
+            (id) => this.evidence.remove(id),
+          )
+          .then(async () => {
+            const indexed = await this.store.reindex();
+            if (indexed > 0) this.logger.info("memorizer.embedding_reindexed", { indexed, remaining: await this.store.missingEmbeddings() });
+          }),
     );
     ctx.on("ready", this.start.bind(this));
     ctx.on("dispose", this.stop.bind(this));
@@ -125,14 +155,12 @@ export default class MemoryAgentPlugin {
   public async start(): Promise<void> {
     if (this.started) return;
     await this.pending.init();
-    this.ctx.yesimbot.model.resolveChatModel(this.config.model);
     await this.scheduler.start();
     this.disposeAgentPlugin = this.ctx.yesimbot.agent.use(this);
     this.started = true;
   }
 
   public setup(context: ChannelContext, _bot: Bot): AgentPlugin {
-    const embeddingModel = this.config.embeddingModel ? this.ctx.yesimbot.model.resolveEmbedding(this.config.embeddingModel, context) : undefined;
     return {
       name: "memory-agent",
       appendSystemPrompt: () => CHANNEL_MEMORY_PROMPT,
@@ -142,10 +170,9 @@ export default class MemoryAgentPlugin {
           evidenceCount: (id) => this.evidence.count(id),
           readConversation: this.ctx.yesimbot.conversation.read,
           rearm: () => this.scheduler.arm(),
-          embeddingModel,
           search: (value, execution) =>
             runSearch({
-              model: this.ctx.yesimbot.model.resolveChatModel(this.config.model, context).model,
+              model: this.ctx.yesimbot.model.resolveAuxiliaryModel("utility", context).model,
               context,
               execution,
               store: this.store,

@@ -288,4 +288,47 @@ describe("turn lifecycle", () => {
     expect(JSON.stringify(seen)).toContain("before");
     expect(JSON.stringify(seen)).toContain("after");
   });
+
+  it("lets beforeModelRequest replace prepared messages before the provider call", async () => {
+    const seen: unknown[] = [];
+    const model = createTextModel();
+    const originalDoStream = model.doStream;
+    model.doStream = async (...args) => {
+      seen.push(args[0]);
+      return originalDoStream.apply(model, args);
+    };
+    const guard = vi.fn(async (context: Parameters<NonNullable<import("../src/agent.js").AgentConfig["beforeModelRequest"]>>[0]) => {
+      expect(context.messages).toEqual([{ role: "user", content: "hello" }]);
+      expect(context.currentMessageIds).toHaveLength(1);
+      return [...context.messages, { role: "system", content: "guarded" }];
+    });
+    const agent = createAgent({ model, beforeModelRequest: guard });
+
+    agent.send(createUserMessage("hello"));
+    await agent.wait();
+
+    expect(guard).toHaveBeenCalledOnce();
+    expect(JSON.stringify(seen)).toContain("guarded");
+  });
+
+  it("fails before the provider call when beforeModelRequest throws", async () => {
+    let calls = 0;
+    const model = createTextModel();
+    const originalDoStream = model.doStream;
+    model.doStream = async (...args) => {
+      calls += 1;
+      return originalDoStream.apply(model, args);
+    };
+    const agent = createAgent({
+      model,
+      beforeModelRequest: () => {
+        throw new Error("request blocked");
+      },
+    });
+
+    const events = await Array.fromAsync(agent.run(createUserMessage("hello")));
+
+    expect(calls).toBe(0);
+    expect(events.at(-1)).toMatchObject({ type: "turn.failed", error: { message: "request blocked" } });
+  });
 });

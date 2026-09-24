@@ -1,4 +1,4 @@
-import type { AgentPlugin } from "@yesimbot/agent-runtime";
+import type { AgentPlugin, EphemeralImageProjectionStore } from "@yesimbot/agent-runtime";
 import type { Awaitable, Bot, Context, Logger, Session } from "koishi";
 
 import type { ChannelContext } from "../channels/index.js";
@@ -6,8 +6,14 @@ import { defaultWillEngine, type WillEngine, type WillPlugin } from "./will.js";
 
 type Disposer = () => void;
 
+export interface ChannelPluginSetupContext {
+  readonly imageProjection: EphemeralImageProjectionStore;
+  /** True when an active polisher owns style rendering, so role prompts must not reach the main Agent. */
+  readonly polisherActive: boolean;
+}
+
 export interface ChannelPlugin {
-  setup(context: ChannelContext, bot: Bot): Awaitable<AgentPlugin | null>;
+  setup(context: ChannelContext, bot: Bot, runtime?: ChannelPluginSetupContext): Awaitable<AgentPlugin | null>;
 }
 
 export class Agents {
@@ -16,6 +22,7 @@ export class Agents {
 
   private readonly plugins = new Set<ChannelPlugin>();
   private readonly willPlugins = new Set<WillPlugin>();
+  private revisionValue = 0;
 
   public constructor(ctx: Context, config: { logLevel?: number } = {}) {
     this.ctx = ctx;
@@ -23,21 +30,35 @@ export class Agents {
     this.logger.level = config.logLevel ?? 2;
   }
 
+  public get revision(): number {
+    return this.revisionValue;
+  }
+
   public use(plugin: ChannelPlugin): Disposer {
-    this.plugins.add(plugin);
-    return () => this.plugins.delete(plugin);
+    if (!this.plugins.has(plugin)) {
+      this.plugins.add(plugin);
+      this.revisionValue += 1;
+    }
+    return () => {
+      if (this.plugins.delete(plugin)) this.revisionValue += 1;
+    };
   }
 
   public will(plugin: WillPlugin): Disposer {
-    this.willPlugins.add(plugin);
-    return () => this.willPlugins.delete(plugin);
+    if (!this.willPlugins.has(plugin)) {
+      this.willPlugins.add(plugin);
+      this.revisionValue += 1;
+    }
+    return () => {
+      if (this.willPlugins.delete(plugin)) this.revisionValue += 1;
+    };
   }
 
-  public async setup(context: ChannelContext, bot: Bot): Promise<AgentPlugin[]> {
+  public async setup(context: ChannelContext, bot: Bot, runtime?: ChannelPluginSetupContext): Promise<AgentPlugin[]> {
     const initialized: AgentPlugin[] = [];
     try {
       for (const plugin of this.plugins) {
-        const result = await plugin.setup(context, bot);
+        const result = await plugin.setup(context, bot, runtime);
         if (result) initialized.push(result);
       }
       return initialized;
@@ -72,4 +93,15 @@ export class Agents {
   }
 }
 
-export type { WillDebug, WillEngine, WillPlugin, WillState } from "./will.js";
+export type { WillBatchDecision, WillDebug, WillEngine, WillPlugin, WillReservationOutcome, WillState } from "./will.js";
+
+export {
+  createSendMessagePolisher,
+  extractProtectedTokens,
+  PolisherRegistry,
+  validatePolishedMessages,
+  type MessagePolisherCapability,
+  type PolisherPromptProfile,
+  type PolisherRequest,
+  type RolePromptProfileProvider,
+} from "./polisher.js";

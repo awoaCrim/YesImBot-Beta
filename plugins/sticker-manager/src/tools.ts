@@ -17,6 +17,7 @@ export interface StickerToolsOptions {
   assets: AssetStore;
   scope: ChannelContext;
   config: StickerConfig;
+  sentTurnIds: Set<string>;
 }
 
 interface StealStickerInput {
@@ -39,7 +40,7 @@ interface SearchStickerInput {
 }
 
 export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
-  const { store, classifier, sender, assets, scope, config } = options;
+  const { store, classifier, sender, assets, scope, config, sentTurnIds } = options;
   const scopeKey = scopeKeyFor(scope, config);
 
   const stealTool: AgentTool<StealStickerInput, ToolResult> = {
@@ -105,9 +106,14 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
 
   const sendTool: AgentTool<SendStickerInput, ToolResult> = {
     name: "sticker_send",
+    terminal: true,
     description: [
       "发送一个已收藏的表情包。",
+      "是否调用本工具由当前回复决定；不需要发送表情包时可以不调用。",
+      "同一轮最多实际发送一张；本轮成功发送后再次调用会返回 sticker_send_limit_reached。",
+      "不传 sticker_id、category、index、tags 时会随机选择一张；也可以选择不调用本工具。",
       "可用 sticker_categories 和 sticker_search 查询；sticker_id 优先，也可按 category 随机或按 index 指定。",
+      "如果本轮还要发送文字，必须先让 send_message 使用 continue=true，再调用本工具；本工具调用后会结束本轮。",
       ...(config.sendStaticAsGif ? ["静态图片会自动转成单帧 GIF 后发送。"] : []),
       ...(config.tagMode ? [`也可仅传 tags 选择多个标签，并从匹配分范围内的表情包中随机发送。${config.fuzzyTagMatch ? "tag 默认支持模糊匹配。" : ""}`] : []),
     ].join("\n"),
@@ -132,7 +138,9 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
       },
       additionalProperties: false,
     }),
-    execute: async ({ sticker_id, category, index, tags }) => {
+    execute: async ({ sticker_id, category, index, tags }, execution) => {
+      if (sentTurnIds.has(execution.turnId)) return { ok: false, error: "sticker_send_limit_reached" };
+
       try {
         let sticker: StickerProjection;
         if (sticker_id) {
@@ -157,6 +165,7 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
         const bytes = await store.readBytes(sticker);
         const prepared = prepareStaticGif(bytes, sticker.mime, config.sendStaticAsGif);
         await sender.send({ bytes: prepared.bytes, mediaType: prepared.mediaType });
+        sentTurnIds.add(execution.turnId);
         await store.markUsed(scopeKey, sticker.id);
         return {
           ok: true,
@@ -173,7 +182,9 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
 
   const categoriesTool: AgentTool<Record<string, never>, ToolResult> = {
     name: "sticker_categories",
-    description: "列出当前可见的表情包分类和每类数量，用于选择 sticker_steal 或 sticker_send 的分类。",
+    description: config.enableSteal
+      ? "列出当前可见的表情包分类和每类数量，用于选择 sticker_steal 或 sticker_send 的分类。"
+      : "列出当前可见的表情包分类和每类数量，用于选择 sticker_send 的分类。",
     inputSchema: jsonSchema<Record<string, never>>({ type: "object", additionalProperties: false }),
     execute: async () => {
       const categories = await store.listCategories(scopeKey);
@@ -197,7 +208,7 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
     name: "sticker_search",
     description: [
       "搜索当前可见的表情包，返回紧凑 id 列表，供 sticker_send 使用。",
-      'sticker_search 只用于查询；确定目标后调用 sticker_send，或在启用 sticker 元素时输出 <sticker id="..."/>。',
+      "sticker_search 只用于查询；确定目标后必须调用 sticker_send。",
       "绝不能把返回的 id 拼成 artifact:// 等资源 URI。",
       ...(config.tagMode ? ["实验性 tag 模式开启时，可按 tags 过滤。"] : []),
     ].join("\n"),
@@ -228,7 +239,7 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
     },
   };
 
-  return [stealTool, sendTool, categoriesTool, searchTool, ...(tagsTool ? [tagsTool] : [])];
+  return [...(config.enableSteal ? [stealTool] : []), sendTool, categoriesTool, searchTool, ...(tagsTool ? [tagsTool] : [])];
 }
 
 export async function pickBestTaggedSticker(

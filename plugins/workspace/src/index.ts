@@ -12,6 +12,7 @@ import { formatWorkspacePrompt } from "./prompt";
 import { formatSkillsForPrompt, loadSkills, type Skill } from "./skills";
 import type { MountSpec, SandboxBashConfig, WorkspacePluginConfig } from "./types";
 import { type SandboxWorkspaceConfig, Workspace } from "./workspace";
+import { resolveSharedWorkspaceRoot } from "./workspace-root";
 
 const SKILL_SCHEME_PROMPT = "读取已注册技能文件：skill://<skill-name>/<relative-path>。执行技能脚本请使用 /skills/<skill-name>/... 虚拟路径。";
 const WORKSPACE_SCHEME_PROMPT =
@@ -23,6 +24,7 @@ export default class WorkspacePlugin {
   public static inject = ["yesimbot"];
 
   public static Config: Schema<WorkspacePluginConfig> = Schema.object({
+    sharedPath: Schema.path({ allowCreate: true }).description("所有频道共用的工作区宿主路径；留空时按频道隔离"),
     bash: Schema.object({
       cwd: Schema.string().default("/home/workspace").description("虚拟文件系统默认目录"),
       mounts: Schema.array(
@@ -57,6 +59,7 @@ export default class WorkspacePlugin {
   private skillCatalog: readonly Skill[] = [];
   private sandbox?: SandboxBashConfig;
   private normalizedMounts?: readonly NormalizedMountSpec[];
+  private sharedWorkspaceRoot?: string;
   private disposeAgentPlugin?: () => void;
   private disposeReaders: Array<() => void> = [];
 
@@ -76,6 +79,8 @@ export default class WorkspacePlugin {
     for (const dispose of this.disposeReaders.splice(0)) dispose();
 
     const sandbox = this.getSandboxConfig();
+    const sharedWorkspaceRoot = resolveSharedWorkspaceRoot(this.ctx.baseDir, this.config.sharedPath);
+    if (sharedWorkspaceRoot) await mkdir(sharedWorkspaceRoot, { recursive: true });
     const skillPaths = (this.config.skillPaths ?? []).map((path) => resolve(this.ctx.baseDir, path));
     const loadResult = await loadSkills({ skillPaths, cwd: this.ctx.baseDir });
     for (const diagnostic of loadResult.diagnostics) {
@@ -96,23 +101,19 @@ export default class WorkspacePlugin {
 
     this.skillCatalog = skillCatalog;
     this.sandbox = sandbox;
-    const owner = this;
+    this.sharedWorkspaceRoot = sharedWorkspaceRoot;
     if (skillCatalog.length > 0) {
       const skillReader: ResourceReader = {
         scheme: "skill",
         prompt: SKILL_SCHEME_PROMPT,
-        setup(resources, uri, options) {
-          return owner.openSkillFromCatalog(skillCatalog, resources, uri, options);
-        },
+        setup: (resources, uri, options) => this.openSkillFromCatalog(skillCatalog, resources, uri, options),
       };
       this.disposeReaders.push(this.ctx.yesimbot.resource.use(skillReader));
     }
     const workspaceReader: ResourceReader = {
       scheme: "workspace",
       prompt: WORKSPACE_SCHEME_PROMPT,
-      setup(resources, uri, options) {
-        return owner.openWorkspace(resources, uri, options);
-      },
+      setup: (resources, uri, options) => this.openWorkspace(resources, uri, options),
     };
     this.disposeReaders.push(this.ctx.yesimbot.resource.use(workspaceReader));
     this.disposeAgentPlugin = this.ctx.yesimbot.agent.use(this);
@@ -126,12 +127,13 @@ export default class WorkspacePlugin {
     const resources = await this.ctx.yesimbot.resource.get(scope);
     const runtimeSkills = this.skillCatalog.map((skill) => ({ ...skill }));
     const runtimeMounts = this.normalizedMounts;
+    const shared = this.sharedWorkspaceRoot !== undefined;
     return {
       name: "workspace",
-      tools: async () => createBashToolSet(await this.getOrCreateWorkspace(scope, resources, sandbox, runtimeMounts)),
+      tools: async () => createBashToolSet(await this.getOrCreateWorkspace(resources, sandbox, runtimeMounts)),
       appendSystemPrompt: async () => {
-        const workspace = await this.getOrCreateWorkspace(scope, resources, sandbox, runtimeMounts);
-        return [formatWorkspacePrompt(workspace), formatSkillsForPrompt(runtimeSkills)].filter(Boolean);
+        const workspace = await this.getOrCreateWorkspace(resources, sandbox, runtimeMounts);
+        return [formatWorkspacePrompt(workspace, { shared }), formatSkillsForPrompt(runtimeSkills)].filter(Boolean);
       },
     } satisfies AgentPlugin;
   }
@@ -143,17 +145,17 @@ export default class WorkspacePlugin {
     this.workspaces.clear();
     this.skillCatalog = [];
     this.sandbox = undefined;
+    this.sharedWorkspaceRoot = undefined;
     this.logger.info("Workspace plugin stopped");
   }
 
   private async getOrCreateWorkspace(
-    channel: ChannelContext,
     resources: ChannelResources,
     sandbox: SandboxBashConfig,
     mounts: readonly NormalizedMountSpec[] | undefined,
   ): Promise<Workspace> {
-    const key = JSON.stringify(channel.type === "direct" ? [channel.platform, channel.selfId, channel.channelId] : [channel.platform, channel.channelId]);
-    const existing = this.workspaces.get(key);
+    const workspaceRoot = this.resolveWorkspaceRoot(resources);
+    const existing = this.workspaces.get(workspaceRoot);
     if (existing) {
       return existing;
     }
@@ -162,13 +164,16 @@ export default class WorkspacePlugin {
       throw new Error("Workspace plugin has not been started");
     }
 
-    const workspaceRoot = join(resources.path, "workspace");
     await mkdir(workspaceRoot, { recursive: true });
 
     const workspace = await Workspace.create(this.createWorkspaceConfig(workspaceRoot, sandbox, mounts));
     await workspace.init();
-    this.workspaces.set(key, workspace);
+    this.workspaces.set(workspaceRoot, workspace);
     return workspace;
+  }
+
+  private resolveWorkspaceRoot(resources: ChannelResources): string {
+    return this.sharedWorkspaceRoot ?? join(resources.path, "workspace");
   }
 
   private createWorkspaceConfig(root: string, sandbox: SandboxBashConfig, mounts: readonly NormalizedMountSpec[]): SandboxWorkspaceConfig {
@@ -229,7 +234,7 @@ export default class WorkspacePlugin {
   ): Promise<{ bytes: Uint8Array; mediaType?: string; filename?: string }> {
     const relativePath = parseWorkspaceUri(uri.href);
     if (!relativePath) throw new Error("Invalid workspace URI");
-    const root = join(resources.path, "workspace");
+    const root = this.resolveWorkspaceRoot(resources);
     const resolved = resolve(root, relativePath);
     if (!isPathContained(root, resolved)) {
       throw new Error("Workspace path escapes its root");

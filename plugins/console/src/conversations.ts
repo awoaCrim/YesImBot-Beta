@@ -1,4 +1,4 @@
-import { readFile, readdir, stat } from "node:fs/promises";
+import { open, readFile, readdir, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { DataService } from "@koishijs/console";
@@ -7,12 +7,21 @@ import { Context } from "koishi";
 import { formatElements } from "koishi-plugin-yesimbot";
 
 const REFRESH_INTERVAL = 10_000;
+const DEFAULT_SESSION_PAGE_SIZE = 10;
+const MAX_SESSION_PAGE_SIZE = 10;
+const BACKWARD_READ_CHUNK_BYTES = 64 * 1024;
+const SESSION_CURSOR_VERSION = 1;
 const MAX_SESSION_ENTRIES = 3_000;
 const MAX_ASSET_DATA_URL_BYTES = 1024 * 1024;
 const COMPLETE_ASSET_ID = /^[a-f0-9]{32}$/;
 const SESSION_FILE = /^[0-9A-Za-zTZ_-]+\.jsonl$/;
 
-export interface ConversationRequest {
+export interface ConversationPageRequest {
+  readonly limit?: number;
+  readonly cursor?: string;
+}
+
+export interface ConversationRequest extends ConversationPageRequest {
   readonly channel: string;
   readonly session: string;
 }
@@ -100,11 +109,15 @@ export interface ConversationAssetView {
   readonly dataUrl?: string;
 }
 
-export interface ConversationDetail {
+export interface ConversationPage {
+  readonly entries: ConversationEntryView[];
+  readonly hasMore: boolean;
+  readonly nextCursor?: string;
+}
+
+export interface ConversationDetail extends ConversationPage {
   readonly channel: string;
   readonly session: string;
-  readonly entries: ConversationEntryView[];
-  readonly truncated: boolean;
   readonly summary: {
     readonly messageCount: number;
     readonly thoughtCount: number;
@@ -151,6 +164,11 @@ interface RawMessage {
   readonly finishReason?: unknown;
 }
 
+interface LocatedJsonLine {
+  readonly start: number;
+  readonly text: string;
+}
+
 declare module "@koishijs/console" {
   namespace Console {
     interface Services {
@@ -186,7 +204,11 @@ export class ConversationsProvider extends DataService<ConversationIndex> {
   }
 }
 
-export async function parseConversationJsonl(content: string, session: string, channelRoot: string): Promise<{ entries: ConversationEntryView[]; truncated: boolean }> {
+export async function parseConversationJsonl(
+  content: string,
+  session: string,
+  channelRoot: string,
+): Promise<{ entries: ConversationEntryView[]; truncated: boolean }> {
   const entries: ConversationEntryView[] = [];
   let sequence = 0;
   let truncated = false;
@@ -209,10 +231,21 @@ export async function parseConversationJsonl(content: string, session: string, c
   return { entries, truncated };
 }
 
-async function buildConversationIndex(ctx: Context): Promise<ConversationIndex> {
+export async function readConversationPage(
+  filePath: string,
+  session: string,
+  channelRoot: string,
+  request: ConversationPageRequest = {},
+): Promise<ConversationPage> {
+  const info = await stat(filePath);
+  if (!info.isFile()) throw new Error("Session file not found");
+  return readSessionEntries(filePath, session, channelRoot, request, info.size);
+}
+
+export async function buildConversationIndex(ctx: Context): Promise<ConversationIndex> {
   const channelsPath = resolveChannelsPath(ctx);
   const will = collectWillPolicies(ctx);
-  const channels = await scanChannelSummaries(channelsPath, will.policies);
+  const channels = await scanChannelSummaries(ctx, channelsPath, will.policies);
   return {
     generatedAt: new Date().toISOString(),
     channels,
@@ -310,34 +343,36 @@ function channelField(context: ChannelMatchContext, key: string): string | boole
   }
 }
 
-async function scanChannelSummaries(channelsPath: string, policies: readonly ConversationWillPolicy[]): Promise<ConversationChannelSummary[]> {
+async function scanChannelSummaries(ctx: Context, channelsPath: string, policies: readonly ConversationWillPolicy[]): Promise<ConversationChannelSummary[]> {
   const entries = await readdir(channelsPath, { withFileTypes: true }).catch(() => []);
   const channels: ConversationChannelSummary[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
     const root = join(channelsPath, entry.name);
-      const manifest = await readChannelManifest(join(root, "channel.json"));
-      if (!manifest) continue;
-      const sessions = await scanSessionSummaries(join(root, "sessions"));
-      const matchContext: ChannelMatchContext = {
-        platform: manifest.platform,
-        channelId: manifest.channelId ?? manifest.guildId ?? "",
-        guildId: manifest.guildId,
-        selfId: manifest.selfId,
-        userId: manifest.userId,
-        type: manifest.type,
-        isDirect: manifest.type === "direct",
-      };
-      channels.push({
+    const manifest = await readChannelManifest(join(root, "channel.json"));
+    if (!manifest) continue;
+    const sessionsPath = join(root, "sessions");
+    const sessions = await scanSessionSummaries(sessionsPath);
+    const activeSession = sessions.find((session) => session.isActive)?.filename ?? null;
+    const matchContext: ChannelMatchContext = {
+      platform: manifest.platform,
+      channelId: manifest.channelId ?? manifest.guildId ?? "",
+      guildId: manifest.guildId,
+      selfId: manifest.selfId,
+      userId: manifest.userId,
+      type: manifest.type,
+      isDirect: manifest.type === "direct",
+    };
+    channels.push({
       key: entry.name,
       type: manifest.type,
       platform: manifest.platform,
-      channelId: manifest.channelId ?? manifest.guildId ?? "",
+      channelId: matchContext.channelId,
       guildId: manifest.guildId,
       userId: manifest.userId,
       selfId: manifest.selfId,
       createdAt: manifest.createdAt,
-      activeSession: sessions.find((session) => session.isActive)?.filename ?? null,
+      activeSession,
       sessions,
       totalSizeBytes: sessions.reduce((sum, session) => sum + session.size, 0),
       lastActivityAt: sessions.reduce<number | null>((latest, session) => {
@@ -401,29 +436,139 @@ async function readConversationDetail(ctx: Context, request: ConversationRequest
   if (!sessionPath) throw new Error("Invalid session");
   const info = await stat(sessionPath);
   if (!info.isFile()) throw new Error("Session file not found");
-  const parsed = await readSessionEntries(sessionPath, request.session, channelPath);
+  const parsed = await readSessionEntries(sessionPath, request.session, channelPath, request, info.size);
   return {
     channel: request.channel,
     session: request.session,
     entries: parsed.entries,
-    truncated: parsed.truncated,
-    summary: {
-      messageCount: parsed.entries.filter((entry) => entry.kind === "user" || entry.kind === "assistant").length,
-      thoughtCount: parsed.entries.filter((entry) => entry.kind === "thought").length,
-      toolCallCount: parsed.entries.filter((entry) => entry.kind === "tool-call").length,
-      errorCount: parsed.entries.filter((entry) => entry.kind === "event" && entry.eventType?.includes("failed")).length,
-      sizeBytes: info.size,
-    },
+    hasMore: parsed.hasMore,
+    nextCursor: parsed.nextCursor,
+    summary: summarizeConversationEntries(parsed.entries, info.size),
   };
 }
 
-async function readSessionEntries(filePath: string, session: string, channelRoot: string): Promise<{ entries: ConversationEntryView[]; truncated: boolean }> {
-  const content = await readFile(filePath, "utf8");
-  return parseConversationJsonl(content, session, channelRoot);
+async function readSessionEntries(
+  filePath: string,
+  session: string,
+  channelRoot: string,
+  request: ConversationPageRequest,
+  fileSize: number,
+): Promise<ConversationPage> {
+  const limit = normalizeSessionPageSize(request.limit);
+  const endOffset = decodeSessionCursor(request.cursor, fileSize);
+  const lines = await readBackwardJsonlLines(filePath, endOffset, limit + 1);
+  const hasMore = lines.length > limit;
+  const pageLines = hasMore ? lines.slice(0, limit) : lines;
+  const entries: ConversationEntryView[] = [];
+
+  for (const line of [...pageLines].reverse()) {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(line.text) as unknown;
+    } catch {
+      continue;
+    }
+    entries.push(...(await parseRawEntry(raw, session, line.start, channelRoot)));
+  }
+
+  return {
+    entries,
+    hasMore,
+    nextCursor: hasMore ? encodeSessionCursor(pageLines.at(-1)?.start ?? 0) : undefined,
+  };
 }
 
-async function parseRawEntry(raw: unknown, session: string, sequence: number, channelRoot: string): Promise<ConversationEntryView[]> {
-  const entry = raw as RawEntry;
+async function readBackwardJsonlLines(filePath: string, endOffset: number, maxLines: number): Promise<LocatedJsonLine[]> {
+  const handle = await open(filePath, "r");
+  try {
+    const lines: LocatedJsonLine[] = [];
+    let scanEnd = endOffset;
+    let buffer = Buffer.alloc(0);
+
+    while (scanEnd > 0 && lines.length < maxLines) {
+      const start = Math.max(0, scanEnd - BACKWARD_READ_CHUNK_BYTES);
+      const chunk = Buffer.alloc(scanEnd - start);
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, start);
+      if (!bytesRead) break;
+      buffer = Buffer.concat([chunk.subarray(0, bytesRead), buffer]);
+
+      let cursor = buffer.length;
+      while (lines.length < maxLines) {
+        while (cursor > 0 && buffer[cursor - 1] === 0x0a) cursor -= 1;
+        if (cursor === 0) break;
+
+        const lineEnd = cursor;
+        const delimiter = buffer.lastIndexOf(0x0a, lineEnd - 1);
+        if (delimiter < 0) {
+          if (start === 0 && !isBlankJsonLine(buffer.subarray(0, lineEnd))) {
+            lines.push({ start, text: buffer.subarray(0, lineEnd).toString("utf8") });
+            cursor = 0;
+          }
+          break;
+        }
+
+        const lineStart = delimiter + 1;
+        const line = buffer.subarray(lineStart, lineEnd);
+        if (!isBlankJsonLine(line)) {
+          lines.push({ start: start + lineStart, text: line.toString("utf8") });
+        }
+        cursor = delimiter;
+      }
+
+      if (lines.length >= maxLines) break;
+      buffer = buffer.subarray(0, cursor);
+      scanEnd = start;
+    }
+
+    return lines;
+  } finally {
+    await handle.close();
+  }
+}
+
+function isBlankJsonLine(line: Uint8Array): boolean {
+  return Buffer.from(line).toString("utf8").trim().length === 0;
+}
+
+function normalizeSessionPageSize(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_SESSION_PAGE_SIZE;
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error("Invalid conversation limit");
+  return Math.min(value, MAX_SESSION_PAGE_SIZE);
+}
+
+function encodeSessionCursor(offset: number): string {
+  return Buffer.from(JSON.stringify({ version: SESSION_CURSOR_VERSION, offset }), "utf8").toString("base64url");
+}
+
+function decodeSessionCursor(cursor: string | undefined, fileSize: number): number {
+  if (cursor === undefined) return fileSize;
+  if (typeof cursor !== "string" || cursor.length === 0 || cursor.length > 512) throw new Error("Invalid conversation cursor");
+  try {
+    const decoded = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as unknown;
+    const payload = objectValue(decoded);
+    const offset = payload?.offset;
+    if (payload?.version !== SESSION_CURSOR_VERSION || typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0 || offset > fileSize) {
+      throw new Error("Invalid conversation cursor");
+    }
+    return offset;
+  } catch {
+    throw new Error("Invalid conversation cursor");
+  }
+}
+
+function summarizeConversationEntries(entries: ConversationEntryView[], sizeBytes: number): ConversationDetail["summary"] {
+  return {
+    messageCount: entries.filter((entry) => entry.kind === "user" || entry.kind === "assistant").length,
+    thoughtCount: entries.filter((entry) => entry.kind === "thought").length,
+    toolCallCount: entries.filter((entry) => entry.kind === "tool-call").length,
+    errorCount: entries.filter((entry) => entry.kind === "event" && entry.eventType?.includes("failed")).length,
+    sizeBytes,
+  };
+}
+
+async function parseRawEntry(raw: unknown, session: string, sequence: number | string, channelRoot: string): Promise<ConversationEntryView[]> {
+  const entry = objectValue(raw) as RawEntry | undefined;
+  if (!entry) return [];
   const timestamp = numberValue(entry.timestamp) ?? Date.now();
   const id = `${sequence}-${stringValue(entry.id) ?? sequence}`;
   const groupKey = stringValue(entry.id) ?? String(sequence);
@@ -471,7 +616,8 @@ async function parseMessageEntry(
   base: { id: string; timestamp: number; groupKey: string; sourceSession: string },
   channelRoot: string,
 ): Promise<ConversationEntryView[]> {
-  const message = raw as RawMessage;
+  const message = objectValue(raw) as RawMessage | undefined;
+  if (!message) return [];
   if (message.role === "custom") return parseCustomMessage(message, base, channelRoot);
   if (message.role === "user") {
     const text = extractText(message.content);
@@ -484,7 +630,14 @@ async function parseMessageEntry(
       result.push({ ...base, id: `${base.id}-thought-${result.length}`, kind: "thought", text: thought });
     }
     if (visibleText) {
-      result.push({ ...base, id: `${base.id}-assistant`, kind: "assistant", text: visibleText, usage: message.usage, finishReason: stringValue(message.finishReason) });
+      result.push({
+        ...base,
+        id: `${base.id}-assistant`,
+        kind: "assistant",
+        text: visibleText,
+        usage: message.usage,
+        finishReason: stringValue(message.finishReason),
+      });
     }
     result.push(...parseToolCalls(message.content, base));
     return result;
@@ -570,9 +723,26 @@ async function resolveAssetViews(elements: unknown[], channelRoot: string): Prom
 function detectImageType(bytes: Uint8Array): string {
   if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
   if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
-  if (bytes.length >= 6 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38 && (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61)
+  if (
+    bytes.length >= 6 &&
+    bytes[0] === 0x47 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x38 &&
+    (bytes[4] === 0x37 || bytes[4] === 0x39) &&
+    bytes[5] === 0x61
+  )
     return "image/gif";
-  if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50)
+  if (
+    bytes.length >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  )
     return "image/webp";
   return "application/octet-stream";
 }
@@ -737,3 +907,5 @@ function diagnosticError(value: Record<string, unknown> | undefined): { name?: s
     message: stringValue(error.message),
   };
 }
+
+export { readConversationDetail };

@@ -23,6 +23,7 @@ const config: StickerConfig = {
   tagRandomRange: 1,
   sendStaticAsGif: true,
   stickerElement: true,
+  enableSteal: true,
 };
 
 const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
@@ -58,18 +59,61 @@ function createDeps(overrides: Partial<StickerConfig> = {}) {
   const classifier: StickerClassifier = { classify: vi.fn(async () => ({ category: "meme", tags: ["搞笑"] })) };
   const sender: StickerSender = { send: vi.fn(async () => undefined) };
   const assets: AssetStore = { put: vi.fn(async () => "a".repeat(32)), get: vi.fn(async () => pngBytes), clear: vi.fn(async () => undefined) };
-  const tools = createStickerTools({ store: store as unknown as StickerStore, classifier, sender, assets, scope, config: effectiveConfig });
-  return { store, classifier, sender, assets, tools };
+  const sentTurnIds = new Set<string>();
+  const tools = createStickerTools({ store: store as unknown as StickerStore, classifier, sender, assets, scope, config: effectiveConfig, sentTurnIds });
+  return { store, classifier, sender, assets, sentTurnIds, tools };
 }
 
-async function execute(tool: AgentTool, input: unknown): Promise<unknown> {
-  return tool.execute!(input, { abortSignal: undefined } as never);
+async function execute(tool: AgentTool, input: unknown, turnId = "turn-1"): Promise<unknown> {
+  return tool.execute!(input, { abortSignal: undefined, turnId } as never);
+}
+
+function toolNames(tools: AgentTool[]): Set<string> {
+  return new Set(tools.map((tool) => tool.name));
+}
+
+function toolByName(tools: AgentTool[], name: string): AgentTool {
+  const tool = tools.find((candidate) => candidate.name === name);
+  if (!tool) throw new Error(`missing tool: ${name}`);
+  return tool;
 }
 
 describe("sticker agent tools", () => {
-  it("exposes the expected sticker tool names", () => {
-    const { tools } = createDeps();
-    expect(tools.map((tool) => tool.name)).toEqual(["sticker_steal", "sticker_send", "sticker_categories", "sticker_search"]);
+  it("keeps the legacy tool set while stealing is enabled", () => {
+    const { tools } = createDeps({ enableSteal: true });
+    expect(toolNames(tools)).toEqual(new Set(["sticker_steal", "sticker_send", "sticker_categories", "sticker_search"]));
+  });
+
+  it("marks sticker_send as terminal because the tool performs platform delivery", () => {
+    const { tools } = createDeps({ enableSteal: false });
+
+    expect(toolByName(tools, "sticker_send").terminal).toBe(true);
+  });
+
+  it("hides sticker_steal but keeps sending, categories and search when stealing is disabled", async () => {
+    const deps = createDeps({ enableSteal: false });
+    expect(toolNames(deps.tools)).toEqual(new Set(["sticker_send", "sticker_categories", "sticker_search"]));
+    expect(deps.tools.map((tool) => tool.description).join("\n")).not.toContain("sticker_steal");
+    expect(toolByName(deps.tools, "sticker_search").description).toContain("必须调用 sticker_send");
+    expect(toolByName(deps.tools, "sticker_search").description).not.toContain("<sticker");
+
+    const sendResult = await execute(toolByName(deps.tools, "sticker_send"), {});
+    expect(deps.sender.send).toHaveBeenCalledWith({ bytes: pngBytes, mediaType: "image/png" });
+    expect(deps.store.markUsed).toHaveBeenCalledWith("global", "a".repeat(64));
+    expect(sendResult).toMatchObject({ ok: true, category: "meme" });
+
+    deps.store.listCategories.mockResolvedValue([{ category: "meme", count: 1 }]);
+    const categoriesResult = await execute(toolByName(deps.tools, "sticker_categories"), {});
+    expect(categoriesResult).toMatchObject({ ok: true, categories: [{ category: "meme", count: 1 }] });
+
+    const searchResult = await execute(toolByName(deps.tools, "sticker_search"), { category: "meme" });
+    expect(deps.store.search).toHaveBeenCalledWith("global", { category: "meme" });
+    expect(searchResult).toMatchObject({ ok: true, stickers: [{ id: "a".repeat(64), category: "meme" }] });
+  });
+
+  it("keeps the tagMode tool set unchanged when stealing is disabled", () => {
+    const { tools } = createDeps({ enableSteal: false, tagMode: true });
+    expect(toolNames(tools)).toEqual(new Set(["sticker_send", "sticker_categories", "sticker_search", "sticker_tags"]));
   });
 
   it("exposes sticker_tags only in experimental tag mode", () => {
@@ -169,11 +213,77 @@ describe("sticker agent tools", () => {
   it("sticker_send sends the selected sticker and records usage", async () => {
     const deps = createDeps();
     deps.store.get.mockResolvedValue(projection());
-    const [, sendTool] = deps.tools;
+    const sendTool = toolByName(deps.tools, "sticker_send");
     const result = await execute(sendTool, { sticker_id: "a".repeat(64) });
     expect(deps.sender.send).toHaveBeenCalledWith({ bytes: pngBytes, mediaType: "image/png" });
     expect(deps.store.markUsed).toHaveBeenCalledWith("global", "a".repeat(64));
     expect(result).toMatchObject({ ok: true, category: "meme" });
+  });
+
+  it("allows only one successful sticker send per turn", async () => {
+    const deps = createDeps();
+    const sendTool = toolByName(deps.tools, "sticker_send");
+
+    const first = await execute(sendTool, {}, "turn-1");
+    const second = await execute(sendTool, {}, "turn-1");
+
+    expect(first).toMatchObject({ ok: true });
+    expect(second).toEqual({ ok: false, error: "sticker_send_limit_reached" });
+    expect(deps.sender.send).toHaveBeenCalledOnce();
+    expect(deps.store.markUsed).toHaveBeenCalledOnce();
+  });
+
+  it("allows sticker sends in different turns", async () => {
+    const deps = createDeps();
+    const sendTool = toolByName(deps.tools, "sticker_send");
+
+    await execute(sendTool, {}, "turn-1");
+    const second = await execute(sendTool, {}, "turn-2");
+
+    expect(second).toMatchObject({ ok: true });
+    expect(deps.sender.send).toHaveBeenCalledTimes(2);
+    expect(deps.store.markUsed).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not claim a turn when sticker sending fails", async () => {
+    const deps = createDeps();
+    deps.sender.send.mockRejectedValueOnce(new Error("send_failed"));
+    const sendTool = toolByName(deps.tools, "sticker_send");
+
+    const first = await execute(sendTool, {}, "turn-1");
+    const second = await execute(sendTool, {}, "turn-1");
+
+    expect(first).toEqual({ ok: false, error: "send_failed" });
+    expect(second).toMatchObject({ ok: true });
+    expect(deps.sender.send).toHaveBeenCalledTimes(2);
+    expect(deps.store.markUsed).toHaveBeenCalledOnce();
+  });
+
+  it("claims a turn before usage accounting completes", async () => {
+    const deps = createDeps();
+    deps.store.markUsed.mockRejectedValueOnce(new Error("usage_failed"));
+    const sendTool = toolByName(deps.tools, "sticker_send");
+
+    const first = await execute(sendTool, {}, "turn-1");
+    const second = await execute(sendTool, {}, "turn-1");
+
+    expect(first).toEqual({ ok: false, error: "usage_failed" });
+    expect(second).toEqual({ ok: false, error: "sticker_send_limit_reached" });
+    expect(deps.sender.send).toHaveBeenCalledOnce();
+    expect(deps.store.markUsed).toHaveBeenCalledOnce();
+  });
+
+  it("does not claim a turn when sticker selection fails", async () => {
+    const deps = createDeps();
+    deps.store.random.mockResolvedValueOnce(null);
+    const sendTool = toolByName(deps.tools, "sticker_send");
+
+    const first = await execute(sendTool, {}, "turn-1");
+    const second = await execute(sendTool, {}, "turn-1");
+
+    expect(first).toEqual({ ok: false, error: "sticker_not_found" });
+    expect(second).toMatchObject({ ok: true });
+    expect(deps.sender.send).toHaveBeenCalledOnce();
   });
 
   it("sticker_send converts a static PNG to a single-frame GIF", async () => {

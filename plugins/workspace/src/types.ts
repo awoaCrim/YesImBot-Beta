@@ -20,6 +20,7 @@ export interface SandboxBashConfig {
 }
 
 export interface WorkspacePluginConfig {
+  readonly sharedPath?: string;
   readonly bash?: SandboxBashConfig;
   readonly skillPaths?: string[];
 }

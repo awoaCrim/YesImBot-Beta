@@ -48,7 +48,7 @@ function createContext() {
   const artifactPut = vi.fn(async (bytes: Uint8Array, metadata: { mediaType?: string; filename?: string }) => {
     void bytes;
     void metadata;
-    return "artifact://tools-snap/019d3b7e-1bd0-7e4f-9c5d-5bf3fd41f1d4";
+    return "artifact://tools-listSnapshots/019d3b7e-1bd0-7e4f-9c5d-5bf3fd41f1d4";
   });
   const artifactForTool = vi.fn(() => ({ put: artifactPut }));
   const ctx = {
@@ -69,7 +69,7 @@ function createContext() {
   return { ctx, disposers, plugins, artifactForTool, artifactPut };
 }
 
-function createClient(toolNames: string[] = ["snap"]) {
+function createClient(toolNames: string[] = ["listSnapshots"]) {
   return {
     callTool: vi.fn(),
     close: vi.fn(async () => undefined),
@@ -78,7 +78,7 @@ function createClient(toolNames: string[] = ["snap"]) {
   };
 }
 
-async function buildPlugin(serverName = "tools", toolNames: string[] = ["snap"]) {
+async function buildPlugin(serverName = "tools", toolNames: string[] = ["listSnapshots"]) {
   const { ctx, plugins, artifactForTool, artifactPut } = createContext();
   const client = createClient(toolNames);
   mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn(async () => undefined) } });
@@ -102,10 +102,10 @@ describe("McpClientPlugin media outputs", () => {
 
     expect(modelOutput).toMatchObject({ type: "text" });
     const value = (modelOutput as { value: string }).value;
-    expect(value).toContain("artifact://tools-snap/019d3b7e-1bd0-7e4f-9c5d-5bf3fd41f1d4");
+    expect(value).toContain("artifact://tools-listSnapshots/019d3b7e-1bd0-7e4f-9c5d-5bf3fd41f1d4");
     expect(value).not.toContain("iVBORw0KGgo");
     expect(value).not.toContain("base64");
-    expect(artifactForTool).toHaveBeenCalledWith("tools-snap");
+    expect(artifactForTool).toHaveBeenCalledWith("tools-listSnapshots");
     const [bytes, metadata] = artifactPut.mock.calls[0]!;
     expect([...bytes]).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
     expect(metadata).toEqual({ mediaType: "image/png", filename: "mcp-image" });

@@ -1,4 +1,4 @@
-import type { AgentPlugin } from "@yesimbot/agent-runtime";
+import type { AgentPlugin, AgentTool } from "@yesimbot/agent-runtime";
 import { describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -94,9 +94,20 @@ function createClient(toolBatches: string[][]) {
   };
 }
 
-async function resolveToolNames(plugin: AgentPlugin): Promise<string[]> {
+async function resolveTools(plugin: AgentPlugin): Promise<AgentTool[]> {
   const tools = typeof plugin.tools === "function" ? await plugin.tools({} as never) : plugin.tools;
-  return tools?.map((tool) => tool.name) ?? [];
+  return tools ?? [];
+}
+
+async function resolveToolNames(plugin: AgentPlugin): Promise<string[]> {
+  return (await resolveTools(plugin)).map((tool) => tool.name);
+}
+
+function outputText(output: unknown): string {
+  if (!Array.isArray(output)) throw new Error(`expected MCP content array, received ${typeof output}`);
+  const block = output[0] as { type?: unknown; text?: unknown };
+  if (block?.type !== "text" || typeof block.text !== "string") throw new Error("expected a single MCP text block");
+  return block.text;
 }
 describe("mcp-client tool registry", () => {
   it("refreshes stable tools when a server reports tool list changes", async () => {
@@ -120,6 +131,35 @@ describe("mcp-client tool registry", () => {
     expect(ctx.yesimbot.agent.use).toHaveBeenCalledTimes(2);
     expect(await resolveToolNames(await plugins[1]!.setup(channelScope, {} as never))).toEqual(["docs-gamma"]);
   });
+  it("invalidates pending confirmations when a catalog refresh publishes replacement tools", async () => {
+    const { client, emitToolListChanged } = createClient([["createOrder"], ["createOrder"]]);
+    client.callTool.mockResolvedValue({ content: [{ text: "upstream", type: "text" }] });
+    const { ctx, plugins } = createContext();
+    mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
+
+    const plugin = new McpClientPlugin(ctx as never, { mcpServers: { luckin: { type: "http", url: "https://example.test/mcp" } } });
+    await plugin.start();
+
+    const channelScope = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as never;
+    const firstTools = await resolveTools(await plugins[0]!.setup(channelScope, {} as never));
+    const firstTool = firstTools.find((tool) => tool.name === "luckin-createOrder");
+    if (!firstTool) throw new Error("initial side-effect tool missing");
+
+    const blocked = await firstTool.execute({}, { messages: [] } as never);
+    const code = /确认短码: ([A-Z0-9]{6})/.exec(outputText(blocked))?.[1];
+    if (!code) throw new Error("initial confirmation code missing");
+
+    await emitToolListChanged();
+
+    const refreshedTools = await resolveTools(await plugins[1]!.setup(channelScope, {} as never));
+    const refreshedTool = refreshedTools.find((tool) => tool.name === "luckin-createOrder");
+    if (!refreshedTool) throw new Error("refreshed side-effect tool missing");
+
+    const replay = await refreshedTool.execute({}, { messages: [{ content: `确认 ${code}`, role: "user" }] } as never);
+    expect(outputText(replay)).toContain("confirmation_required");
+    expect(client.callTool).not.toHaveBeenCalled();
+  });
+
   it("disambiguates exposed names after sanitization", async () => {
     const { client } = createClient([["search/tool", "search.tool"]]);
     const { ctx, plugins } = createContext();

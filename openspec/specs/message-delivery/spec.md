@@ -50,9 +50,30 @@ A rejected passive or active send MUST call `fail()` on the producing ChannelRun
 ### Requirement: Empty Turn Delivers Nothing
 When a producing runtime yields no renderable output, Messenger MUST send no platform message and MUST emit no delivery-failure record.
 
-### Requirement: Current-Bot Send Tool
-Core MUST provide the Agent's current-Bot send tool with an explicit channel ID. A resolved `Bot.sendMessage()` string array, including an empty array, MUST count as successful completion; a rejected send MUST surface as an error to the tool.
+#### Scenario: Turn has no renderable output
+- **WHEN** the producing runtime completes without a deliverable segment
+- **THEN** Messenger MUST not call a platform send API
 
+### Requirement: Current-Bot Send Tool
+Core MUST provide the Agent's current-Bot send tool with an explicit channel ID. A resolved `Bot.sendMessage()` string array, including an empty array, MUST count as successful tool completion; a rejected send MUST surface as an error to the tool.
+
+#### Scenario: Platform returns an empty ID list
+- **WHEN** `Bot.sendMessage()` resolves with an empty array
+- **THEN** the tool MUST report successful completion with zero delivered IDs
+
+### Requirement: Delivery-Confirmed Will Reservation
+
+Tool completion MUST NOT by itself confirm a willingness reservation. Core MUST confirm only on the first `send_message.onDelivered` callback for the producing turn, current conversation channel, and a non-empty platform message ID. At least one successful segment commits even when a later segment fails. Empty ID arrays, all-failed sends, cross-channel delivery, and model text without a send MUST leave the turn unconfirmed so its terminal path releases the reservation.
+
+#### Scenario: Partial send
+
+- **WHEN** the first segment returns a platform message ID and a later segment fails
+- **THEN** Core MUST commit the reservation exactly once using the first ID
+
+#### Scenario: Successful tool with zero IDs
+
+- **WHEN** `send_message` completes with an empty message ID array
+- **THEN** Core MUST release the reservation at turn completion
 
 ### Requirement: Resource source preparation before delivery
 Core MUST prepare recognized `asset://`, `artifact://`, and `workspace://` sources in `img` and `file` elements before passive Gateway delivery, autonomous Bot delivery, or the current-Bot active send tool reaches a platform adapter. Core MUST resolve each source within the producing channel scope, validate its media and delivery limits, and materialize only a representation supported by that platform. Core MUST preserve unrecognized structured elements without URI recovery or an element whitelist.
@@ -78,3 +99,10 @@ The Core `sendMessage` tool description MUST state that `img` and `file` source 
 - **WHEN** Core cannot resolve one recognized resource source in an output segment
 - **THEN** Core MUST omit only that unavailable media reference
 - **AND** it MUST preserve sibling output content and record a safe diagnostic without a host path, source URL, or raw bytes
+
+### Requirement: Fresh Terminal Settlement Retry
+Core MAY cache one in-flight reservation settlement Promise, but MUST clear a rejected settlement so terminal cleanup can make a fresh bounded retry. A delivery-confirmed commit outcome MUST remain the terminal retry outcome even when the turn later reports failure.
+#### Scenario: Delivery-time settlement exhausts transient retries
+- **WHEN** the first current-channel delivery is real but its immediate bounded settlement attempts all reject transiently
+- **THEN** terminal cleanup MUST make a fresh bounded commit attempt rather than reusing the rejected Promise
+- **AND** it MUST NOT convert the confirmed delivery into a release

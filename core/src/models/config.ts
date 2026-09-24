@@ -36,6 +36,7 @@ export interface BaseProviderConfig {
 
 export interface ModelServiceConfig {
   basePath: string;
+  auxiliaryModel?: string;
   logLevel?: number;
 }
 

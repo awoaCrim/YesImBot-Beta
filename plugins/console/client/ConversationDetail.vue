@@ -20,8 +20,13 @@
             {{ detail.summary.messageCount }} 条消息 · {{ detail.summary.thoughtCount }} 次思考 · {{ detail.summary.toolCallCount }} 次工具调用 ·
             {{ detail.summary.errorCount }} 个错误
           </p>
+          <p class="yib-detail__order-hint">上方是旧记录，下方是新记录；打开后默认定位到最新记录。</p>
         </div>
-        <span v-if="detail?.truncated" class="yib-truncated-badge">只显示最近 {{ detail.entries.length }} 条</span>
+        <div v-if="detail" class="yib-pagination-summary">
+          <span>已加载 {{ detail.entries.length }} 条显示记录</span>
+          <span v-if="detail.hasMore">还可以加载更早记录</span>
+          <span v-else>已到最早记录</span>
+        </div>
       </header>
 
       <section class="yib-toolbar">
@@ -64,163 +69,181 @@
         <span>正在读取会话…</span>
       </section>
 
-      <section v-else-if="turnGroups.length" class="yib-graph-list">
-        <article v-for="group in turnGroups" :key="group.id" class="yib-turn-graph">
-          <div class="yib-turn-graph__body">
-            <ol class="yib-main-thread">
-              <li v-for="node in visibleMainNodes(group)" :key="node.id" class="yib-main-node" :class="[`is-${node.kind}`, { 'is-error': node.error }]">
-                <div class="yib-main-node__marker">
-                  <svg v-if="node.kind === 'user'" class="yib-svg-icon" viewBox="0 0 24 24">
-                    <path
-                      fill="currentColor"
-                      d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4s-4 1.79-4 4s1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"
-                    />
-                  </svg>
-                  <svg v-else-if="node.kind === 'assistant'" class="yib-svg-icon" viewBox="0 0 24 24">
-                    <path
-                      fill="currentColor"
-                      d="M20 2H4c-1.1 0-1.99.9-1.99 2L2 22l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM6 9h12v2H6V9zm8 5H6v-2h8v2zm4-6H6V6h12v2z"
-                    />
-                  </svg>
-                  <svg v-else-if="node.kind === 'thought'" class="yib-svg-icon" viewBox="0 0 24 24">
-                    <path
-                      fill="currentColor"
-                      d="M12 3c-4.97 0-9 4.03-9 9c0 2.12.74 4.07 1.97 5.61L4.35 21l3.68-.61C9.41 20.76 10.67 21 12 21c4.97 0 9-4.03 9-9s-4.03-9-9-9zm0 16c-1.18 0-2.31-.25-3.34-.73l-.24-.11l-2.47.41l.41-2.47l-.11-.24A6.98 6.98 0 0 1 5 12c0-3.86 3.14-7 7-7s7 3.14 7 7s-3.14 7-7 7z"
-                    />
-                  </svg>
-                  <svg v-else-if="node.kind === 'tool-call'" class="yib-svg-icon" viewBox="0 0 24 24">
-                    <path fill="currentColor" d="M9.4 16.6L4.8 12l4.6-4.6L8 6l-6 6l6 6l1.4-1.4zm5.2 0l4.6-4.6l-4.6-4.6L16 6l6 6l-6 6l-1.4-1.4z" />
-                  </svg>
-                  <svg v-else-if="node.kind === 'tool-result'" class="yib-svg-icon" viewBox="0 0 24 24">
-                    <path
-                      v-if="node.error"
-                      fill="currentColor"
-                      d="M19 6.41L17.59 5L12 10.59L6.41 5L5 6.41L10.59 12L5 17.59L6.41 19L12 13.41L17.59 19L19 17.59L13.41 12z"
-                    />
-                    <path v-else fill="currentColor" d="M9 16.17L4.83 12l-1.42 1.41L9 19L21 7l-1.41-1.41z" />
-                  </svg>
-                  <svg v-else class="yib-svg-icon" viewBox="0 0 24 24">
-                    <path
-                      fill="currentColor"
-                      d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8s8 3.59 8 8s-3.59 8-8 8z"
-                    />
-                  </svg>
-                </div>
+      <section v-else-if="detail" ref="timelineScroller" class="yib-timeline-scroll" @scroll.passive="handleTimelineScroll">
+        <div class="yib-timeline-scroll__content">
+          <section class="yib-pagination-bar yib-pagination-bar--top">
+            <button v-if="detail.hasMore" type="button" :disabled="loadingMore || loading" @click="loadMore">
+              {{ loadingMore ? "正在加载更早记录…" : `加载更早 ${CONVERSATION_PAGE_SIZE} 条` }}
+            </button>
+            <span v-if="detail.hasMore && !loadingMore">上滑到顶部会自动加载更早记录</span>
+            <span v-else-if="!detail.hasMore">已到最早记录</span>
+          </section>
 
-                <div class="yib-main-node__content">
-                  <div class="yib-main-node__label">
-                    <strong>{{ mainNodeTitle(node) }}</strong>
-                    <time>{{ formatTime(node.timestamp) }}</time>
-                  </div>
-
-                  <details v-if="node.thought" class="yib-thought-card" open>
-                    <summary class="yib-thought-card__head">
-                      <svg class="yib-svg-icon" viewBox="0 0 24 24">
+          <section v-if="turnGroups.length" class="yib-graph-list">
+            <article v-for="group in turnGroups" :key="group.id" class="yib-turn-graph">
+              <div class="yib-turn-graph__body">
+                <ol class="yib-main-thread">
+                  <li v-for="node in visibleMainNodes(group)" :key="node.id" class="yib-main-node" :class="[`is-${node.kind}`, { 'is-error': node.error }]">
+                    <div class="yib-main-node__marker">
+                      <svg v-if="node.kind === 'user'" class="yib-svg-icon" viewBox="0 0 24 24">
                         <path
                           fill="currentColor"
-                          d="M9 21c0 .55.45 1 1 1h4c.55 0 1-.45 1-1v-1H9v1zm3-19C8.14 2 5 5.14 5 9c0 2.38 1.19 4.47 3 5.74V17c0 .55.45 1 1 1h6c.55 0 1-.45 1-1v-2.26c1.81-1.27 3-3.36 3-5.74c0-3.86-3.14-7-7-7z"
+                          d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4s-4 1.79-4 4s1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"
                         />
                       </svg>
-                      <span>思考过程</span>
-                    </summary>
-                    <div class="yib-thought-card__body">
-                      {{ node.thought }}
+                      <svg v-else-if="node.kind === 'assistant'" class="yib-svg-icon" viewBox="0 0 24 24">
+                        <path
+                          fill="currentColor"
+                          d="M20 2H4c-1.1 0-1.99.9-1.99 2L2 22l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM6 9h12v2H6V9zm8 5H6v-2h8v2zm4-6H6V6h12v2z"
+                        />
+                      </svg>
+                      <svg v-else-if="node.kind === 'thought'" class="yib-svg-icon" viewBox="0 0 24 24">
+                        <path
+                          fill="currentColor"
+                          d="M12 3c-4.97 0-9 4.03-9 9c0 2.12.74 4.07 1.97 5.61L4.35 21l3.68-.61C9.41 20.76 10.67 21 12 21c4.97 0 9-4.03 9-9s-4.03-9-9-9zm0 16c-1.18 0-2.31-.25-3.34-.73l-.24-.11l-2.47.41l.41-2.47l-.11-.24A6.98 6.98 0 0 1 5 12c0-3.86 3.14-7 7-7s7 3.14 7 7s-3.14 7-7 7z"
+                        />
+                      </svg>
+                      <svg v-else-if="node.kind === 'tool-call'" class="yib-svg-icon" viewBox="0 0 24 24">
+                        <path fill="currentColor" d="M9.4 16.6L4.8 12l4.6-4.6L8 6l-6 6l6 6l1.4-1.4zm5.2 0l4.6-4.6l-4.6-4.6L16 6l6 6l-6 6l-1.4-1.4z" />
+                      </svg>
+                      <svg v-else-if="node.kind === 'tool-result'" class="yib-svg-icon" viewBox="0 0 24 24">
+                        <path
+                          v-if="node.error"
+                          fill="currentColor"
+                          d="M19 6.41L17.59 5L12 10.59L6.41 5L5 6.41L10.59 12L5 17.59L6.41 19L12 13.41L17.59 19L19 17.59L13.41 12z"
+                        />
+                        <path v-else fill="currentColor" d="M9 16.17L4.83 12l-1.42 1.41L9 19L21 7l-1.41-1.41z" />
+                      </svg>
+                      <svg v-else class="yib-svg-icon" viewBox="0 0 24 24">
+                        <path
+                          fill="currentColor"
+                          d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8s8 3.59 8 8s-3.59 8-8 8z"
+                        />
+                      </svg>
                     </div>
-                  </details>
 
-                  <div v-if="node.reply" class="yib-reply-card">
-                    <div class="yib-reply-card__body">
-                      {{ node.reply }}
+                    <div class="yib-main-node__content">
+                      <div class="yib-main-node__label">
+                        <strong>{{ mainNodeTitle(node) }}</strong>
+                        <time>{{ formatTime(node.timestamp) }}</time>
+                      </div>
+
+                      <details v-if="node.thought" class="yib-thought-card" open>
+                        <summary class="yib-thought-card__head">
+                          <svg class="yib-svg-icon" viewBox="0 0 24 24">
+                            <path
+                              fill="currentColor"
+                              d="M9 21c0 .55.45 1 1 1h4c.55 0 1-.45 1-1v-1H9v1zm3-19C8.14 2 5 5.14 5 9c0 2.38 1.19 4.47 3 5.74V17c0 .55.45 1 1 1h6c.55 0 1-.45 1-1v-2.26c1.81-1.27 3-3.36 3-5.74c0-3.86-3.14-7-7-7z"
+                            />
+                          </svg>
+                          <span>思考过程</span>
+                        </summary>
+                        <div class="yib-thought-card__body">
+                          {{ node.thought }}
+                        </div>
+                      </details>
+
+                      <div v-if="node.reply" class="yib-reply-card">
+                        <div class="yib-reply-card__body">
+                          {{ node.reply }}
+                        </div>
+                      </div>
+
+                      <p v-if="node.kind === 'user' && node.text" class="yib-user-text">{{ node.text }}</p>
+                      <p v-if="node.kind === 'compact' && node.text" class="yib-compact-text">{{ node.text }}</p>
+
+                      <div v-if="node.assets?.length" class="yib-asset-grid">
+                        <a
+                          v-for="asset in node.assets"
+                          :key="asset.id"
+                          class="yib-asset"
+                          :href="asset.dataUrl"
+                          :download="asset.kind === 'file' ? asset.title || asset.id : undefined"
+                          target="_blank"
+                          :title="asset.id"
+                        >
+                          <img v-if="asset.kind === 'image' && asset.dataUrl" :src="asset.dataUrl" :alt="asset.id" />
+                          <span v-else-if="asset.kind === 'image'" class="yib-asset__placeholder">图片</span>
+                          <span v-else class="yib-asset__placeholder">{{ asset.title || "文件" }}</span>
+                          <small>{{ formatSize(asset.size) }}</small>
+                        </a>
+                      </div>
+
+                      <div v-if="node.kind === 'will'" class="yib-will-box">
+                        <span class="yib-decision-badge" :class="node.decision === 'trigger' ? 'is-trigger' : 'is-wait'">
+                          {{ node.decision === "trigger" ? "触发" : "等待" }}
+                        </span>
+                        <details v-if="node.willDebug !== undefined">
+                          <summary>策略参数</summary>
+                          <pre>{{ prettyJson(node.willDebug) }}</pre>
+                        </details>
+                      </div>
+
+                      <div v-if="node.kind === 'event'" class="yib-event-box">
+                        <span class="yib-mono">{{ node.eventType }}</span>
+                        <span v-if="node.error?.message" class="yib-error-text">{{ node.error.message }}</span>
+                      </div>
+
+                      <div v-if="node.kind === 'tool-call'" class="yib-tool-box">
+                        <div class="yib-tool-box__head">
+                          <span class="yib-tool-badge is-call">工具调用</span>
+                          <span class="yib-mono">{{ node.toolName || "Tool" }}</span>
+                        </div>
+                        <details class="yib-code-box" open>
+                          <summary>参数</summary>
+                          <pre>{{ prettyJson(node.args) }}</pre>
+                        </details>
+                      </div>
+
+                      <div v-else-if="node.kind === 'tool-result'" class="yib-tool-box" :class="{ 'is-error': node.error }">
+                        <div class="yib-tool-box__head">
+                          <span class="yib-tool-badge" :class="node.error ? 'is-error' : 'is-success'">
+                            {{ node.error ? "工具异常" : "工具结果" }}
+                          </span>
+                          <span class="yib-mono">{{ node.toolName || "Tool" }}</span>
+                        </div>
+                        <div v-if="node.error?.message" class="yib-error-text">{{ node.error.message }}</div>
+                        <details v-else-if="node.result !== undefined" class="yib-code-box" open>
+                          <summary>返回结果</summary>
+                          <pre>{{ prettyJson(node.result) }}</pre>
+                        </details>
+                        <div v-else class="yib-tool-box__pending">等待工具返回...</div>
+                      </div>
                     </div>
-                  </div>
+                  </li>
+                </ol>
+              </div>
+            </article>
+          </section>
 
-                  <p v-if="node.kind === 'user' && node.text" class="yib-user-text">{{ node.text }}</p>
-                  <p v-if="node.kind === 'compact' && node.text" class="yib-compact-text">{{ node.text }}</p>
-
-                  <div v-if="node.assets?.length" class="yib-asset-grid">
-                    <a
-                      v-for="asset in node.assets"
-                      :key="asset.id"
-                      class="yib-asset"
-                      :href="asset.dataUrl"
-                      :download="asset.kind === 'file' ? asset.title || asset.id : undefined"
-                      target="_blank"
-                      :title="asset.id"
-                    >
-                      <img v-if="asset.kind === 'image' && asset.dataUrl" :src="asset.dataUrl" :alt="asset.id" />
-                      <span v-else-if="asset.kind === 'image'" class="yib-asset__placeholder">图片</span>
-                      <span v-else class="yib-asset__placeholder">{{ asset.title || "文件" }}</span>
-                      <small>{{ formatSize(asset.size) }}</small>
-                    </a>
-                  </div>
-
-                  <div v-if="node.kind === 'will'" class="yib-will-box">
-                    <span class="yib-decision-badge" :class="node.decision === 'trigger' ? 'is-trigger' : 'is-wait'">
-                      {{ node.decision === "trigger" ? "触发" : "等待" }}
-                    </span>
-                    <details v-if="node.willDebug !== undefined">
-                      <summary>策略参数</summary>
-                      <pre>{{ prettyJson(node.willDebug) }}</pre>
-                    </details>
-                  </div>
-
-                  <div v-if="node.kind === 'event'" class="yib-event-box">
-                    <span class="yib-mono">{{ node.eventType }}</span>
-                    <span v-if="node.error?.message" class="yib-error-text">{{ node.error.message }}</span>
-                  </div>
-
-                  <div v-if="node.kind === 'tool-call'" class="yib-tool-box">
-                    <div class="yib-tool-box__head">
-                      <span class="yib-tool-badge is-call">工具调用</span>
-                      <span class="yib-mono">{{ node.toolName || "Tool" }}</span>
-                    </div>
-                    <details class="yib-code-box" open>
-                      <summary>参数</summary>
-                      <pre>{{ prettyJson(node.args) }}</pre>
-                    </details>
-                  </div>
-
-                  <div v-else-if="node.kind === 'tool-result'" class="yib-tool-box" :class="{ 'is-error': node.error }">
-                    <div class="yib-tool-box__head">
-                      <span class="yib-tool-badge" :class="node.error ? 'is-error' : 'is-success'">
-                        {{ node.error ? "工具异常" : "工具结果" }}
-                      </span>
-                      <span class="yib-mono">{{ node.toolName || "Tool" }}</span>
-                    </div>
-                    <div v-if="node.error?.message" class="yib-error-text">{{ node.error.message }}</div>
-                    <details v-else-if="node.result !== undefined" class="yib-code-box" open>
-                      <summary>返回结果</summary>
-                      <pre>{{ prettyJson(node.result) }}</pre>
-                    </details>
-                    <div v-else class="yib-tool-box__pending">等待工具返回...</div>
-                  </div>
-                </div>
-              </li>
-            </ol>
-          </div>
-        </article>
+          <section v-else class="yib-empty-state">当前过滤条件下没有记录。</section>
+        </div>
       </section>
-
-      <section v-else-if="detail" class="yib-empty-state">当前过滤条件下没有记录。</section>
     </div>
   </k-layout>
 </template>
 
 <script lang="ts" setup>
 import { send } from "@koishijs/client";
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
 import type { ConversationAssetView, ConversationDetail as DetailPayload, ConversationEntryView, ConversationRequest } from "./types";
 
 const route = useRoute();
 const router = useRouter();
+const CONVERSATION_PAGE_SIZE = 10;
+const TIMELINE_LOAD_THRESHOLD = 120;
 const detail = ref<DetailPayload>();
 const loading = ref(false);
 const error = ref("");
 const query = ref("");
 const filter = ref<"all" | "chat" | "thought" | "tool" | "event">("all");
+const loadingMore = ref(false);
+const loadedOlderPages = ref(false);
+const timelineScroller = ref<HTMLElement | null>(null);
 let timer: number | undefined;
+let loadGeneration = 0;
 
 const filters = [
   { value: "all", label: "全部" },
@@ -261,19 +284,119 @@ interface MainNode {
   result?: unknown;
 }
 
-async function load(): Promise<void> {
+async function loadLatest(reset = false): Promise<void> {
   if (!channel.value || !sessionName.value) return;
+  if ((loading.value || loadingMore.value) && !reset) return;
+  const generation = ++loadGeneration;
+  const wasAtBottom = isAtBottom(timelineScroller.value);
+  if (reset) {
+    loadedOlderPages.value = false;
+    loadingMore.value = false;
+    detail.value = undefined;
+  }
+  const preserveLoadedPages = !reset && loadedOlderPages.value && Boolean(detail.value);
   loading.value = true;
   error.value = "";
   try {
-    const request: ConversationRequest = { channel: channel.value, session: sessionName.value };
+    const request: ConversationRequest = { channel: channel.value, session: sessionName.value, limit: CONVERSATION_PAGE_SIZE };
     const requestDetail = send as unknown as (type: "yesimbot/conversation", input: ConversationRequest) => Promise<DetailPayload>;
-    detail.value = await requestDetail("yesimbot/conversation", request);
+    const latest = await requestDetail("yesimbot/conversation", request);
+    if (generation !== loadGeneration) return;
+    if (!preserveLoadedPages || !detail.value) {
+      detail.value = latest;
+      await nextTick();
+      scrollToBottom();
+    } else {
+      const entries = mergeEntries(detail.value.entries, latest.entries);
+      detail.value = {
+        ...detail.value,
+        entries,
+        summary: summarizeEntries(entries, latest.summary.sizeBytes),
+      };
+      if (wasAtBottom) {
+        await nextTick();
+        scrollToBottom();
+      }
+    }
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause);
+    if (generation === loadGeneration) error.value = cause instanceof Error ? cause.message : String(cause);
   } finally {
-    loading.value = false;
+    if (generation === loadGeneration) loading.value = false;
   }
+}
+
+async function loadMore(): Promise<void> {
+  const current = detail.value;
+  if (!current?.hasMore || !current.nextCursor || loading.value || loadingMore.value) return;
+  const generation = loadGeneration;
+  const scroller = timelineScroller.value;
+  const previousScrollTop = scroller?.scrollTop ?? 0;
+  const previousScrollHeight = scroller?.scrollHeight ?? 0;
+  loadingMore.value = true;
+  error.value = "";
+  try {
+    const request: ConversationRequest = {
+      channel: channel.value,
+      session: sessionName.value,
+      limit: CONVERSATION_PAGE_SIZE,
+      cursor: current.nextCursor,
+    };
+    const requestDetail = send as unknown as (type: "yesimbot/conversation", input: ConversationRequest) => Promise<DetailPayload>;
+    const older = await requestDetail("yesimbot/conversation", request);
+    if (generation !== loadGeneration || detail.value !== current) return;
+    const entries = mergeEntries(older.entries, current.entries);
+    detail.value = {
+      ...current,
+      entries,
+      hasMore: older.hasMore,
+      nextCursor: older.nextCursor,
+      summary: summarizeEntries(entries, older.summary.sizeBytes),
+    };
+    loadedOlderPages.value = true;
+    await nextTick();
+    if (scroller) {
+      scroller.scrollTop = previousScrollTop + Math.max(0, scroller.scrollHeight - previousScrollHeight);
+    }
+  } catch (cause) {
+    if (generation === loadGeneration) error.value = cause instanceof Error ? cause.message : String(cause);
+  } finally {
+    loadingMore.value = false;
+  }
+}
+
+function handleTimelineScroll(event: Event): void {
+  const element = event.currentTarget as HTMLElement | null;
+  if (!element || element.scrollTop > TIMELINE_LOAD_THRESHOLD) return;
+  void loadMore();
+}
+
+function isAtBottom(element: HTMLElement | null): boolean {
+  if (!element) return false;
+  return element.scrollHeight - element.clientHeight - element.scrollTop <= TIMELINE_LOAD_THRESHOLD;
+}
+
+function scrollToBottom(): void {
+  const element = timelineScroller.value;
+  if (element) element.scrollTop = element.scrollHeight;
+}
+
+function mergeEntries(first: ConversationEntryView[], second: ConversationEntryView[]): ConversationEntryView[] {
+  const seen = new Set<string>();
+  return [...first, ...second].filter((entry) => {
+    if (seen.has(entry.id)) return false;
+    seen.add(entry.id);
+    return true;
+  });
+}
+
+function summarizeEntries(entries: ConversationEntryView[], sizeBytes: number): DetailPayload["summary"] {
+  return {
+    messageCount: entries.filter((entry) => entry.kind === "user" || entry.kind === "assistant").length,
+    thoughtCount: entries.filter((entry) => entry.kind === "thought").length,
+    toolCallCount: entries.filter((entry) => entry.kind === "tool-call").length,
+    errorCount: entries.filter((entry) => entry.kind === "event" && entry.eventType?.includes("failed")).length,
+    sizeBytes,
+  };
 }
 
 function visibleMainNodes(group: TurnGroup): MainNode[] {
@@ -364,7 +487,10 @@ function buildTurnGroups(entries: ConversationEntryView[]): TurnGroup[] {
       group.mainNodes.push(main);
       continue;
     }
-    group ??= createGroup(entry);
+    if (!group) {
+      group = createGroup(entry);
+      groups.push(group);
+    }
     if (entry.kind === "thought" || entry.kind === "assistant") {
       if (main && (main.kind === "thought" || main.kind === "assistant") && main.groupKey && entry.groupKey && main.groupKey === entry.groupKey) {
         mergeEntry(main, entry);
@@ -379,6 +505,14 @@ function buildTurnGroups(entries: ConversationEntryView[]): TurnGroup[] {
     main = undefined;
   }
   return groups;
+}
+
+function shortenId(value: string): string {
+  return value.length <= 20 ? value : `${value.slice(0, 10)}…${value.slice(-8)}`;
+}
+
+function shortenFingerprint(value: string): string {
+  return value.length <= 24 ? value : `${value.slice(0, 16)}…${value.slice(-8)}`;
 }
 
 function formatTime(value: number): string {
@@ -416,12 +550,14 @@ function goBack(): void {
   }
 }
 
-watch([channel, sessionName], load);
+watch([channel, sessionName], () => {
+  void loadLatest(true);
+});
 
 onMounted(() => {
-  void load();
+  void loadLatest(true);
   timer = window.setInterval(() => {
-    if (document.visibilityState === "visible") void load();
+    if (document.visibilityState === "visible") void loadLatest();
   }, 3_000);
 });
 
@@ -454,11 +590,12 @@ onBeforeUnmount(() => {
 .yib-detail__body {
   box-sizing: border-box;
   height: 100%;
+  min-height: 0;
   padding: 24px;
   display: flex;
   flex-direction: column;
   gap: 18px;
-  overflow: auto;
+  overflow: hidden;
   color: var(--k-text-dark, #1c1f23);
 }
 
@@ -537,6 +674,12 @@ onBeforeUnmount(() => {
     color: var(--k-text-normal, #666);
     font-size: 13px;
   }
+
+  .yib-detail__order-hint {
+    margin-top: 6px;
+    color: var(--k-text-normal, #888);
+    font-size: 12px;
+  }
 }
 
 .yib-eyebrow {
@@ -547,15 +690,67 @@ onBeforeUnmount(() => {
   text-transform: uppercase;
 }
 
-.yib-truncated-badge {
+.yib-pagination-summary {
   flex: 0 0 auto;
-  padding: 4px 10px;
-  border: 1px solid var(--k-color-warning, #e6a23c);
-  border-radius: 4px;
-  color: var(--k-color-warning, #e6a23c);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+  color: var(--k-text-normal, #666);
   font-size: 12px;
-  font-weight: 600;
   white-space: nowrap;
+}
+
+.yib-pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 38px;
+  color: var(--k-text-normal, #888);
+  font-size: 12px;
+
+  button {
+    min-height: 34px;
+    padding: 0 14px;
+    border: 1px solid var(--k-color-divider);
+    border-radius: 7px;
+    background: transparent;
+    color: var(--k-color-primary, #409eff);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+
+    &:hover:not(:disabled) {
+      border-color: var(--k-color-primary, #409eff);
+      background: color-mix(in srgb, var(--k-color-primary, #409eff) 8%, transparent);
+    }
+
+    &:disabled {
+      cursor: wait;
+      opacity: 0.65;
+    }
+  }
+}
+
+.yib-pagination-bar--top {
+  min-height: 52px;
+  padding: 4px 0 12px;
+  flex-direction: column;
+}
+
+.yib-timeline-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 0 2px 24px;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.yib-timeline-scroll__content {
+  min-height: 100%;
 }
 
 .yib-toolbar {

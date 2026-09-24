@@ -1,6 +1,10 @@
 import type { Workspace } from "./workspace";
 
-export function formatWorkspacePrompt(workspace: Workspace): string {
+export interface WorkspacePromptOptions {
+  readonly shared?: boolean;
+}
+
+export function formatWorkspacePrompt(workspace: Workspace, options: WorkspacePromptOptions = {}): string {
   const networkState = workspace.config.bash.network ? "启用（仅拒绝私有/本地地址）" : "禁用";
   const mountLines = workspace.mounts.map((mount) => `- ${mount.path}：${formatMountLabel(mount.kind)}`);
 
@@ -8,7 +12,9 @@ export function formatWorkspacePrompt(workspace: Workspace): string {
     "## 工作区沙箱",
     "你可以使用由 just-bash 虚拟沙箱支撑的工作区工具。它不是宿主机 shell：命令由 JS 解释执行，只有下列挂载点存在，宿主机上的其他文件与二进制都不可见。不要假设某个命令存在，先用 help 或 which 确认。",
     `当前工作目录：${workspace.config.bash.cwd}`,
-    "工作区按频道隔离：/home/workspace 下的文件只在当前频道内共享。",
+    options.shared
+      ? "工作区由所有已启用频道共享：/home/workspace 下的文件会被其他频道读取和修改，不要假设其中内容只对当前对话可见。"
+      : "工作区按频道隔离：/home/workspace 下的文件只在当前频道内共享。",
     `网络访问：${networkState}`,
     `命令超时：${workspace.defaultTimeoutMs} ms`,
     "bash 的 stdout 与 stderr 各自最多返回约 30 KB，超出会被静默截断；处理大输出时先用 wc、head、grep 收窄再看。",
