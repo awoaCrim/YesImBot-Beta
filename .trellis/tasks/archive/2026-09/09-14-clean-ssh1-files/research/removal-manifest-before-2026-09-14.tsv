@@ -1,0 +1,28 @@
+class	path	observed_size	action	reason
+user-tool	/root/.vscode-server	2.9G	DELETE_EXACT_DIR	No active unit/cron/nginx reference, no mount, no process reference; removes remote VS Code Server and extensions.
+user-cache	/home/clawuser/.npm/_cacache	1.1G	DELETE_CONTENTS	NPM cache only; no mount or process reference.
+app-build-cache	/opt/mooc/backend/.venv	683M	DELETE_EXACT_DIR	Inactive app virtualenv; no service/cron/nginx/process/mount reference; preserve /opt/mooc/.env, database and uploads.
+app-build-cache	/opt/mooc/frontend/node_modules	247M	DELETE_EXACT_DIR	Inactive frontend dependency tree; no service/cron/nginx/process/mount reference.
+user-cache	/root/.cache	178M	DELETE_CONTENTS	User/tool cache root; no process reference; preserve parent directory.
+user-cache	/home/claude/.cache	96M	DELETE_CONTENTS	User/tool cache root; no process reference; preserve parent directory.
+repo-history	/root/ds2api/.git	39M	DELETE_EXACT_DIR	Git metadata only; no service/cron/nginx/process/mount reference; preserve source and .env.
+user-cache	/home/claude/.npm/_cacache	42M	DELETE_CONTENTS	NPM cache only; no mount or process reference.
+repo-history	/opt/mooc/.git	21M	DELETE_EXACT_DIR	Git metadata only; no service/cron/nginx/process/mount reference; preserve app .env, database and uploads.
+user-cache	/root/.npm/_cacache	33M	DELETE_CONTENTS	NPM cache only; no mount or process reference.
+app-cache	/opt/mihomo/config/cache.db	24K	DELETE_EXACT_FILE	Explicit cache DB; no process or service reference.
+small-cache	/opt/mooc/.playwright-mcp	48K	DELETE_EXACT_DIR	Tool cache only; no service/process/mount reference.
+small-cache	/opt/mooc/.claude	12K	DELETE_EXACT_DIR	Project tool metadata only; no service/process/mount reference.
+small-cache	/opt/mooc/__pycache__	20K	DELETE_EXACT_DIR	Python bytecode cache only; no service/process/mount reference.
+small-cache	/root/ds2api/.claude	8K	DELETE_EXACT_DIR	Project tool metadata only; no service/process/mount reference.
+PRESERVE	/var/lib/docker	3.2G	SKIP	Explicit user boundary; never modify.
+PRESERVE	/opt/terraria	3.5G	SKIP	terraria-tmodloader.service is enabled and references this application.
+PRESERVE	/opt/atrbot	2.7G	SKIP	AstrBot service and Docker bind mounts depend on it.
+PRESERVE	/opt/mcp-servers	12K	SKIP	Active MCP services depend on it.
+PRESERVE	/root/sillytavern-docker	522M	SKIP	Running Docker container bind mounts depend on it.
+PRESERVE	/etc/natfrp	SERVICE_DATA	SKIP	Running natfrp Docker container bind mounts depend on it.
+PRESERVE	/root/.ssh	CREDENTIALS	SKIP	SSH credentials.
+PRESERVE	/root/ssh-credential	CREDENTIALS	SKIP	Credential directory.
+PRESERVE	/root/.acme.sh	CREDENTIALS	SKIP	Certificate/account data.
+PRESERVE	/root/.docker	CREDENTIALS	SKIP	Docker client configuration.
+PRESERVE	/opt/mooc/.env and data	SENSITIVE_DATA	SKIP	Sensitive config, database and uploads detected; not deleting entire app directory.
+PRESERVE	/root/ds2api/.env	SENSITIVE_DATA	SKIP	Sensitive configuration detected; only .git is targeted.

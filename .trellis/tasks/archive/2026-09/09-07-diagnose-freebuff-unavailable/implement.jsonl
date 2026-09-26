@@ -1,0 +1,2 @@
+{"file":".trellis/spec/guides/index.md","reason":"执行跨主机代理恢复前遵循项目的跨层、配置变更和安全检查原则。"}
+{"file":".trellis/spec/new-api/backend/deployment-integration.md","reason":"验证 freebuff 与 NewAPI 网络边界、健康检查和凭据不回显约束；本次不应修改 NewAPI 数据库。"}

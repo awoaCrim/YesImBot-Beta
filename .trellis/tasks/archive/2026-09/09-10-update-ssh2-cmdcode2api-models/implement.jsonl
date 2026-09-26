@@ -1,0 +1,2 @@
+{"file":".trellis/tasks/09-10-update-ssh2-cmdcode2api-models/research/commandcode-model-catalog.md","reason":"记录 CommandCode 官方 live model catalog、ssh2 实测目录和 cmdcode2api 启动刷新机制，供远程执行时核对。"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"本任务跨越官方 API、cmdcode2api 进程内目录、管理 API 和对外模型 API，需要按边界检查数据流与集合一致性。"}

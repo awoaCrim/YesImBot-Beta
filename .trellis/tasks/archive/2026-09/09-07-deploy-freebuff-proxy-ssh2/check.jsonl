@@ -1,0 +1,1 @@
+{"file": ".trellis/tasks/09-07-deploy-freebuff-proxy-ssh2/research/deployment-findings.md", "reason": "验收时复核 DNS、host-network、Caddy reload、健康检查和回滚风险"}

@@ -1,0 +1,2 @@
+{"file": ".trellis/tasks/09-14-relaypanel-2260-compatibility/research/3x-ui-v3.7.0-vps.md", "reason": "按相同 VPS-only 约束检查 3x-ui/Xray 配置、既有 sing-box 不变和敏感信息处理"}
+{"file": ".trellis/tasks/09-14-relaypanel-2260-compatibility/research/deployment-2026-09-14.md", "reason": "按实际 VPS 验证结果检查部署边界、既有 sing-box 完整性和敏感值处理"}

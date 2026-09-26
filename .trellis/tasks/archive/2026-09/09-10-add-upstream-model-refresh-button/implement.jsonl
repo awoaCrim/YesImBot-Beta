@@ -1,0 +1,3 @@
+{"file":".trellis/tasks/09-10-add-upstream-model-refresh-button/research/cmdcode2api-refresh-button-research.md","reason":"已确认 cmdcode2api 当前模型抓取、管理 API、前端模型页和 ssh2 Go 工具链约束，实施时据此修改。"}
+{"file":".trellis/spec/v7/backend/cmdcode2api-model-catalog.md","reason":"复用 ssh2 模型目录、暴露策略、备份、敏感信息和集合校验契约，并在实现后更新刷新接口部分。"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"按钮请求要贯穿上游 provider、进程内 catalog、管理 API、配置持久化和 WebUI，需按跨层数据流检查。"}

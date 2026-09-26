@@ -1,0 +1,7 @@
+{"file":".trellis/spec/ops/server-cleanup.md","reason":"检查宿主机服务和精确文件删除是否符合远程清理合同。"}
+{"file":".trellis/tasks/09-14-remove-ssh1-ollama-nginx/research/inventory-2026-09-14.md","reason":"对照删除前后的服务、包、文件、端口和 Natfrp 保留状态。"}
+{"file":".trellis/tasks/09-14-remove-ssh1-ollama-nginx/research/preflight-delete-before-2026-09-14.txt","reason":"删除前即时确认 Ollama/Nginx 包、路径、端口、服务和 Natfrp 保留基线。"}
+{"file":".trellis/tasks/09-14-remove-ssh1-ollama-nginx/research/removal-execution-2026-09-14.txt","reason":"记录停止服务、apt purge 和精确文件删除结果。"}
+{"file":".trellis/tasks/09-14-remove-ssh1-ollama-nginx/research/postflight-delete-after-2026-09-14.txt","reason":"新 SSH 连接下验证目标路径/包/服务/端口消失及 Natfrp/SSH/Docker 保留。"}
+{"file":".trellis/tasks/09-14-remove-ssh1-ollama-nginx/research/execution-summary-2026-09-14.md","reason":"汇总删除对象、保留对象、端口、磁盘和不可逆影响。"}
+{"file":".trellis/tasks/09-14-remove-ssh1-ollama-nginx/research/postflight-natfrp-detail-2026-09-14.txt","reason":"补充确认 Natfrp 容器 ID、镜像、running 状态、/etc/natfrp bind mount 和包/关键服务保留。"}

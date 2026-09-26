@@ -1,0 +1,5 @@
+{"file": ".trellis/tasks/09-02-mogick-multi-account-balance-webui/research/balance-api.md", "reason": "Verified Tongyuan balance endpoint and safe balance semantics"}
+{"file": ".trellis/tasks/09-02-mogick-multi-account-balance-webui/research/multi-account-webui-architecture.md", "reason": "Account isolation, scheduler, WebUI security, migration and rollback constraints"}
+{"file": ".trellis/tasks/09-02-mogick-multi-account-balance-webui/research/resin-integration.md", "reason": "Official Resin sticky proxy and management integration contracts"}
+{"file": ".trellis/tasks/09-02-mogick-multi-account-balance-webui/research/usage-metrics.md", "reason": "Token/cache usage extraction, storage and no-content requirements"}
+{"file": ".trellis/spec/v7/backend/managed-openai-proxy-gateway.md", "reason": "Review matrix for auth, scheduling, Resin, metrics and deployment safety"}

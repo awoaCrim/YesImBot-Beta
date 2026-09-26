@@ -1,0 +1,6 @@
+{"file":".trellis/spec/yesimbot/backend/index.md","reason":"YesImBot backend checklist for scoped production activation, backups, package resolution, and no real-message verification."}
+{"file":".trellis/spec/yesimbot/backend/repository-development-and-operations-contract.md","reason":"Defines source/runtime boundaries, owner-only production backup, atomic build activation, container restart, and rollback requirements."}
+{"file":".trellis/spec/ops/server-cleanup.md","reason":"Defines SSH cleanup authorization, exact-path deletion, mount/service preservation, and before/after validation contracts."}
+{"file":".trellis/spec/guides/index.md","reason":"Shared thinking-guide entry point for cross-layer and operational boundary checks."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Used to trace local build, remote package resolution, durable session storage, container lifecycle, and health verification boundaries."}
+{"file":".trellis/tasks/09-15-deploy-ssh2-clear-koishi-history/research/execution-result.md","reason":"Contains the task-scoped execution evidence, backup path, cleanup counts, remediation history, and final verification boundaries."}

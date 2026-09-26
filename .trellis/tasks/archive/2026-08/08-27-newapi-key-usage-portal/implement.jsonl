@@ -1,0 +1,11 @@
+{"file":"../public-api/.trellis/spec/backend/index.md","reason":"Backend guideline index and owning contract location for the Go/Gin/GORM changes."}
+{"file":"../public-api/.trellis/spec/backend/directory-structure.md","reason":"Defines router/controller/model ownership and test placement for the new endpoints."}
+{"file":"../public-api/.trellis/spec/backend/database-guidelines.md","reason":"Token usage and log queries must remain compatible with SQLite, MySQL, PostgreSQL, and optional ClickHouse LOG_DB behavior."}
+{"file":"../public-api/.trellis/spec/backend/error-handling.md","reason":"Defines safe API envelopes and separation of internal errors from public Token-facing responses."}
+{"file":"../public-api/.trellis/spec/backend/logging-guidelines.md","reason":"Defines durable log privacy boundaries and forbids logging API keys or raw sensitive payloads."}
+{"file":"../public-api/.trellis/spec/backend/quality-guidelines.md","reason":"Owns cross-layer security/testing contracts and must be extended for the public Token self-service portal."}
+{"file":"../public-api/.trellis/spec/backend/deployment-guidelines.md","reason":"Required exact-commit ssh2 deployment, backup, health verification, and rollback contract."}
+{"file":"../public-api/.trellis/spec/guides/index.md","reason":"Shared pre-development thinking checklist."}
+{"file":"../public-api/.trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Feature crosses browser state, API auth, controller DTOs, LOG_DB queries, and deployment boundaries."}
+{"file":"../public-api/.trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Guides safe reuse of Usage Analysis presentation/query logic without copying privileged dashboard behavior."}
+{"file":".trellis/tasks/08-27-newapi-key-usage-portal/research/repo-audit.md","reason":"Repository evidence, existing API contracts, privacy risks, and recommended architecture for implementation."}

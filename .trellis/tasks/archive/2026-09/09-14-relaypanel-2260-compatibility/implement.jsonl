@@ -1,0 +1,2 @@
+{"file": ".trellis/tasks/09-14-relaypanel-2260-compatibility/research/3x-ui-v3.7.0-vps.md", "reason": "VPS 基线、3x-ui v3.7.0 安装方式、端口隔离、TLS/安全和验证边界"}
+{"file": ".trellis/tasks/09-14-relaypanel-2260-compatibility/research/deployment-2026-09-14.md", "reason": "VPS 实际部署、敏感值轮换、端口隔离和最终验证记录"}

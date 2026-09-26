@@ -1,0 +1,9 @@
+{"file":".trellis/spec/guides/index.md","reason":"按共享指南检查远程删除是否跨越系统、服务和数据边界，以及是否有足够验证。"}
+{"file":".trellis/spec/ops/index.md","reason":"按运维规范入口复核远程变更边界和完成后的验证要求。"}
+{"file":".trellis/spec/ops/server-cleanup.md","reason":"按服务器文件清理合同复核本次精确路径、服务依赖、Docker 排除和前后验证。"}
+{"file":".trellis/tasks/09-14-clean-ssh1-files/research/ssh1-inventory.md","reason":"用于对照清理前后的保留路径、候选路径、服务依赖和 Docker 排除范围。"}
+{"file":".trellis/tasks/09-14-clean-ssh1-files/research/preflight-before-2026-09-14.txt","reason":"清理前服务、enabled unit、容器、挂载、监听端口和磁盘基线。"}
+{"file":".trellis/tasks/09-14-clean-ssh1-files/research/candidate-preflight-2026-09-14.txt","reason":"执行前候选目录的挂载、服务引用、进程引用和敏感文件名检查。"}
+{"file":".trellis/tasks/09-14-clean-ssh1-files/research/cleanup-execution-2026-09-14.txt","reason":"精确删除命令的 pre-delete 检查、删除结果和目标复核。"}
+{"file":".trellis/tasks/09-14-clean-ssh1-files/research/postflight-after-2026-09-14.txt","reason":"新 SSH 连接下的磁盘、服务、容器、监听端口、保留路径和目标缺失验证。"}
+{"file":".trellis/tasks/09-14-clean-ssh1-files/research/execution-summary.md","reason":"汇总清理量、验证结果、跳过对象和残留风险。"}

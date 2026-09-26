@@ -1,0 +1,5 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/yesimbot/backend/index.md", "reason": "Quality gate for preserving production containers, config, data, and restart state."}
+{"file": ".trellis/spec/guides/index.md", "reason": "Shared verification guidance for boundary and cross-layer consistency checks."}
+{"file": ".trellis/tasks/09-14-ssh2-garbage-cache-cleanup/research/remote-inventory.md", "reason": "Sanitized preflight facts used to compare post-cleanup state."}
+{"file": ".trellis/tasks/09-14-ssh2-garbage-cache-cleanup/research/execution-result.md", "reason": "Sanitized execution and postflight evidence, including the corrected safety checks."}

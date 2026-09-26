@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "删除前先搜索并确认唯一的包配置项，避免误删同名或相关扩展。"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "确认包配置、安装目录、运行时加载与后续新会话之间的跨层结果。"}

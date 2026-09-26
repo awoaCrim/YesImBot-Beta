@@ -1,0 +1,2 @@
+{"file":".trellis/spec/yesimbot/backend/index.md","reason":"Quality gate for package resolution, remote deployment, and no-unrelated-state changes."}
+{"file":".trellis/spec/yesimbot/backend/roleplay-image-tools-contract.md","reason":"Existing image-tools config and ownership contract that the installation fix must preserve."}

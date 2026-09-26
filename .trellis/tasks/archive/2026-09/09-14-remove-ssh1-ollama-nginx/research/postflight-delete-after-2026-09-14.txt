@@ -1,0 +1,52 @@
+=== host ===
+debian
+0
+2026-09-14T15:51:41Z
+=== disk ===
+Filesystem     Type      Size  Used Avail Use% Mounted on
+/dev/nvme0n1p2 ext4      453G   20G  410G   5% /
+efivarfs       efivarfs  128K   21K  103K  17% /sys/firmware/efi/efivars
+/dev/nvme0n1p1 vfat      975M  8.8M  966M   1% /boot/efi
+=== services ===
+ollama.service enabled=not-found
+ollama.service active=inactive
+nginx.service enabled=not-found
+nginx.service active=inactive
+ssh.service enabled=enabled
+ssh.service active=active
+docker.service enabled=enabled
+docker.service active=active
+containerd.service enabled=enabled
+containerd.service active=active
+=== packages ===
+ABSENT nginx
+ABSENT nginx-common
+ABSENT nginx-core
+=== target paths ===
+ABSENT /usr/local/bin/ollama
+ABSENT /usr/share/ollama
+ABSENT /root/.ollama
+ABSENT /etc/systemd/system/ollama.service
+ABSENT /etc/nginx
+ABSENT /var/log/nginx
+ABSENT /var/lib/nginx
+ABSENT /var/cache/nginx
+ABSENT /usr/lib/nginx
+ABSENT /usr/sbin/nginx
+=== preserved Natfrp/Docker ===
+/natfrp-service running ghcr.io/natfrp/launcher
+EXISTS directory 4096 /etc/natfrp
+EXISTS directory 4096 /var/lib/docker
+natfrp-service	Up 3 weeks	ghcr.io/natfrp/launcher
+=== failed units ===
+=== listeners ===
+Netid State  Recv-Q Send-Q Local Address:Port  Peer Address:PortProcess                                  
+udp   UNCONN 0      0            0.0.0.0:5353       0.0.0.0:*    users:(("avahi-daemon",pid=873,fd=12))  
+udp   UNCONN 0      0            0.0.0.0:47735      0.0.0.0:*    users:(("avahi-daemon",pid=873,fd=14))  
+udp   UNCONN 0      0               [::]:37516         [::]:*    users:(("avahi-daemon",pid=873,fd=15))  
+udp   UNCONN 0      0               [::]:5353          [::]:*    users:(("avahi-daemon",pid=873,fd=13))  
+tcp   LISTEN 0      20         127.0.0.1:25         0.0.0.0:*    users:(("exim4",pid=2703,fd=5))         
+tcp   LISTEN 0      128          0.0.0.0:22         0.0.0.0:*    users:(("sshd",pid=6968,fd=6))          
+tcp   LISTEN 0      20             [::1]:25            [::]:*    users:(("exim4",pid=2703,fd=6))         
+tcp   LISTEN 0      4096               *:7102             *:*    users:(("natfrp-service",pid=2303,fd=7))
+tcp   LISTEN 0      128             [::]:22            [::]:*    users:(("sshd",pid=6968,fd=7))          

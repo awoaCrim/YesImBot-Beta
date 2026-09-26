@@ -1,0 +1,5 @@
+{"file":".trellis/spec/guides/index.md","reason":"遵循项目共享思考指南，特别是远程操作的边界、依赖和验证思路。"}
+{"file":".trellis/spec/ops/index.md","reason":"确认跨主机运维规范入口；本任务不涉及订阅合同，但需遵守运维边界意识。"}
+{"file":".trellis/spec/ops/server-cleanup.md","reason":"记录本任务沉淀的远程文件清理合同、精确路径规则、enabled service/Docker mount 保护和验证矩阵。"}
+{"file":".trellis/tasks/09-14-clean-ssh1-files/research/ssh1-inventory.md","reason":"提供 ssh1 的初始只读盘点、活跃服务依赖、Docker bind mount 和候选路径证据。"}
+{"file":".trellis/tasks/09-14-clean-ssh1-files/research/removal-manifest-before-2026-09-14.tsv","reason":"记录执行前逐项登记的精确删除目标、保留路径和删除依据。"}
