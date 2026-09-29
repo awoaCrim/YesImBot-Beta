@@ -14,6 +14,8 @@ export type {
   MessagePolisherCapability,
   PolisherPromptProfile,
   PolisherRequest,
+  PolisherTurnContext,
+  PolisherTurnEntry,
   RolePromptProfileProvider,
   WillBatchDecision,
   WillDebug,
@@ -36,6 +38,8 @@ export * from "./messages/index.js";
 export type { Translator } from "./messengers/index.js";
 
 export type * from "./models/index.js";
+
+export { createThinkingLevelMapSchema, getSupportedThinkingLevels, resolveThinkingLevel, THINKING_LEVELS } from "./models/index.js";
 
 export { ResourceReadError } from "./resources/index.js";
 

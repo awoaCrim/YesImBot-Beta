@@ -79,7 +79,7 @@ export async function buildCoreSystemPrompt(options: CoreSystemPromptOptions): P
   const delegated = options.delegated === true;
 
   return [
-    { role: "system", content: coreConstitution(options.customInnerThought ?? true, delegated) },
+    { role: "system", content: coreConstitution(options.customInnerThought ?? false, delegated) },
     ...(delegated ? [] : [wrap("persona", persona)]),
     ...(agents ? [wrap("agents", agents)] : []),
     formatRuntimeContext(options.channel, options.selfId),

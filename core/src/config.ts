@@ -37,7 +37,7 @@ export const Config: Schema<Config> = Schema.intersect([
       charactersPerSecond: Schema.number().min(1).default(8).description("send_message 相邻消息之间的发送速度（字符/秒）"),
       maxTotalDelayMs: Schema.number().min(1).default(60_000).description("单次 send_message 调用的最大累计延迟（毫秒）"),
     }).description("消息发送节奏"),
-    customInnerThought: Schema.boolean().default(true).description("为 send_message 提供 inner_thought 字段，记录不发送的内心独白"),
+    customInnerThought: Schema.boolean().default(false).description("为 send_message 提供 inner_thought 字段，记录不发送的内心独白；默认关闭"),
   }),
   Schema.object({
     session: Schema.object({

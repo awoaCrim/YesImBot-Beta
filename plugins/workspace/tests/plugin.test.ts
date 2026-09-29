@@ -9,7 +9,7 @@ vi.mock("koishi", async () => {
   return { Context: class {}, Logger: class {}, Schema };
 });
 
-import WorkspacePlugin from "../src/index.js";
+import WorkspacePlugin, { isHostExecAllowed } from "../src/index.js";
 import type { WorkspacePluginConfig } from "../src/types.js";
 
 async function createWorkspace() {
@@ -44,6 +44,24 @@ async function createWorkspace() {
 }
 
 describe("WorkspacePlugin", () => {
+  it("matches Host execution only for the exact Anon direct scope", () => {
+    const rule = { platform: "onebot", channelId: "private:1049700117", userId: "1049700117", selfId: "3535802886" };
+
+    expect(isHostExecAllowed({ type: "direct", platform: "onebot", channelId: "private:1049700117", selfId: "3535802886", userId: "1049700117" }, [rule])).toBe(
+      true,
+    );
+    expect(isHostExecAllowed({ type: "direct", platform: "onebot", channelId: "private:other", selfId: "3535802886", userId: "other" }, [rule])).toBe(false);
+    expect(isHostExecAllowed({ type: "direct", platform: "onebot", channelId: "private:1049700117", selfId: "3535802886", userId: "other" }, [rule])).toBe(
+      false,
+    );
+    expect(
+      isHostExecAllowed({ type: "guild", platform: "onebot", channelId: "private:1049700117", guildId: "private:1049700117", selfId: "3535802886" }, [rule]),
+    ).toBe(false);
+    expect(isHostExecAllowed({ type: "direct", platform: "other", channelId: "private:1049700117", selfId: "3535802886", userId: "1049700117" }, [rule])).toBe(
+      false,
+    );
+  });
+
   it("registers named ResourceReader objects and one agent plugin on start", async () => {
     const fixture = await createWorkspace();
     try {

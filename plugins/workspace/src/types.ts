@@ -19,9 +19,23 @@ export interface SandboxBashConfig {
   readonly enableJavascript?: boolean;
 }
 
+export interface HostExecChannelRule {
+  readonly platform: string;
+  readonly channelId: string;
+  readonly userId: string;
+  readonly selfId: string;
+}
+
+export interface HostExecConfig {
+  readonly enabled?: boolean;
+  readonly allowedChannels?: HostExecChannelRule[];
+  readonly timeoutMs?: number;
+}
+
 export interface WorkspacePluginConfig {
   readonly sharedPath?: string;
   readonly bash?: SandboxBashConfig;
+  readonly hostExec?: HostExecConfig;
   readonly skillPaths?: string[];
 }
 

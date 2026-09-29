@@ -38,6 +38,17 @@ export function formatWorkspacePrompt(workspace: Workspace, options: WorkspacePr
   ].join("\n");
 }
 
+export function formatHostExecPrompt(defaultTimeoutMs: number): string {
+  return [
+    "## SSH1 宿主机管理工具",
+    "当前私聊已被明确授权使用 hostExec。它执行的是真实 SSH1 宿主机 Bash，不是 just-bash 虚拟文件系统；当前命令以 host 用户 anon 运行，anon 可以通过现有 sudo 权限管理整台 SSH1。",
+    "需要管理主机时使用 hostExec，不要因为虚拟 bash 看不到 docker 或 systemctl 就反复尝试虚拟路径。hostExec 的 cwd 是 SSH1 宿主机绝对路径，省略时为 /；一次调用写完一条完整命令，命令之间的依赖用同一条 Bash 命令连接。",
+    `默认命令超时为 ${defaultTimeoutMs} ms；stdout/stderr 有固定上限。先用 id、pwd、docker ps、systemctl is-system-running 等只读检查确认状态，再执行变更；执行后检查返回的 ok、exitCode 和输出。`,
+    "不要读取、打印或复制 API key、token、密码、私钥、完整环境变量或无关的聊天/数据库内容；需要操作配置时只查看必要的非敏感字段。超时、取消或失败后先停止并报告，不要盲目重试可能已经执行一半的破坏性命令。",
+    "hostExec 的能力等价于高权限运维入口。不要把它用于普通工作区文件编辑；普通文件处理仍使用 bash、readFile、writeFile。",
+  ].join("\\n");
+}
+
 function formatMountLabel(kind: Workspace["mounts"][number]["kind"]): string {
   if (kind === "read-only") {
     return "只读（写入会失败）";

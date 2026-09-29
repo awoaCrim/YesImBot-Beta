@@ -1,11 +1,11 @@
-import { EphemeralImageProjectionStore, jsonSchema, type AgentTool } from "@yesimbot/agent-runtime";
+import { EphemeralImageProjectionStore, jsonSchema, type AgentMessage, type AgentTool } from "@yesimbot/agent-runtime";
 import { generateText, type LanguageModel } from "ai";
 import { h, type Bot, type Element } from "koishi";
 
 import type { PacingConfig } from "../config.js";
 import { parseReply } from "../messages/index.js";
 import { detectImageMediaType, prepareOutputSegments, ResourceReadError, type ChannelResources } from "../resources/index.js";
-import { validatePolishedMessages } from "./polisher.js";
+import { buildPolisherTurnContext, validatePolishedMessages, type PolisherTurnContext } from "./polisher.js";
 
 const READ_MAX_TEXT_CHARS = 30_000;
 const ONEBOT_GROUP_CHANNEL_PREFIX = "group:";
@@ -78,6 +78,7 @@ export interface SendMessageToolOptions {
   readonly polish?: (input: {
     readonly facts: readonly string[];
     readonly messages: readonly string[];
+    readonly turnContext: PolisherTurnContext;
     readonly signal?: AbortSignal;
   }) => Promise<readonly string[] | undefined>;
   readonly onDelivered?: (notice: DeliveredNotice) => void;
@@ -139,7 +140,7 @@ export function createSendMessageTool(options: SendMessageToolOptions): AgentToo
       if (input.mode && input.mode !== "element" && input.mode !== "raw")
         return { ok: false, error: { name: "InvalidInput", message: `mode must be "element" or "raw"` }, sent: [], failedAt: 0 };
       const mode = input.mode ?? "element";
-      const messages = await polishedMessages(polish, input, execution.abortSignal);
+      const messages = await polishedMessages(polish, input, execution.messages, execution.abortSignal);
       const total = messages.length;
       const sent: string[] = [];
       let elapsed = 0;
@@ -477,11 +478,15 @@ messages: ["当 x<10 且 y>5 时执行"]
 async function polishedMessages(
   polish: SendMessageToolOptions["polish"],
   input: SendMessageInput,
+  currentTurnMessages: readonly AgentMessage[],
   signal: AbortSignal | undefined,
 ): Promise<readonly string[]> {
   if (!polish) return input.messages;
   try {
-    return validatePolishedMessages(input.messages, await polish({ facts: input.facts ?? [], messages: input.messages, signal })) ?? input.messages;
+    const turnContext = buildPolisherTurnContext(currentTurnMessages);
+    return (
+      validatePolishedMessages(input.messages, await polish({ facts: input.facts ?? [], messages: input.messages, turnContext, signal })) ?? input.messages
+    );
   } catch {
     return input.messages;
   }

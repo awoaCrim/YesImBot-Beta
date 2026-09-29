@@ -119,6 +119,43 @@ allowedChannels:
 
 活动 Runtime 会在创建时快照模型能力、`imageInput`、Will、提示词与插件。Core 不提供 `reload()`：配置、模型或插件变化会在 Runtime 因停止或 shared Bot 变更而替换后生效。
 
+#### 模型思考等级
+
+四个内置 Provider（Google、OpenAI、Anthropic、DeepSeek）支持在各自的 `chatModels` 模型行上配置统一的思考等级。等级固定为：
+
+`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`
+
+`thinkingLevel` 不填写时不新增任何 thinking 参数，继续使用 Provider 默认行为；配置跟随具体模型，因此主聊天、消息润色、记忆和其它 auxiliary 请求解析到同一模型时会使用同一设置，不需要在某个用途的调用点单独传参。
+
+```yaml
+chatModels:
+  - id: gemini-3.7-flash
+    toolCall: true
+    reasoning: true
+    thinkingLevel: high
+    # 原生值由 Provider 解释；null 表示该统一等级不受此模型支持
+    thinkingLevelMap:
+      xhigh: high
+      max: null
+```
+
+`thinkingLevelMap` 是可选的逐模型原生映射。Google 使用 `thinkingConfig.thinkingLevel`，OpenAI 使用 `reasoningEffort`，Anthropic 使用 `effort`，DeepSeek 使用 `thinking` 与 `reasoningEffort`。不同模型或 Provider 不支持某个等级时可写 `null`；显式请求不可用等级会按固定顺序优先夹到更高的可用等级，再向更低等级寻找，并记录 warning，不会发送无效原生值。`reasoning: false` 的模型只保留 `off`。
+
+也可以在 `data/yesimbot/models.json` 的 `chat` 覆盖中调整已注册模型：
+
+```json
+{
+  "chat": {
+    "openai:gpt-5": {
+      "thinkingLevel": "high",
+      "thinkingLevelMap": { "xhigh": "xhigh", "max": null }
+    }
+  }
+}
+```
+
+DeepSeek 原有的全局 `thinking` 默认值和模型 ID `:level` 后缀仍然有效；后缀优先级高于模型行的 `thinkingLevel`。本配置只改变模型请求设置，不会自动修改生产配置或部署。
+
 ## Plugins
 
 YesImBot 的能力通过插件系统按需加载。

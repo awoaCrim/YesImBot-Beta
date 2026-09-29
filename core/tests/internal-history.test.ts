@@ -1,7 +1,7 @@
 import { createAssistantMessage, createEntry, createSystemMessage, createToolMessage, createUserMessage } from "@yesimbot/agent-runtime";
 import { describe, expect, it } from "vitest";
 
-import { isDeliveredTranscript } from "../src/conversations/delivered-transcript.js";
+import { createDeliveredTranscriptMessage, isDeliveredTranscript } from "../src/conversations/delivered-transcript.js";
 import { stripInternalAssistantInputs } from "../src/conversations/internal-history.js";
 
 describe("internal model-history projection", () => {
@@ -374,5 +374,156 @@ describe("internal model-history projection", () => {
     const projected = stripInternalAssistantInputs([user, createEntry("message", assistant, { id: "assistant-1", timestamp: 2 })]);
 
     expect(projected).toEqual([user]);
+  });
+
+  it("keeps only a safe paired send_message trace in Gemini mode", () => {
+    const assistant = createAssistantMessage([
+      {
+        type: "tool-call",
+        toolCallId: "send-1",
+        toolName: "send_message",
+        input: {
+          messages: ["已经发送", '<img src="artifact://old-image"/>'],
+          facts: ["可见事实"],
+          mode: "element",
+          inner_thought: "不可见判断",
+          reason: "不应进入历史",
+        },
+        providerOptions: { google: { thoughtSignature: "call-signature" } },
+      },
+      {
+        type: "tool-call",
+        toolCallId: "finish-1",
+        toolName: "finish",
+        input: { reason: "内部结束原因" },
+      },
+    ]);
+    const tool = createToolMessage([
+      {
+        type: "tool-result",
+        toolCallId: "send-1",
+        toolName: "send_message",
+        output: { type: "json", value: { ok: true, count: 2, messageIds: ["m1", "m2"] } },
+        providerOptions: { google: { thoughtSignature: "result-signature" } },
+      },
+      { type: "tool-result", toolCallId: "finish-1", toolName: "finish", output: { type: "json", value: { ok: true } } },
+    ]);
+    const entries = [createEntry("message", assistant, { id: "assistant-1", timestamp: 1 }), createEntry("message", tool, { id: "tool-1", timestamp: 2 })];
+
+    const projected = stripInternalAssistantInputs(entries, "gemini-native");
+
+    expect(projected).toHaveLength(2);
+    expect(projected[0]).toMatchObject({
+      id: "assistant-1",
+      data: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "send-1",
+            toolName: "send_message",
+            input: { messages: ["已经发送", "[图片]"], facts: ["可见事实"], mode: "element" },
+            providerOptions: { google: { thoughtSignature: "call-signature" } },
+          },
+          { type: "tool-call", toolCallId: "finish-1", toolName: "finish", input: {} },
+        ],
+      },
+    });
+    expect(projected[1]).toMatchObject({
+      id: "tool-1",
+      data: {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "send-1",
+            toolName: "send_message",
+            providerOptions: { google: { thoughtSignature: "result-signature" } },
+          },
+          { type: "tool-result", toolCallId: "finish-1", toolName: "finish" },
+        ],
+      },
+    });
+    expect(JSON.stringify(projected)).not.toContain("delivered_transcript");
+    expect(JSON.stringify(projected)).not.toContain("inner_thought");
+    expect(JSON.stringify(projected)).not.toContain("artifact://old-image");
+    expect(entries[0]).toEqual(expect.objectContaining({ data: expect.objectContaining({ content: assistant.content }) }));
+    expect(stripInternalAssistantInputs(projected, "gemini-native")).toEqual(projected);
+  });
+
+  it.each([
+    ["partial delivery", { ok: false, sent: ["m1"], failedAt: 1 }],
+    ["zero delivery", { ok: false, sent: [], failedAt: 0 }],
+    ["malformed success", { ok: true, count: 1 }],
+  ])("fails closed for %s in Gemini mode", (_label, result) => {
+    const assistant = createAssistantMessage([
+      { type: "tool-call", toolCallId: "send-1", toolName: "send_message", input: { messages: ["第一条", "第二条"] } },
+    ]);
+    const tool = createToolMessage([{ type: "tool-result", toolCallId: "send-1", toolName: "send_message", output: { type: "json", value: result } }]);
+    const user = createEntry("message", createUserMessage("当前问题"), { id: "user-1", timestamp: 3 });
+    const projected = stripInternalAssistantInputs(
+      [createEntry("message", assistant, { id: "assistant-1", timestamp: 1 }), createEntry("message", tool, { id: "tool-1", timestamp: 2 }), user],
+      "gemini-native",
+    );
+
+    expect(projected).toEqual([user]);
+  });
+
+  it("fails closed for unpaired, legacy, malformed, and marker-only delivered history in Gemini mode", () => {
+    const unpaired = createEntry(
+      "message",
+      createAssistantMessage([{ type: "tool-call", toolCallId: "send-unpaired", toolName: "send_message", input: { messages: ["没有结果"] } }]),
+      { id: "assistant-unpaired", timestamp: 1 },
+    );
+    const legacy = createEntry("message", createAssistantMessage("[DELIVERED_MESSAGE]\n旧消息\n[/DELIVERED_MESSAGE]"), {
+      id: "assistant-legacy",
+      timestamp: 2,
+    });
+    const malformed = createEntry("message", createAssistantMessage("[DELIVERED_MESSAGE]\n没有闭合"), { id: "assistant-malformed", timestamp: 3 });
+    const transcript = createEntry("message", createDeliveredTranscriptMessage({ messages: ["旧 typed transcript"], deliveredCount: 1, partial: false }), {
+      id: "transcript-1",
+      timestamp: 4,
+    });
+    const user = createEntry("message", createUserMessage("当前问题"), { id: "user-1", timestamp: 5 });
+
+    expect(stripInternalAssistantInputs([unpaired, legacy, malformed, transcript, user], "gemini-native")).toEqual([user]);
+  });
+
+  it("keeps ordinary reads while filtering non-replayable historical traces in Gemini mode", () => {
+    const assistant = createAssistantMessage([
+      { type: "tool-call", toolCallId: "asset-read", toolName: "read", input: { uri: "asset://reference" } },
+      { type: "tool-call", toolCallId: "artifact-read", toolName: "read", input: { uri: "artifact://old" } },
+      { type: "tool-call", toolCallId: "image", toolName: "generate_image", input: { prompt: "old image" } },
+      { type: "tool-call", toolCallId: "finish", toolName: "finish", input: {} },
+    ]);
+    const tool = createToolMessage([
+      { type: "tool-result", toolCallId: "asset-read", toolName: "read", output: { type: "json", value: { asset: true } } },
+      { type: "tool-result", toolCallId: "artifact-read", toolName: "read", output: { type: "json", value: { artifact: true } } },
+      { type: "tool-result", toolCallId: "image", toolName: "generate_image", output: { type: "json", value: { uri: "artifact://old" } } },
+      { type: "tool-result", toolCallId: "finish", toolName: "finish", output: { type: "json", value: { ok: true } } },
+    ]);
+
+    const projected = stripInternalAssistantInputs(
+      [createEntry("message", assistant, { id: "assistant-1", timestamp: 1 }), createEntry("message", tool, { id: "tool-1", timestamp: 2 })],
+      "gemini-native",
+    );
+
+    expect(projected).toHaveLength(2);
+    expect(projected[0]).toMatchObject({
+      data: {
+        content: [
+          { type: "tool-call", toolCallId: "asset-read" },
+          { type: "tool-call", toolCallId: "finish" },
+        ],
+      },
+    });
+    expect(projected[1]).toMatchObject({
+      data: {
+        content: [
+          { type: "tool-result", toolCallId: "asset-read" },
+          { type: "tool-result", toolCallId: "finish" },
+        ],
+      },
+    });
   });
 });

@@ -185,6 +185,7 @@ async function runtime(
   polisher?: MessagePolisherCapability,
   polish?: ChannelRuntimeOptions["polish"],
   compactFragments?: ChannelRuntimeOptions["compactFragments"],
+  historyProjection?: ChannelRuntimeOptions["historyProjection"],
 ) {
   const root = await mkdtemp(join(tmpdir(), "yesimbot-runtime-"));
   const channel = new Channel(context, root);
@@ -200,6 +201,7 @@ async function runtime(
     providerTools,
     messageBatch,
     ...(compactFragments ? { compactFragments } : {}),
+    historyProjection,
     polisher,
     polish,
   });
@@ -253,6 +255,53 @@ describe("ChannelRuntime scheduling", () => {
       expect(currentContent).toContain("[CURRENT_MESSAGE]");
       expect(currentContent).toContain('sender="443306717 (443306717)"');
       expect(currentContent).toContain('id="jiang-1"');
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("drops delivered transcripts and merges adjacent user turns only in Gemini mode", async () => {
+    const { value, root } = await runtime(undefined, {}, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "gemini-native");
+    try {
+      const plugin = vi
+        .mocked(createAgent)
+        .mock.calls.at(-1)?.[0]
+        .plugins?.find((item) => item.name === "core.model-input");
+      const transcript = createDeliveredTranscriptMessage(
+        { messages: ["已经发出的内容"], deliveredCount: 1, partial: false },
+        { id: "transcript-gemini", timestamp: 123 },
+      );
+      await expect(plugin?.toModelMessages?.(transcript, { history: [transcript], current: [] } as never)).resolves.toEqual([]);
+
+      const prepared = await plugin?.prepareStep?.(
+        [
+          { role: "user", content: "第一段" },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "第二段" },
+              { type: "file", data: new Uint8Array([1]), mediaType: "image/png" },
+            ],
+          },
+          { role: "assistant", content: "边界" },
+          { role: "user", content: "第三段" },
+        ],
+        { turnId: "turn-gemini" } as never,
+      );
+
+      expect(prepared).toHaveLength(3);
+      expect(prepared?.[0]).toMatchObject({
+        role: "user",
+        content: [
+          { type: "text", text: "第一段" },
+          { type: "text", text: "\n" },
+          { type: "text", text: "第二段" },
+          { type: "file", mediaType: "image/png" },
+        ],
+      });
+      expect(prepared?.[1]).toEqual({ role: "assistant", content: "边界" });
+      expect(prepared?.[2]).toEqual({ role: "user", content: "第三段" });
     } finally {
       await value.stop();
       await rm(root, { recursive: true, force: true });
@@ -540,6 +589,21 @@ describe("ChannelRuntime scheduling", () => {
       const result = await value.post(event);
       if (result.kind === "run") await result.done;
       expect(state.run).toHaveBeenCalledWith(expect.objectContaining({ role: "custom", type: "yesimbot.event" }), { ifBusy: "defer", historyMode: "event" });
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("allows an explicitly posted event to use conversation history", async () => {
+    const { value, root } = await runtime();
+    try {
+      const result = await value.post(event, { historyMode: "conversation" });
+      if (result.kind === "run") await result.done;
+      expect(state.run).toHaveBeenCalledWith(expect.objectContaining({ role: "custom", type: "yesimbot.event" }), {
+        ifBusy: "defer",
+        historyMode: "conversation",
+      });
     } finally {
       await value.stop();
       await rm(root, { recursive: true, force: true });
@@ -1716,6 +1780,46 @@ describe("Runtimes identity", () => {
       const replacement = await runtimes.get(channel, bot as never);
 
       expect(replacement).not.toBe(first);
+      await runtimes.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("proactively retires a cached runtime when polisher registration changes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-runtimes-polisher-invalidate-"));
+    try {
+      vi.mocked(createAgent).mockClear();
+      const ctx = new Context();
+      const channels = new Channels(ctx, { basePath: root });
+      const model = {
+        resolveChatModel: vi.fn(() => ({ model: {} as never, entry: {} })),
+        resolveAuxiliaryModel: vi.fn(() => {
+          throw new Error("auxiliary unavailable");
+        }),
+      };
+      const polishers = new PolisherRegistry();
+      const dispose = polishers.use({ name: "test", polish: vi.fn(async () => undefined) });
+      const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root }, new Agents(ctx), new MessageBatchRegistry(), polishers);
+      const channel = await channels.resolve({ type: "direct", platform: "test", channelId: "user", userId: "user", selfId: "bot" });
+      const bot = { platform: "test", selfId: "bot" };
+
+      const first = await runtimes.get(channel, bot as never);
+      const firstAgent = vi.mocked(createAgent).mock.results.at(-1)?.value;
+      const firstConfig = vi.mocked(createAgent).mock.calls.at(-1)?.[0];
+      if (!firstConfig || typeof firstConfig.systemPrompt !== "function") throw new Error("Initial Agent prompt was not captured");
+      const firstPrompt = (await firstConfig.systemPrompt()).map((block) => String(block.content)).join("\n");
+      expect(firstPrompt).not.toContain("<persona>");
+
+      dispose();
+      await vi.waitFor(() => expect(firstAgent?.stop).toHaveBeenCalledOnce());
+      const replacement = await runtimes.get(channel, bot as never);
+      const replacementConfig = vi.mocked(createAgent).mock.calls.at(-1)?.[0];
+      if (!replacementConfig || typeof replacementConfig.systemPrompt !== "function") throw new Error("Replacement Agent prompt was not captured");
+      const replacementPrompt = (await replacementConfig.systemPrompt()).map((block) => String(block.content)).join("\n");
+
+      expect(replacement).not.toBe(first);
+      expect(replacementPrompt).toContain("<persona>");
       await runtimes.stop();
     } finally {
       await rm(root, { recursive: true, force: true });

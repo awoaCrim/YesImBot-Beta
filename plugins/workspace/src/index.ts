@@ -7,10 +7,12 @@ import { Context, Logger, Schema } from "koishi";
 import type { ChannelResources, ChannelContext, ResourceReader } from "koishi-plugin-yesimbot";
 
 import { createBashToolSet } from "./bash-tool";
+import { createHostRunner, type HostRunner } from "./host-engine";
+import { createHostExecTool } from "./host-tool";
 import { normalizeMounts, type NormalizedMountSpec } from "./mounts";
-import { formatWorkspacePrompt } from "./prompt";
+import { formatHostExecPrompt, formatWorkspacePrompt } from "./prompt";
 import { formatSkillsForPrompt, loadSkills, type Skill } from "./skills";
-import type { MountSpec, SandboxBashConfig, WorkspacePluginConfig } from "./types";
+import type { HostExecChannelRule, HostExecConfig, MountSpec, SandboxBashConfig, WorkspacePluginConfig } from "./types";
 import { type SandboxWorkspaceConfig, Workspace } from "./workspace";
 import { resolveSharedWorkspaceRoot } from "./workspace-root";
 
@@ -47,6 +49,21 @@ export default class WorkspacePlugin {
       enablePython: Schema.boolean().default(false).description("启用 Python 执行"),
       enableJavascript: Schema.boolean().default(false).description("启用 JavaScript 执行"),
     }).description("Bash 沙箱配置"),
+    hostExec: Schema.object({
+      enabled: Schema.boolean().default(false).description("为精确 allowlist 的 Anon 私聊启用 SSH1 宿主机命令工具"),
+      allowedChannels: Schema.array(
+        Schema.object({
+          platform: Schema.string().min(1).required(),
+          channelId: Schema.string().min(1).required(),
+          userId: Schema.string().min(1).required(),
+          selfId: Schema.string().min(1).required(),
+        }),
+      )
+        .role("table")
+        .default([])
+        .description("Host 工具允许的 Anon direct scope；必须精确匹配 platform/channelId/selfId"),
+      timeoutMs: Schema.number().min(1000).max(300000).default(60000).description("Host 命令默认超时（毫秒）"),
+    }).description("仅 Anon 私聊可用的 SSH1 宿主机命令能力"),
     skillPaths: Schema.array(Schema.path({ filters: ["directory", "file"], allowCreate: true })),
   });
 
@@ -60,6 +77,8 @@ export default class WorkspacePlugin {
   private sandbox?: SandboxBashConfig;
   private normalizedMounts?: readonly NormalizedMountSpec[];
   private sharedWorkspaceRoot?: string;
+  private hostExecConfig?: HostExecConfig;
+  private hostRunner?: HostRunner;
   private disposeAgentPlugin?: () => void;
   private disposeReaders: Array<() => void> = [];
 
@@ -74,11 +93,21 @@ export default class WorkspacePlugin {
   public async start(): Promise<void> {
     this.logger.info("Starting workspace plugin...");
 
+    await this.stopHostRunner();
     this.disposeAgentPlugin?.();
     this.disposeAgentPlugin = undefined;
     for (const dispose of this.disposeReaders.splice(0)) dispose();
 
     const sandbox = this.getSandboxConfig();
+    const hostExecConfig = this.getHostExecConfig();
+    this.hostExecConfig = hostExecConfig;
+    if (hostExecConfig?.enabled && (hostExecConfig.allowedChannels?.length ?? 0) > 0) {
+      if (process.platform === "linux") {
+        this.hostRunner = createHostRunner({ defaultTimeoutMs: hostExecConfig.timeoutMs ?? 60000 });
+      } else {
+        this.logger.warn("Host exec is disabled because the Koishi process is not running on Linux");
+      }
+    }
     const sharedWorkspaceRoot = resolveSharedWorkspaceRoot(this.ctx.baseDir, this.config.sharedPath);
     if (sharedWorkspaceRoot) await mkdir(sharedWorkspaceRoot, { recursive: true });
     const skillPaths = (this.config.skillPaths ?? []).map((path) => resolve(this.ctx.baseDir, path));
@@ -128,17 +157,31 @@ export default class WorkspacePlugin {
     const runtimeSkills = this.skillCatalog.map((skill) => ({ ...skill }));
     const runtimeMounts = this.normalizedMounts;
     const shared = this.sharedWorkspaceRoot !== undefined;
+    const hostExecConfig = this.hostExecConfig;
+    const hostRunner = this.hostRunner;
+    const hostExecAllowed = hostRunner !== undefined && isHostExecAllowed(scope, hostExecConfig?.allowedChannels ?? []);
     return {
       name: "workspace",
-      tools: async () => createBashToolSet(await this.getOrCreateWorkspace(resources, sandbox, runtimeMounts)),
+      tools: async () => {
+        const tools = await createBashToolSet(await this.getOrCreateWorkspace(resources, sandbox, runtimeMounts));
+        if (hostExecAllowed && hostRunner) {
+          tools.push(createHostExecTool({ runner: hostRunner, defaultTimeoutMs: hostExecConfig?.timeoutMs ?? 60000 }));
+        }
+        return tools;
+      },
       appendSystemPrompt: async () => {
         const workspace = await this.getOrCreateWorkspace(resources, sandbox, runtimeMounts);
-        return [formatWorkspacePrompt(workspace, { shared }), formatSkillsForPrompt(runtimeSkills)].filter(Boolean);
+        return [
+          formatWorkspacePrompt(workspace, { shared }),
+          ...(hostExecAllowed ? [formatHostExecPrompt(hostExecConfig?.timeoutMs ?? 60000)] : []),
+          formatSkillsForPrompt(runtimeSkills),
+        ].filter(Boolean);
       },
     } satisfies AgentPlugin;
   }
 
   public async stop(): Promise<void> {
+    await this.stopHostRunner();
     this.disposeAgentPlugin?.();
     this.disposeAgentPlugin = undefined;
     for (const dispose of this.disposeReaders.splice(0)) dispose();
@@ -146,6 +189,7 @@ export default class WorkspacePlugin {
     this.skillCatalog = [];
     this.sandbox = undefined;
     this.sharedWorkspaceRoot = undefined;
+    this.hostExecConfig = undefined;
     this.logger.info("Workspace plugin stopped");
   }
 
@@ -204,6 +248,22 @@ export default class WorkspacePlugin {
     };
   }
 
+  private getHostExecConfig(): HostExecConfig | undefined {
+    const hostExec = this.config.hostExec;
+    if (!hostExec?.enabled) return undefined;
+    return {
+      enabled: true,
+      allowedChannels: (hostExec.allowedChannels ?? []).map((rule) => ({ ...rule })),
+      timeoutMs: hostExec.timeoutMs ?? 60000,
+    };
+  }
+
+  private async stopHostRunner(): Promise<void> {
+    const runner = this.hostRunner;
+    this.hostRunner = undefined;
+    if (runner) await runner.stop();
+  }
+
   private async openSkillFromCatalog(
     skills: readonly Skill[],
     _resources: ChannelResources,
@@ -247,6 +307,13 @@ export default class WorkspacePlugin {
     const bytes = await readBoundedFile(realFile, options);
     return { bytes, filename: basename(realFile) };
   }
+}
+
+export function isHostExecAllowed(scope: ChannelContext, rules: readonly HostExecChannelRule[]): boolean {
+  if (scope.type !== "direct") return false;
+  return rules.some(
+    (rule) => rule.platform === scope.platform && rule.channelId === scope.channelId && rule.userId === scope.userId && rule.selfId === scope.selfId,
+  );
 }
 
 async function readBoundedFile(filePath: string, options: { signal: AbortSignal; maxBytes: number }): Promise<Uint8Array> {

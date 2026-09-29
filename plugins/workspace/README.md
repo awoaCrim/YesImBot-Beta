@@ -7,6 +7,7 @@ Workspace tools for YesImBot agents, backed by `just-bash` and `bash-tool`.
 - `bash`: run supported Unix-style commands in a `just-bash` virtual sandbox.
 - `readFile`: read a known file from the virtual workspace.
 - `writeFile`: write a complete file into the virtual workspace.
+- `hostExec`: optionally run a real SSH1 host Bash command, but only for an exact configured Anon OneBot direct scope. This is disabled by default and is a high-privilege operations entry point.
 
 The default writable workspace is channel-isolated. On channel initialization
 the plugin obtains `ChannelResources` through `ctx.yesimbot.resource.get(scope)`
@@ -20,15 +21,16 @@ tool-name-specific prompts to use `bash`, `readFile`, and `writeFile`.
 
 ## Configuration
 
-| Option          | Meaning                                                                                                 |
-| --------------- | ------------------------------------------------------------------------------------------------------- |
-| `sharedPath`    | Optional host path used as `/home/workspace` by every enabled channel.                                 |
-| `cwd`           | Virtual working directory used by `bash-tool`. Default: `/home/workspace`.                              |
-| `persistPaths`  | Extra writable host-backed mounts. Changes persist on the host.                                         |
-| `readOnlyPaths` | Read-only host-backed mounts. Reads succeed, writes fail.                                               |
-| `overlayPaths`  | Copy-on-write host-backed mounts. Reads come from the host path, writes stay in the virtual filesystem. |
-| `timeoutMs`     | Bash command timeout in milliseconds. Default: `30000`.                                                 |
-| `enableNetwork` | Enables `just-bash` network support. Default: `false`.                                                  |
+| Option          | Meaning                                                                                                        |
+| --------------- | -------------------------------------------------------------------------------------------------------------- |
+| `sharedPath`    | Optional host path used as `/home/workspace` by every enabled channel.                                         |
+| `cwd`           | Virtual working directory used by `bash-tool`. Default: `/home/workspace`.                                     |
+| `persistPaths`  | Extra writable host-backed mounts. Changes persist on the host.                                                |
+| `readOnlyPaths` | Read-only host-backed mounts. Reads succeed, writes fail.                                                      |
+| `overlayPaths`  | Copy-on-write host-backed mounts. Reads come from the host path, writes stay in the virtual filesystem.        |
+| `timeoutMs`     | Bash command timeout in milliseconds. Default: `30000`.                                                        |
+| `enableNetwork` | Enables `just-bash` network support. Default: `false`.                                                         |
+| `hostExec`      | Optional exact-scope SSH1 host command capability; disabled by default and requires host namespace deployment. |
 
 Without `sharedPath`, the writable workspace root comes from
 `ChannelResources.path`. With `sharedPath`, the configured path is resolved
@@ -104,6 +106,28 @@ persistPaths:
 
 Use writable host-backed mounts only for trusted operators and trusted
 channels. The agent can modify real host files under these mounts.
+
+### Exact Anon SSH1 host scope
+
+```yaml
+hostExec:
+  enabled: true
+  allowedChannels:
+    - platform: onebot
+      channelId: private:1049700117
+      userId: "1049700117"
+      selfId: "3535802886"
+  timeoutMs: 60000
+```
+
+`hostExec` is not another virtual mount. It enters the configured Linux host
+namespace and runs `/bin/bash` as the existing host user `anon`; that user may
+use its existing `sudo` policy to manage the whole SSH1 host. The tool is
+registered only when all four scope fields match exactly and the Koishi
+process is running on Linux. Do not use wildcards or expose this capability to
+groups or ordinary channels. The container deployment must separately provide
+`pid: host`, privileged namespace access, and the required host mounts; a cwd
+or virtual mount alone cannot make this tool work.
 
 ## Sandbox Notes
 

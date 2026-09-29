@@ -1,8 +1,10 @@
+import type { AgentMessage } from "@yesimbot/agent-runtime";
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("koishi", async () => import("@koishijs/core"));
 
 import {
+  buildPolisherTurnContext,
   createSendMessagePolisher,
   extractProtectedTokens,
   PolisherRegistry,
@@ -14,8 +16,8 @@ import type { ChannelContext } from "../src/channels/index.js";
 
 const context: ChannelContext = { type: "guild", platform: "test", channelId: "room", guildId: "room" };
 
-function execution() {
-  return { toolCallId: "call", turnId: "turn", abortSignal: undefined } as never;
+function execution(messages: readonly AgentMessage[] = []) {
+  return { toolCallId: "call", turnId: "turn", abortSignal: undefined, messages } as never;
 }
 
 function createTool(extra: { sendMessage?: ReturnType<typeof vi.fn>; polish?: SendMessageToolOptions["polish"] } = {}) {
@@ -41,6 +43,50 @@ function createPolishHook(polish: MessagePolisherCapability["polish"]) {
   return createSendMessagePolisher({ registry, resolveProfile: async () => ({ persona: "p" }), context });
 }
 
+function currentTurnMessages(): AgentMessage[] {
+  return [
+    {
+      id: "user",
+      timestamp: 1,
+      role: "user",
+      content: [
+        { type: "text", text: "查一下天气" },
+        { type: "image", image: "raw-image" },
+      ],
+    },
+    {
+      id: "assistant",
+      timestamp: 2,
+      role: "assistant",
+      content: [
+        { type: "reasoning", text: "PRIVATE_REASONING" },
+        { type: "tool-call", toolCallId: "call-1", toolName: "web_search", input: { query: "PRIVATE_QUERY", inner_thought: "PRIVATE_THOUGHT" } },
+      ],
+    },
+    {
+      id: "tool",
+      timestamp: 3,
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "call-1",
+          toolName: "web_search",
+          output: {
+            provider: "test",
+            query: "天气",
+            results: [{ title: "天气预报", url: "https://example.com/weather", snippet: "今天晴。", rawContent: "今天晴，PRIVATE_RESULT" }],
+            inner_thought: "PRIVATE_OUTPUT_THOUGHT",
+            reason: "PRIVATE_OUTPUT_REASON",
+          },
+        },
+        { type: "tool-result", toolCallId: "call-2", toolName: "send_message", output: { messages: ["已经发送"] } },
+        { type: "tool-result", toolCallId: "call-3", toolName: "generate_image", output: { artifact: "artifact://image/1", image: "raw-pixels" } },
+      ],
+    },
+  ] as unknown as AgentMessage[];
+}
+
 describe("extractProtectedTokens", () => {
   it("extracts numeric expressions, element tags, resource URIs, and at mentions", () => {
     expect(extractProtectedTokens('看 -12.5%、+3/4 和 asset://abc123<img src="asset://up"/> <at id="7"/> @bob @bob.example @猫-龙')).toEqual([
@@ -53,6 +99,48 @@ describe("extractProtectedTokens", () => {
       "@bob.example",
       "@猫-龙",
     ]);
+  });
+});
+
+describe("buildPolisherTurnContext", () => {
+  it("keeps current user/media and safe tool results while excluding reasoning, calls, sends, and image output", () => {
+    const context = buildPolisherTurnContext(currentTurnMessages());
+    expect(context).toEqual([
+      { kind: "user", content: "查一下天气[图片]" },
+      {
+        kind: "tool-result",
+        toolName: "web_search",
+        content: expect.stringContaining('"query": "天气"'),
+      },
+    ]);
+
+    const serialized = JSON.stringify(context);
+    expect(serialized).toContain("天气预报");
+    expect(serialized).toContain("PRIVATE_RESULT");
+    expect(serialized).not.toContain("PRIVATE_REASONING");
+    expect(serialized).not.toContain("PRIVATE_QUERY");
+    expect(serialized).not.toContain("PRIVATE_THOUGHT");
+    expect(serialized).not.toContain("PRIVATE_OUTPUT_THOUGHT");
+    expect(serialized).not.toContain("send_message");
+    expect(serialized).not.toContain("generate_image");
+    expect(serialized).not.toContain("raw-pixels");
+  });
+
+  it("bounds each entry and the complete current-turn reference", () => {
+    const messages = [
+      { id: "user", timestamp: 1, role: "user", content: [{ type: "text", text: "x".repeat(100_000) }] },
+      ...Array.from({ length: 30 }, (_, index) => ({
+        id: `tool-${index}`,
+        timestamp: index + 2,
+        role: "tool",
+        content: [{ type: "tool-result", toolName: "lookup", output: { text: "y".repeat(10_000) } }],
+      })),
+    ] as unknown as AgentMessage[];
+
+    const context = buildPolisherTurnContext(messages);
+    expect(context.length).toBeLessThanOrEqual(16);
+    expect(context.every((entry) => entry.content.length <= 4_000)).toBe(true);
+    expect(context.reduce((total, entry) => total + entry.content.length, 0)).toBeLessThanOrEqual(16_000);
   });
 });
 
@@ -119,6 +207,24 @@ describe("PolisherRegistry", () => {
     expect(registry.revision).toBe(4);
   });
 
+  it("notifies listeners for capability and profile revisions", () => {
+    const registry = new PolisherRegistry();
+    const revisions: number[] = [];
+    const disposeListener = registry.onRevision((revision) => revisions.push(revision));
+    const capability = { name: "capability", polish: vi.fn(async () => undefined) };
+    const provider = { name: "provider", resolve: () => undefined };
+
+    const disposeCapability = registry.use(capability);
+    const disposeProvider = registry.profile(provider);
+    disposeCapability();
+    disposeProvider();
+
+    expect(revisions).toEqual([1, 2, 3, 4]);
+    disposeListener();
+    registry.use(capability);
+    expect(revisions).toEqual([1, 2, 3, 4]);
+  });
+
   it("uses only a non-empty role profile and swallows provider failures", async () => {
     const registry = new PolisherRegistry();
     const empty = { name: "empty", resolve: () => undefined };
@@ -161,6 +267,24 @@ describe("createSendMessageTool polisher integration", () => {
     expect(sendMessage.mock.calls[0]?.[0]).toBe("other");
     expect(sentPayload(sendMessage)).toContain("润色后的稿子");
     expect(sentPayload(sendMessage)).not.toContain("原稿");
+  });
+
+  it("forwards the bounded current-turn context immediately before polishing", async () => {
+    const polish = vi.fn(async () => ["润色后的稿子"]);
+    const { tool, sendMessage } = createTool({ polish: createPolishHook(polish) });
+
+    await tool.execute({ facts: ["天气结果"], messages: ["原稿"], mode: "raw" }, execution(currentTurnMessages()));
+
+    expect(polish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        facts: ["天气结果"],
+        messages: ["原稿"],
+        turnContext: expect.arrayContaining([expect.objectContaining({ kind: "tool-result", toolName: "web_search" })]),
+      }),
+      context,
+      undefined,
+    );
+    expect(sendMessage).toHaveBeenCalledOnce();
   });
 
   it("preserves the sender's partial-failure receipt after polishing without retrying delivery", async () => {
@@ -249,10 +373,15 @@ describe("createSendMessageTool polisher integration", () => {
     const resolveProfile = vi.fn(async () => ({ persona: `persona-${++version}` }));
     const polish = createSendMessagePolisher({ registry, resolveProfile, context });
 
-    await expect(polish({ facts: ["f"], messages: ["draft"] })).resolves.toEqual(["persona-1"]);
-    await expect(polish({ facts: ["f"], messages: ["draft"] })).resolves.toEqual(["persona-2"]);
+    await expect(polish({ facts: ["f"], messages: ["draft"], turnContext: [] })).resolves.toEqual(["persona-1"]);
+    await expect(polish({ facts: ["f"], messages: ["draft"], turnContext: [] })).resolves.toEqual(["persona-2"]);
     expect(resolveProfile).toHaveBeenCalledTimes(2);
-    expect(capability.polish).toHaveBeenNthCalledWith(1, { facts: ["f"], messages: ["draft"], profile: { persona: "persona-1" } }, context, undefined);
+    expect(capability.polish).toHaveBeenNthCalledWith(
+      1,
+      { facts: ["f"], messages: ["draft"], profile: { persona: "persona-1" }, turnContext: [] },
+      context,
+      undefined,
+    );
   });
 
   it("falls back to the original draft when the polisher throws", async () => {

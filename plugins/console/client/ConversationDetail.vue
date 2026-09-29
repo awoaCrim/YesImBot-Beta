@@ -240,7 +240,6 @@ const error = ref("");
 const query = ref("");
 const filter = ref<"all" | "chat" | "thought" | "tool" | "event">("all");
 const loadingMore = ref(false);
-const loadedOlderPages = ref(false);
 const timelineScroller = ref<HTMLElement | null>(null);
 let timer: number | undefined;
 let loadGeneration = 0;
@@ -290,11 +289,10 @@ async function loadLatest(reset = false): Promise<void> {
   const generation = ++loadGeneration;
   const wasAtBottom = isAtBottom(timelineScroller.value);
   if (reset) {
-    loadedOlderPages.value = false;
     loadingMore.value = false;
     detail.value = undefined;
   }
-  const preserveLoadedPages = !reset && loadedOlderPages.value && Boolean(detail.value);
+  const preserveExistingDetail = !reset && Boolean(detail.value);
   loading.value = true;
   error.value = "";
   try {
@@ -302,7 +300,7 @@ async function loadLatest(reset = false): Promise<void> {
     const requestDetail = send as unknown as (type: "yesimbot/conversation", input: ConversationRequest) => Promise<DetailPayload>;
     const latest = await requestDetail("yesimbot/conversation", request);
     if (generation !== loadGeneration) return;
-    if (!preserveLoadedPages || !detail.value) {
+    if (!preserveExistingDetail || !detail.value) {
       detail.value = latest;
       await nextTick();
       scrollToBottom();
@@ -352,7 +350,6 @@ async function loadMore(): Promise<void> {
       nextCursor: older.nextCursor,
       summary: summarizeEntries(entries, older.summary.sizeBytes),
     };
-    loadedOlderPages.value = true;
     await nextTick();
     if (scroller) {
       scroller.scrollTop = previousScrollTop + Math.max(0, scroller.scrollHeight - previousScrollHeight);

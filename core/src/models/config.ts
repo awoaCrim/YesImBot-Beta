@@ -1,5 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 
+import { THINKING_LEVELS, type ThinkingLevel, type ThinkingLevelMap } from "./thinking.js";
+
 export const CHAT_MODEL_MODALITIES = ["text", "audio", "image", "video", "pdf"] as const;
 
 let mutationTail: Promise<void> = Promise.resolve();
@@ -14,6 +16,8 @@ export interface ChatModelConfig {
   hidden?: boolean;
   toolCall?: boolean;
   reasoning?: boolean;
+  thinkingLevel?: ThinkingLevel;
+  thinkingLevelMap?: ThinkingLevelMap;
   limit?: { context: number; output: number };
   modalities?: { input?: ChatModelModality[]; output?: ChatModelModality[] };
   variants?: Record<string, unknown>;
@@ -152,6 +156,35 @@ function readBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
+function readThinkingLevel(value: unknown, fullId: string, warnings: string[]): ThinkingLevel | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "string" && THINKING_LEVELS.some((level) => level === value)) return value as ThinkingLevel;
+  warnings.push(`models.json chat override for "${fullId}" thinkingLevel must be one of: ${THINKING_LEVELS.join(", ")}.`);
+  return undefined;
+}
+
+function readThinkingLevelMap(value: unknown, fullId: string, warnings: string[]): ThinkingLevelMap | undefined {
+  if (value === undefined) return undefined;
+  if (!isPlainObject(value)) {
+    warnings.push(`models.json chat override for "${fullId}" thinkingLevelMap must be an object.`);
+    return undefined;
+  }
+
+  const result: ThinkingLevelMap = {};
+  for (const [level, native] of Object.entries(value)) {
+    if (!THINKING_LEVELS.some((candidate) => candidate === level)) {
+      warnings.push(`models.json chat override for "${fullId}" thinkingLevelMap has unknown level "${level}".`);
+      continue;
+    }
+    if (native !== null && typeof native !== "string") {
+      warnings.push(`models.json chat override for "${fullId}" thinkingLevelMap.${level} must be a string or null.`);
+      continue;
+    }
+    result[level as ThinkingLevel] = native;
+  }
+  return result;
+}
+
 function readLimit(value: unknown, fullId: string, warnings: string[]): ChatModelConfig["limit"] {
   if (!isPlainObject(value)) {
     warnings.push(`models.json chat override for "${fullId}" limit must be an object.`);
@@ -207,6 +240,8 @@ function readChatOverrides(section: JsonObject, warnings: string[]): Record<stri
       name: readString(value.name),
       toolCall: readBoolean(value.toolCall),
       reasoning: readBoolean(value.reasoning),
+      thinkingLevel: readThinkingLevel(value.thinkingLevel, fullId, warnings),
+      thinkingLevelMap: readThinkingLevelMap(value.thinkingLevelMap, fullId, warnings),
       hidden: readBoolean(value.hidden),
       limit: value.limit === undefined ? undefined : readLimit(value.limit, fullId, warnings),
       modalities: value.modalities === undefined ? undefined : readModalities(value.modalities, fullId, warnings),
@@ -227,3 +262,7 @@ function readEmbeddingOverrides(section: JsonObject, warnings: string[]): Record
   }
   return result;
 }
+
+export type { ThinkingLevel, ThinkingLevelMap } from "./thinking.js";
+
+export { THINKING_LEVELS } from "./thinking.js";
