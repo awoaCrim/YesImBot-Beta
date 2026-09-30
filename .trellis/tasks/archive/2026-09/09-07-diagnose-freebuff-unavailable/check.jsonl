@@ -1,2 +1,0 @@
-{"file":".trellis/spec/guides/index.md","reason":"质量检查需要覆盖跨层数据流、配置变更和回滚边界。"}
-{"file":".trellis/spec/new-api/backend/deployment-integration.md","reason":"质量检查需要确认 NewAPI 渠道、健康探测、模型探测和敏感凭据保护没有被破坏。"}

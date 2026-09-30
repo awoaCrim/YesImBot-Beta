@@ -1,4 +1,0 @@
-{"file":".trellis/spec/guides/index.md","reason":"遵循共享思考指南，检查宿主机服务、文件边界和验证。"}
-{"file":".trellis/spec/ops/index.md","reason":"确认运维规范入口和跨服务变更边界。"}
-{"file":".trellis/spec/ops/server-cleanup.md","reason":"遵循精确路径、服务依赖、凭据保护和前后验证合同。"}
-{"file":".trellis/tasks/09-14-remove-ssh1-ollama-nginx/research/inventory-2026-09-14.md","reason":"提供 Ollama/Nginx 当前服务、路径、包、端口和 Natfrp 保留基线。"}

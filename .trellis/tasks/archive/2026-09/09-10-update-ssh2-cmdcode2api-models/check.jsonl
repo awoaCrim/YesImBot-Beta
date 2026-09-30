@@ -1,2 +1,0 @@
-{"file":".trellis/tasks/09-10-update-ssh2-cmdcode2api-models/research/commandcode-model-catalog.md","reason":"质量检查时以执行时官方目录和已确认的 69 模型基线核对管理 API、/v1/models 和暴露策略。"}
-{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"检查官方目录到进程内 catalog、管理台和对外 API 的跨边界数据是否完整、未误开放模型。"}

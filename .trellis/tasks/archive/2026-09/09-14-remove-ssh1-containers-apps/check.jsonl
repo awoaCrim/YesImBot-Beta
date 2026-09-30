@@ -1,7 +1,0 @@
-{"file":".trellis/spec/ops/server-cleanup.md","reason":"检查容器、volume、宿主机目录、enabled unit 和 Docker bind mount 删除是否符合运维合同。"}
-{"file":".trellis/tasks/09-14-remove-ssh1-containers-apps/research/current-inventory-2026-09-14.txt","reason":"对照清理前 Docker、服务、端口和磁盘基线。"}
-{"file":".trellis/tasks/09-14-remove-ssh1-containers-apps/research/target-dependencies-2026-09-14.md","reason":"对照用户确认的 Natfrp 保留范围、删除目标和 Nginx/systemd 依赖。"}
-{"file":".trellis/tasks/09-14-remove-ssh1-containers-apps/research/preflight-delete-before-2026-09-14.txt","reason":"删除前即时确认目标容器、镜像、volume、目录、unit 和 Nginx 引用。"}
-{"file":".trellis/tasks/09-14-remove-ssh1-containers-apps/research/removal-execution-2026-09-14.txt","reason":"记录精确删除动作及已保留 Natfrp 的执行输出。"}
-{"file":".trellis/tasks/09-14-remove-ssh1-containers-apps/research/postflight-delete-after-2026-09-14.txt","reason":"新 SSH 连接下确认目标资源消失、Natfrp/系统服务/端口正常和 Nginx 配置通过。"}
-{"file":".trellis/tasks/09-14-remove-ssh1-containers-apps/research/execution-summary-2026-09-14.md","reason":"汇总最终删除、保留、释放空间、验证结果和执行异常说明。"}

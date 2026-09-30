@@ -1,3 +1,0 @@
-{"file":".trellis/tasks/09-10-add-upstream-model-refresh-button/research/cmdcode2api-refresh-button-research.md","reason":"质量检查以现有实现证据、接口边界和 Go 1.25 验证约束为基线。"}
-{"file":".trellis/spec/v7/backend/cmdcode2api-model-catalog.md","reason":"检查刷新 endpoint、默认隐藏新模型、并发锁、错误矩阵和部署回滚是否符合 ssh2 运维契约。"}
-{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"检查上游响应到 catalog、exclusion 持久化、admin API 和 UI 展示的完整数据流，避免按钮只改表面。"}

@@ -1,5 +1,0 @@
-{"file":".trellis/spec/guides/index.md","reason":"遵循共享思考指南，检查远程删除的依赖、边界和验证。"}
-{"file":".trellis/spec/ops/index.md","reason":"确认运维规范入口和跨服务变更边界。"}
-{"file":".trellis/spec/ops/server-cleanup.md","reason":"遵循精确路径、enabled service、Docker bind mount 和前后验证合同。"}
-{"file":".trellis/tasks/09-14-remove-ssh1-containers-apps/research/current-inventory-2026-09-14.txt","reason":"当前容器、镜像、volumes、bind mounts、宿主机目录和服务基线。"}
-{"file":".trellis/tasks/09-14-remove-ssh1-containers-apps/research/target-dependencies-2026-09-14.md","reason":"记录用户最终删除范围及 systemd/Nginx 依赖处理。"}

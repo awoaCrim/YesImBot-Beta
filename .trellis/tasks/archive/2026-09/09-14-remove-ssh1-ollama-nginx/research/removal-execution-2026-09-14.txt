@@ -1,34 +1,0 @@
-=== assertions ===
-ASSERTIONS=PASS
-=== stop and disable services ===
-SERVICES_STOPPED=ollama,nginx
-=== purge exact Debian packages ===
-Reading package lists...
-Building dependency tree...
-Reading state information...
-The following packages will be REMOVED:
-  nginx* nginx-common*
-0 upgraded, 0 newly installed, 2 to remove and 68 not upgraded.
-After this operation, 1,891 kB disk space will be freed.
-(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 71819 files and directories currently installed.)
-Removing nginx (1.26.3-3+deb13u2) ...
-Removing nginx-common (1.26.3-3+deb13u2) ...
-Processing triggers for man-db (2.13.1-1) ...
-(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 71789 files and directories currently installed.)
-Purging configuration files for nginx-common (1.26.3-3+deb13u2) ...
-PACKAGES_PURGED=nginx,nginx-common
-=== remove exact Ollama and Nginx paths ===
-REMOVED	/usr/local/bin/ollama	38273024 bytes
-REMOVED	/usr/share/ollama	2695168 bytes
-REMOVED	/root/.ollama	16384 bytes
-REMOVED	/etc/systemd/system/ollama.service	4096 bytes
-ABSENT	/etc/nginx
-ABSENT	/var/log/nginx
-ABSENT	/var/lib/nginx
-ABSENT	/var/cache/nginx
-ABSENT	/usr/lib/nginx
-ABSENT	/usr/sbin/nginx
-DAEMON_RELOAD=PASS
-=== same-connection assertions ===
-nginx_status=inactive ollama_status=inactive
-SAME_CONNECTION_ASSERTIONS=PASS

@@ -1,8 +1,0 @@
-{"file":"../public-api/.trellis/spec/backend/database-guidelines.md","reason":"Review database portability, bounded LOG_DB queries, and ClickHouse-specific behavior."}
-{"file":"../public-api/.trellis/spec/backend/error-handling.md","reason":"Review public error safety and confirm API keys/database details cannot leak."}
-{"file":"../public-api/.trellis/spec/backend/logging-guidelines.md","reason":"Review log DTO privacy and ensure secrets, bodies, IP, and admin fields remain excluded."}
-{"file":"../public-api/.trellis/spec/backend/quality-guidelines.md","reason":"Primary code-quality, security-contract, and regression-test checklist."}
-{"file":"../public-api/.trellis/spec/backend/deployment-guidelines.md","reason":"Review ssh2 commit/build/backup/health/rollback execution."}
-{"file":"../public-api/.trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Check end-to-end payload, authentication, cache, and UI state consistency."}
-{"file":"../public-api/.trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Check that privileged dashboard components are not copied or reused unsafely."}
-{"file":".trellis/tasks/08-27-newapi-key-usage-portal/research/repo-audit.md","reason":"Evidence baseline for verifying route scope, DTO omissions, frontend client isolation, and deployment target."}

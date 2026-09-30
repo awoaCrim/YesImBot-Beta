@@ -1,5 +1,0 @@
-{"file":".trellis/spec/guides/pi-environment-migration-guide.md","reason":"远程 Windows Pi 配置/扩展同步的 allowlist、备份、非交互验证和安全边界。"}
-{"file":".trellis/tasks/09-06-sync-pi-environment-ssh3/research/historical-sync-process.md","reason":"历史 ssh3 用户级同步流程及项目、凭据、进程状态排除经验。"}
-{"file":".trellis/tasks/09-06-upgrade-ssh3-pi-cli/research/current-package-lineage.md","reason":"ssh3 当前 Pi package lineage 和目标 CLI 验收事实。"}
-{"file": ".trellis/tasks/09-08-sync-pi-extensions-config-ssh3-ssh4/research/current-comparison.md", "reason": "核对 ssh3 已同步事实、ssh4 host-key/登录可用但尚未同步，以及 model-preserve allowlist 决策"}
-{"file": ".trellis/tasks/09-08-sync-pi-extensions-config-ssh3-ssh4/research/ssh4-comparison.md", "reason": "ssh4 host-key 信任后的只读连接与本机差异盘点"}

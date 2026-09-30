@@ -1,2 +1,0 @@
-{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "验证包配置、安装目录、运行时加载与后续新会话之间的跨层结果。"}
-{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "验证只移除目标包，未重复或误改其他扩展配置。"}
