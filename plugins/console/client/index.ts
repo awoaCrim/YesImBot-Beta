@@ -16,7 +16,8 @@ export default function (ctx: Context): void {
   });
   ctx.on("dispose", dispose);
 
-  if (router.currentRoute.value.path === "/") {
+  // Keep a pending direct URL saved by the router while dynamic pages load.
+  if (router.currentRoute.value.path === "/" && (!redirectTo.value || redirectTo.value === "/")) {
     redirectTo.value = "/yesimbot";
   }
 

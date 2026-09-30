@@ -153,7 +153,14 @@ const filteredChannels = computed(() => {
   return panel.value.channels.filter((channel) => {
     if (typeFilter.value !== "all" && channel.type !== typeFilter.value) return false;
     if (!keyword) return true;
-    const haystack = [channel.platform, channel.channelId, channel.guildId, channel.userId, channel.selfId, ...channel.sessions.map((session) => session.filename)]
+    const haystack = [
+      channel.platform,
+      channel.channelId,
+      channel.guildId,
+      channel.userId,
+      channel.selfId,
+      ...channel.sessions.map((session) => session.filename),
+    ]
       .filter(Boolean)
       .join(" ")
       .toLowerCase();
@@ -476,6 +483,10 @@ function willPolicyDetail(policy: ConversationWillPolicy): string {
 
 .yib-text-muted {
   color: var(--k-text-normal, #666);
+}
+
+.yib-text-warning {
+  color: var(--k-color-warning, #e6a23c);
 }
 
 .yib-session-list {
