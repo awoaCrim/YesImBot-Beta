@@ -70,6 +70,7 @@ jobs:
             -ec '
               set -eu
               apk add --no-cache bash python3 make g++ git libc6-compat
+              mkdir -p "$HOME"
               git config --global --add safe.directory /workspace
               HUSKY=0 node .yarn/releases/yarn-4.12.0.cjs install --immutable
               python3 scripts/release.py pack --source-sha "$SOURCE_SHA" --run-id "$RUN_ID" --repository "$REPOSITORY"
