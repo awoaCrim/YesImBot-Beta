@@ -16,6 +16,7 @@ export interface StickerConfig {
   tagRandomRange: number;
   sendStaticAsGif: boolean;
   stickerElement: boolean;
+  enableSteal: boolean;
 }
 
 export interface StickerSource {

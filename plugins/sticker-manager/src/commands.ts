@@ -1,10 +1,11 @@
-import { h, type Command, type Context, type Session } from "koishi";
+import { type Command, type Context, type Session } from "koishi";
 import type { ChannelContext } from "koishi-plugin-yesimbot";
 
 import type { StickerClassifier } from "./classifier.js";
 import { prepareStaticGif } from "./frames.js";
 import { importDirectory, importEmojiHubTxt, importImageFile } from "./importers.js";
 import { migrateScope, migrateV3 } from "./migrate.js";
+import { createStickerImageElement } from "./sender.js";
 import type { StickerStore } from "./store.js";
 import { scopeKeyFor, type ImportStats, type MigrationResult, type StickerConfig, type StickerProjection } from "./types.js";
 
@@ -331,8 +332,7 @@ export function registerStickerCommands(deps: StickerCommandDeps): () => void {
 async function sendSticker(session: Session, scopeKey: string, store: StickerStore, sticker: StickerProjection, sendStaticAsGif: boolean): Promise<void> {
   const bytes = await store.readBytes(sticker);
   const prepared = prepareStaticGif(bytes, sticker.mime, sendStaticAsGif);
-  const dataUrl = `data:${prepared.mediaType};base64,${Buffer.from(prepared.bytes).toString("base64")}`;
-  await session.send([h.image(dataUrl)]);
+  await session.send([createStickerImageElement(prepared.bytes, prepared.mediaType)]);
   await store.markUsed(scopeKey, sticker.id);
 }
 
