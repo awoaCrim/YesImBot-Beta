@@ -261,6 +261,15 @@
 
       <!-- 快捷入口 -->
       <section class="yib-quick-actions">
+        <router-link class="yib-action-card" to="/yesimbot/channels">
+          <div class="yib-action-card__icon"><k-icon name="clipboard-list"></k-icon></div>
+          <div class="yib-action-card__info">
+            <strong>会话浏览</strong>
+            <p>查看频道历史、工具调用与内部思考</p>
+          </div>
+          <k-icon name="chevron-right" class="yib-action-card__arrow"></k-icon>
+        </router-link>
+
         <router-link class="yib-action-card" to="/analytics">
           <div class="yib-action-card__icon"><k-icon name="tag"></k-icon></div>
           <div class="yib-action-card__info">
@@ -292,6 +301,27 @@ import { socket, store } from "@koishijs/client";
 import { computed } from "vue";
 
 import YesImBotIcon from "./YesImBotIcon.vue";
+
+const connected = computed(() => Boolean(socket.value));
+
+const panel = computed(() => (store as { yesimbotPanel?: PanelPayload }).yesimbotPanel ?? emptyPanel());
+
+const enabledPluginCount = computed(() => panel.value.plugins.filter((plugin) => plugin.enabled).length);
+
+const onboardingProgress = computed(() => {
+  const steps = panel.value.onboarding.steps;
+  if (!steps || steps.length === 0) return 100;
+  const doneCount = steps.filter((s) => s.done).length;
+  return Math.round((doneCount / steps.length) * 100);
+});
+
+const recentItems = computed(() => panel.value.recent.slice(0, 8));
+
+const imageInputText = computed(() => {
+  if (!panel.value.model.imageInput) return "禁用";
+  const budget = panel.value.model.imageBudget;
+  return budget ? `启用 · ${budget.maxCount} 张 / ${formatSize(budget.maxBytesPerImage)}` : "启用";
+});
 
 interface PanelPayload {
   generatedAt: string;
@@ -361,29 +391,11 @@ interface PanelOnboarding {
   steps: PanelOnboardingStep[];
 }
 
-const connected = computed(() => Boolean(socket.value));
-const panel = computed(() => (store as { yesimbotPanel?: PanelPayload }).yesimbotPanel ?? emptyPanel());
-const enabledPluginCount = computed(() => panel.value.plugins.filter((plugin) => plugin.enabled).length);
-
-const onboardingProgress = computed(() => {
-  const steps = panel.value.onboarding.steps;
-  if (!steps || steps.length === 0) return 100;
-  const doneCount = steps.filter((s) => s.done).length;
-  return Math.round((doneCount / steps.length) * 100);
-});
-const recentItems = computed(() => panel.value.recent.slice(0, 8));
-
 function isCurrentStep(index: number): boolean {
   const steps = panel.value.onboarding.steps;
   const firstUndone = steps.findIndex((s) => !s.done);
   return firstUndone === index;
 }
-
-const imageInputText = computed(() => {
-  if (!panel.value.model.imageInput) return "禁用";
-  const budget = panel.value.model.imageBudget;
-  return budget ? `启用 · ${budget.maxCount} 张 / ${formatSize(budget.maxBytesPerImage)}` : "启用";
-});
 
 function emptyPanel(): PanelPayload {
   return {
@@ -1110,7 +1122,7 @@ function adapterStateText(adapter: PanelAdapter): string {
 /* 快捷操作卡片 */
 .yib-quick-actions {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 16px;
 }
 
@@ -1269,6 +1281,10 @@ function adapterStateText(adapter: PanelAdapter): string {
 @media screen and (max-width: 900px) {
   .yib-metrics-grid,
   .yib-meta-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .yib-quick-actions {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

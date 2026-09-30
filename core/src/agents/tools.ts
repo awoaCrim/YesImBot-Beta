@@ -1,57 +1,199 @@
-import { jsonSchema, type AgentTool } from "@yesimbot/agent-runtime";
+import { EphemeralImageProjectionStore, jsonSchema, type AgentMessage, type AgentTool } from "@yesimbot/agent-runtime";
 import { generateText, type LanguageModel } from "ai";
-import type { Bot } from "koishi";
+import { h, type Bot, type Element } from "koishi";
 
-import { parseReply } from "../messages/index.js";
-import { prepareOutputSegments, ResourceReadError, type ChannelResources } from "../resources/index.js";
+import type { PacingConfig } from "../config.js";
+import { PARAGRAPH_BREAK, parseReply } from "../messages/index.js";
+import { detectImageMediaType, prepareOutputSegments, ResourceReadError, type ChannelResources } from "../resources/index.js";
+import { buildPolisherTurnContext, validatePolishedMessages, type PolisherTurnContext } from "./polisher.js";
 
 const READ_MAX_TEXT_CHARS = 30_000;
+const ONEBOT_GROUP_CHANNEL_PREFIX = "group:";
 
 type ResourceReadInput = { uri: string };
 
-type ResourceReadResult = { uri: string; filename?: string; mediaType?: string; text?: string; error?: string };
+export type ReadImageMode = "native" | "vision" | "unavailable";
+
+export interface ReadImagePolicy {
+  readonly mode: ReadImageMode;
+  readonly visionModel?: LanguageModel;
+}
+
+export type ResourceReadResult = {
+  uri: string;
+  filename?: string;
+  mediaType?: string;
+  text?: string;
+  imageMode?: ReadImageMode;
+  error?: string;
+};
 
 type DescribeImageInput = { uri: string; question: string };
 
 type DescribeImageOutput = { text: string } | { error: string };
 
-type SendMessageInput = { channelId: string; content: string };
+type SendMessageMode = "element" | "raw";
 
-type SendMessageOutput = { ok: true; messageIds: string[] } | { ok: false; error: { name: string; message: string } };
+type SendMessageInput = {
+  messages: string[];
+  facts?: string[];
+  channel?: string;
+  mode?: SendMessageMode;
+  continue?: boolean;
+  inner_thought?: string;
+};
 
-export function createSendMessageTool(bot: Bot, currentChannelId: string, resources: ChannelResources): AgentTool<SendMessageInput, SendMessageOutput> {
+type SendMessageOutput =
+  | { ok: true; messageIds: string[]; count: number }
+  | { ok: false; error: { name: string; message: string }; sent: string[]; failedAt: number };
+
+/** Facts about one delivered platform message, reported so the owner can announce it. */
+export interface DeliveredNotice {
+  readonly channelId: string;
+  readonly messageId: string;
+  readonly turnId: string;
+  readonly text: string;
+}
+
+/** Facts about an aborted send. The model learns from the tool result; this is for operators. */
+export interface SendFailedNotice {
+  readonly channelId: string;
+  readonly turnId: string;
+  readonly failedAt: number;
+  readonly total: number;
+  readonly error: { readonly name: string; readonly message: string };
+}
+
+export interface SendMessageToolOptions {
+  readonly bot: Bot;
+  /** Channel used when the model omits `channel`. */
+  readonly channelId: string;
+  readonly resources: ChannelResources;
+  readonly pacing: PacingConfig;
+  /** Exposes the `inner_thought` field so monologue never has to be written as visible text. */
+  readonly innerThought: boolean;
+  /** Requires the explicit `facts` field when a send-message polisher owns style rendering. */
+  readonly factsRequired?: boolean;
+  /** Optional pre-send rewrite. A result replaces `messages` only; failures keep the original draft. */
+  readonly polish?: (input: {
+    readonly facts: readonly string[];
+    readonly messages: readonly string[];
+    readonly turnContext: PolisherTurnContext;
+    readonly signal?: AbortSignal;
+  }) => Promise<readonly string[] | undefined>;
+  readonly onDelivered?: (notice: DeliveredNotice) => void;
+  readonly onFailed?: (notice: SendFailedNotice) => void;
+}
+
+/**
+ * Sends the supplied messages to a platform. Plain model text is never delivered; plugin-owned
+ * delivery tools can send their own content. Ends the turn unless the model asks to `continue`.
+ */
+export function createSendMessageTool(options: SendMessageToolOptions): AgentTool<SendMessageInput, SendMessageOutput> {
+  const { bot, channelId: defaultChannelId, resources, pacing, innerThought, factsRequired, polish, onDelivered, onFailed } = options;
   return {
-    name: "sendMessage",
-    description: [
-      "向当前频道以外的指定频道发送一条消息。不要使用本工具回复当前频道；直接输出文本即可。",
-      "content 使用与直接输出相同的元素语法。",
-      "返回 {ok:true,messageIds} 或 {ok:false,error}；必须检查 ok，失败时不会发出消息。",
-    ].join("\n"),
+    name: "send_message",
+    terminal: (input) => !input.continue,
+    description: sendMessageDescription(innerThought, factsRequired === true),
     inputSchema: jsonSchema<SendMessageInput>({
       type: "object",
-      properties: { channelId: { type: "string", minLength: 1 }, content: { type: "string" } },
-      required: ["channelId", "content"],
+      properties: {
+        messages: {
+          type: "array",
+          minItems: 1,
+          items: { type: "string", minLength: 1 },
+          description: factsRequired
+            ? "本轮待发送的草稿消息；完整表达事实、判断和交流动作，不自行添加事实或承诺。每一项对应一条独立消息，润色时保留条数与顺序"
+            : "要发送的消息，每一项作为一条独立消息按顺序发出；同一次调用中的所有项目属于同一个回应单元，语域、说话身份和情绪力度保持连贯",
+        },
+        ...(factsRequired
+          ? {
+              facts: {
+                type: "array",
+                minItems: 1,
+                items: { type: "string", minLength: 1 },
+                description: "本次回复依据的明示事实列表：哪一条来自可见消息、哪一条来自工具结果、哪一条只是你的推断；只用于发送前校验，不会发送给任何人",
+              },
+            }
+          : {}),
+        channel: {
+          type: "string",
+          minLength: 1,
+          description: "目标频道 ID；留空则发往当前频道。OneBot 群频道直接填写裸群号，不要使用 group: 前缀",
+        },
+        mode: { type: "string", enum: ["element", "raw"], description: "element（默认）解析消息元素；raw 原样发送纯文本" },
+        continue: {
+          type: "boolean",
+          description: "默认 false，发送后结束本轮；true 时继续下一步。本轮还要调用其他工具或发送更多内容时，必须在这次发送前设为 true",
+        },
+        ...(innerThought ? { inner_thought: { type: "string", description: "本次发送前的内心独白；只保留在你自己的历史里，不会发送给任何人" } } : {}),
+      },
+      required: factsRequired ? ["facts", "messages"] : ["messages"],
     }),
-    execute: async ({ channelId, content }, execution) => {
-      if (channelId === currentChannelId) {
-        return { ok: false, error: { name: "InvalidChannel", message: "sendMessage cannot target the current channel" } };
+    execute: async (input, execution) => {
+      const requestedTarget = input.channel ? input.channel : defaultChannelId;
+      const target =
+        bot.platform === "onebot" && requestedTarget.startsWith(ONEBOT_GROUP_CHANNEL_PREFIX)
+          ? requestedTarget.slice(ONEBOT_GROUP_CHANNEL_PREFIX.length)
+          : requestedTarget;
+      const inputMessages = Array.isArray(input.messages) ? input.messages : [];
+      if (inputMessages.length === 0) return { ok: false, error: { name: "InvalidInput", message: "messages is empty" }, sent: [], failedAt: 0 };
+      if (inputMessages.some((message) => typeof message !== "string" || message.length === 0))
+        return { ok: false, error: { name: "InvalidInput", message: "messages must be non-empty strings" }, sent: [], failedAt: 0 };
+      if (input.mode && input.mode !== "element" && input.mode !== "raw")
+        return { ok: false, error: { name: "InvalidInput", message: `mode must be "element" or "raw"` }, sent: [], failedAt: 0 };
+      const mode = input.mode ?? "element";
+      const messages = await polishedMessages(polish, input, execution.messages, execution.abortSignal);
+      const total = messages.length;
+      const sent: string[] = [];
+      let elapsed = 0;
+      const abort = (index: number, error: { name: string; message: string }): SendMessageOutput => {
+        onFailed?.({ channelId: target, turnId: execution.turnId, failedAt: index, total, error });
+        return { ok: false, error, sent, failedAt: index };
+      };
+      for (const [index, message] of messages.entries()) {
+        try {
+          // Parse first so paragraph breaks cannot cut element syntax or expose stripped thoughts.
+          const parsed = mode === "raw" ? [[h.text(message)]] : parseReply(message, true);
+          const split = parsed.length > 1 || parsed.some(hasParagraphBreak);
+          const paragraphs = parsed.flatMap(splitMessageParagraphs);
+          const segments: { elements: Element[]; text: string }[] = [];
+          for (const paragraph of paragraphs) {
+            const text = split ? formatOutputParagraph(paragraph) : message;
+            const prepared = mode === "raw" ? [paragraph] : await prepareOutputSegments([paragraph], resources, execution.abortSignal);
+            for (const elements of prepared) segments.push({ elements, text });
+          }
+          for (const { elements: segment, text } of segments) {
+            if (sent.length > 0) {
+              const delay = pacedDelay(segment, pacing, elapsed);
+              const startedAt = Date.now();
+              await sleep(delay, execution.abortSignal);
+              elapsed += Math.max(delay, Date.now() - startedAt);
+            }
+            if (execution.abortSignal?.aborted) return abort(index, { name: "AbortError", message: "send_message aborted" });
+            const ids = await bot.sendMessage(target, segment);
+            sent.push(...ids);
+            for (const id of ids) onDelivered?.({ channelId: target, messageId: id, turnId: execution.turnId, text });
+          }
+        } catch (cause) {
+          if (cause instanceof ResourceReadError) return abort(index, { name: cause.code, message: cause.message });
+          return abort(index, {
+            name: cause instanceof Error ? cause.name : "Error",
+            message: cause instanceof Error ? cause.message : String(cause),
+          });
+        }
       }
-      try {
-        const messageIds: string[] = [];
-        const segments = await prepareOutputSegments(parseReply(content), resources, execution.abortSignal);
-        for (const segment of segments) messageIds.push(...(await bot.sendMessage(channelId, segment)));
-        return { ok: true, messageIds };
-      } catch (cause) {
-        if (cause instanceof ResourceReadError) return { ok: false, error: { name: cause.code, message: cause.message } };
-        return { ok: false, error: { name: cause instanceof Error ? cause.name : "Error", message: cause instanceof Error ? cause.message : String(cause) } };
-      }
+      return { ok: true, messageIds: sent, count: total };
     },
   };
 }
 
-export function createReadTool(resources: ChannelResources, imageOutputSupported: boolean): AgentTool<{ uri: string }, ResourceReadResult> {
-  const pendingImages = new Map<string, { bytes: Uint8Array; mediaType: string }>();
-  const imageEnabled = imageOutputSupported && resources.imageInput;
+export function createReadTool(
+  resources: ChannelResources,
+  policyInput: ReadImagePolicy | boolean,
+  imageProjection = new EphemeralImageProjectionStore(),
+): AgentTool<{ uri: string }, ResourceReadResult> {
+  const policy: ReadImagePolicy = typeof policyInput === "boolean" ? { mode: policyInput && resources.imageInput ? "native" : "unavailable" } : policyInput;
   const lines = [
     "读取资源内容。仅在确实需要内容时读取精确 URI，不要猜测或拼造 URI。",
     "URI 形如 scheme://authority[/path]，不能包含 ?、#、%，也不能有 . 或 .. 路径段。",
@@ -64,24 +206,26 @@ export function createReadTool(resources: ChannelResources, imageOutputSupported
     .sort((a, b) => a.scheme.localeCompare(b.scheme))) {
     lines.push(`- ${reader.scheme}://：${reader.prompt}`);
   }
-  lines.push(
-    "",
-    "返回 {uri, filename?, mediaType?, text?, error?}。",
-    "- 文本资源在 text 中直接给出内容，过长会被截断并以 [内容已截断] 结尾。",
-    imageEnabled
-      ? "- 图片资源：读取后图片字节将随结果返回，你可以直接查看图片内容。查看图片必须使用本工具读取。"
-      : "- 图片资源只给出占位描述，不包含图片字节，当前无法查看图片内容。",
-  );
-  if (!imageEnabled) lines.push("- 需要图片内容时，使用 describe_image 工具获取图片描述。");
+  lines.push("", "返回 {uri, filename?, mediaType?, text?, imageMode?, error?}。", "- 文本资源在 text 中直接给出内容，过长会被截断并以 [内容已截断] 结尾。");
+  if (policy.mode === "native") {
+    lines.push("- 图片资源：读取后图片字节将随结果返回，你可以直接查看图片内容。查看图片必须使用本工具读取。");
+  } else if (policy.mode === "vision") {
+    lines.push("- 图片资源：本工具会自动调用视觉模型，并在 text 中返回图片描述；主模型不会接收原始图片字节。");
+  } else {
+    lines.push("- 图片资源只返回明确的不可用结果，当前无法查看图片内容；不要根据文件名或上下文猜测画面。");
+  }
   lines.push(
     "- 其他二进制只给出类型与大小，无法查看内容。",
-    "- error 存在时不会有 text：invalid_resource_uri 表示 URI 形状不合法，检查后重写而不是原样重试；resource_not_found 表示资源不存在，换来源；resource_unavailable 表示该方案当前未启用；resource_too_large 表示超出读取上限，无法读取；timeout 与 resource_read_aborted 可以重试一次；resource_read_failed 表示读取失败。",
+    "- error 可能为：invalid_resource_uri、resource_not_found、resource_unavailable、resource_too_large、timeout、resource_read_aborted、resource_read_failed、invalid_image_data、vision_call_failed 或 image_input_unavailable。",
   );
+
   return {
     name: "read",
     description: lines.join("\n"),
     inputSchema: jsonSchema<ResourceReadInput>({ type: "object", properties: { uri: { type: "string", description: "要读取的资源 URI" } }, required: ["uri"] }),
     execute: async ({ uri }, execution) => {
+      // A retried/reused tool call ID must never inherit bytes from an earlier read.
+      imageProjection.clear(execution.toolCallId);
       let opened: Awaited<ReturnType<ChannelResources["openStrict"]>>;
       try {
         opened = await resources.openStrict(uri, execution.abortSignal);
@@ -89,15 +233,83 @@ export function createReadTool(resources: ChannelResources, imageOutputSupported
         if (cause instanceof ResourceReadError) return { uri, error: cause.code };
         return { uri, error: "resource_read_failed" };
       }
-      const mediaType = detectedMediaType(opened.bytes) ?? opened.mediaType;
-      if (imageOutputSupported && resources.imageInput && mediaType?.startsWith("image/")) {
-        pendingImages.set(execution.toolCallId, { bytes: opened.bytes, mediaType });
+
+      const detectedImageType = detectImageMediaType(opened.bytes);
+      const declaredImage = opened.mediaType?.startsWith("image/") ?? false;
+      if (declaredImage && !detectedImageType) {
+        return {
+          uri,
+          filename: opened.filename,
+          mediaType: opened.mediaType,
+          imageMode: "unavailable",
+          error: "invalid_image_data",
+          text: "模型没有看到图片内容。",
+        };
       }
-      return { uri, filename: opened.filename, mediaType, text: describeBytes(opened.bytes, mediaType) };
+
+      const mediaType = detectedImageType ?? opened.mediaType;
+      if (!detectedImageType) return { uri, filename: opened.filename, mediaType, text: describeBytes(opened.bytes, mediaType) };
+
+      const metadata = describeBytes(opened.bytes, detectedImageType);
+      if (policy.mode === "native" && resources.imageInput) {
+        if (execution.abortSignal?.aborted) {
+          return {
+            uri,
+            filename: opened.filename,
+            mediaType: detectedImageType,
+            imageMode: "unavailable",
+            error: "resource_read_aborted",
+            text: "模型没有看到图片内容。",
+          };
+        }
+        imageProjection.stage({
+          toolCallId: execution.toolCallId,
+          turnId: execution.turnId,
+          bytes: opened.bytes,
+          mediaType: detectedImageType,
+          signal: execution.abortSignal,
+        });
+        return { uri, filename: opened.filename, mediaType: detectedImageType, text: metadata, imageMode: "native" };
+      }
+
+      if (policy.mode === "vision" && policy.visionModel) {
+        try {
+          const text = await describeImageBytes({
+            model: policy.visionModel,
+            bytes: opened.bytes,
+            mediaType: detectedImageType,
+            question: "请描述这张图片中清晰可见的内容，并说明无法确认的部分。",
+            abortSignal: execution.abortSignal,
+          });
+          return { uri, filename: opened.filename, mediaType: detectedImageType, text, imageMode: "vision" };
+        } catch {
+          return {
+            uri,
+            filename: opened.filename,
+            mediaType: detectedImageType,
+            imageMode: "unavailable",
+            error: execution.abortSignal?.aborted ? "resource_read_aborted" : "vision_call_failed",
+            text: "模型没有看到图片内容。",
+          };
+        }
+      }
+
+      return {
+        uri,
+        filename: opened.filename,
+        mediaType: detectedImageType,
+        imageMode: "unavailable",
+        error: "image_input_unavailable",
+        text: "模型没有看到图片内容。",
+      };
     },
     toModelOutput: ({ toolCallId, output }) => {
-      const image = pendingImages.get(toolCallId);
+      const image = imageProjection.get(toolCallId);
       if (!image) return { type: "json", value: output };
+      // AI SDK may project the same live tool result more than once: once for
+      // step callbacks and again while constructing the next provider request.
+      // The shared store keeps it available for the bounded live-turn window;
+      // durable history is sanitized separately by agent-runtime.
       return {
         type: "content",
         value: [
@@ -107,6 +319,33 @@ export function createReadTool(resources: ChannelResources, imageOutputSupported
       };
     },
   };
+}
+
+async function describeImageBytes(options: {
+  model: LanguageModel;
+  bytes: Uint8Array;
+  mediaType: string;
+  question: string;
+  abortSignal?: AbortSignal;
+}): Promise<string> {
+  const result = await generateText({
+    model: options.model,
+    temperature: 0.2,
+    abortSignal: options.abortSignal,
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: `请详细描述这张图片，并回答问题：${options.question}\n区分可见事实与推测；如果无法确认具体身份、作品、地点或事件，请明确说明不确定及原因，不要猜测。\n\n图片内容：`,
+          },
+          { type: "file", data: options.bytes, mediaType: options.mediaType },
+        ],
+      },
+    ],
+  });
+  return result.text;
 }
 
 export function createDescribeImageTool(model: LanguageModel, resources: ChannelResources): AgentTool<DescribeImageInput, DescribeImageOutput> {
@@ -131,24 +370,12 @@ export function createDescribeImageTool(model: LanguageModel, resources: Channel
       } catch {
         return { error: "asset_not_found" };
       }
-      const mediaType = detectedMediaType(bytes);
+      const mediaType = detectImageMediaType(bytes);
       if (!mediaType) return { error: "not_an_image" };
       try {
-        const result = await generateText({
-          model,
-          temperature: 0.2,
-          abortSignal: execution.abortSignal,
-          messages: [
-            {
-              role: "user",
-              content: [
-                { type: "text", text: `请详细描述这张图片，并回答问题：${question}\n\n图片内容：` },
-                { type: "file", data: bytes, mediaType },
-              ],
-            },
-          ],
-        });
-        return { text: result.text };
+        return {
+          text: await describeImageBytes({ model, bytes, mediaType, question, abortSignal: execution.abortSignal }),
+        };
       } catch (cause) {
         return { error: `vision_call_failed: ${cause instanceof Error ? cause.message : String(cause)}` };
       }
@@ -156,8 +383,199 @@ export function createDescribeImageTool(model: LanguageModel, resources: Channel
   };
 }
 
+function sendMessageDescription(innerThought: boolean, factsRequired: boolean): string {
+  return `向频道发送文字或消息元素。你的普通文本输出不会被发送；调用本工具才能发送 messages 中的内容。其他实际提供的发送工具可以发送它们各自支持的内容。
+
+调用后生成真正展示给用户的消息，可以针对某个用户或所有用户回复；只写在普通文本输出里的内容不会被送达。
+
+# 参数
+
+## messages
+要发送的消息列表，每一项作为一条独立消息按顺序发出。
+${
+  factsRequired
+    ? "只写清楚本轮要表达的事实、判断和交流动作，不自行添加事实或承诺；措辞风格由发送前的润色阶段处理，每条草稿独立改写，条数与顺序保持不变。"
+    : `同一次调用中的 messages 属于同一个回应单元，保持一致的说话身份、语域和情绪力度。工具、搜索和图片结果只是材料；用当前 persona 自然表达。需要分条时按对话节奏处理，事实、指令、代码、链接和其他后果重大的内容保持在同一条消息内。`
+}
+不要用空行分段。平台不会把空行渲染成视觉分隔，它只是一个被吞掉的空白，让消息看起来格式奇怪。需要分开就分成多条。
+
+${factsRequired ? "" : "尽量用文字和标点表达情绪；只有确实有助于语气时才使用 emoji。"}
+
+## channel
+目标频道 ID。留空发往当前频道；填写其他频道 ID 可以向该频道发送。OneBot 群频道直接填写裸群号，不要使用 group: 前缀；私聊频道仍使用 private:<账号>。
+
+## mode
+- element（默认）：内容按下面的消息元素语法解析，<img> 与 <file> 的资源 URI 会被解析成真实内容。
+- raw：内容作为字面量原样发送，不解析任何元素。尖括号、& 和引号都不需要转义，你写下的每个字符原样到达接收方。发送代码、日志、命令行输出、含大量特殊字符的文本，或需要精确控制每个字符时用它。
+
+## continue
+默认 false，发送后结束本轮。设为 true 时，发送后继续生成下一步，可以再调用工具或再次发送消息。若本轮还要调用其他发送工具，必须在这次发送前设为 true；需要「先回应再去做事」或「分几次发送并在中间查资料」时也用它。
+${
+  factsRequired
+    ? `
+## facts
+
+逐条列出本次草稿依据的可见消息、工具结果或推断；只用于发送前校验与改写，不会发送给任何人。
+`
+    : ""
+}${
+    innerThought
+      ? `
+## inner_thought
+
+${
+  factsRequired
+    ? "记录互动对象、可见事实与推测、是否回应和行动计划。使用简洁内部记录，不要提前写对外文本。它不会到达平台；需要让对方知道的内容必须写进 messages。不要把过去的 inner_thought 或 finish.reason 当作当前事实。"
+    : "记录互动对象、可见事实与推测、回应语域、是否回应和行动计划。使用简洁内部记录，不模仿角色台词或提前写对外文本。它不会到达平台；需要让对方知道的内容必须写进 messages。不要把过去的 inner_thought 或 finish.reason 当作当前事实。"
+}
+`
+      : ""
+  }
+# 返回值
+成功返回 {ok:true, messageIds, count}。
+失败返回 {ok:false, error, sent, failedAt}：sent 是已经成功发出的消息 ID，failedAt 是出错的 messages 下标。发送遇错会立即停止，failedAt 及其之后的消息都没有发出。必须检查 ok，不要假设发送成功。
+
+# 消息元素（仅 mode=element）
+消息元素的语法与 HTML 类似，形如 <名称 属性="值"/>。你观察到的消息由元素组成，你发出的消息使用同一套元素：普通文本直接写，结构元素直接放在文本里。
+元素名只能由小写字母、数字和连字符组成，且以字母开头。不符合规则的标签形式会被当作普通文本——但如果你的文本恰好长得像合法元素名，它就会被错误解析。这就是为什么转义很重要。
+
+## 常用元素
+<at id="用户ID"/>：提及某人。id 填用户 ID，不是昵称。
+<at type="all"/>：提及全体成员。<at type="here"/>：提及在线成员。
+<quote id="消息ID"/>：引用某条消息。id 取自该消息观察头的 id。
+<img src="…"/>：图片。src 支持频道资源 URI。
+<file src="…"/>：文件。src 支持频道资源 URI。
+<audio src="…"/>：语音。src 只能是平台可直接访问的地址。
+<video src="…"/>：视频。src 只能是平台可直接访问的地址。
+<text>…</text>：逐字交付的纯文本块。其中的内容不会被解析成元素，所有字符原样到达接收方。用它包裹含尖括号的代码、标签示例、泛型签名等片段。整条消息都是这类内容时，直接用 mode=raw 更省事。
+
+## 转义（关键）
+< 和 > 如果没有转义，系统会尝试把它们之间的内容解析为元素。如果解析成功，你原本想输出的文字就会消失——这不是显示异常，而是内容被永久吞掉。
+例如：你想说「当 a<b 且 c>d 时」，但 <b 且 c> 看起来像一个元素，会被解析掉，接收方看到的是「当 a d 时」。
+规则：文本中出现的 <、>、&、" 如果不是用来构成元素标签，必须转义。
+| 字符 | 转义 | 何时需要 |
+|:---:|:---:|:---|
+| < | &lt; | 文本中所有非元素用途的 < |
+| > | &gt; | 文本中所有非元素用途的 > |
+| & | &amp; | 文本中的 &（否则会被当作转义序列开头） |
+| " | &quot; | 元素属性值内的引号 |
+
+## 简短示例
+- 普通文本：messages: ["今天天气不错"]
+- 需要精确保留尖括号、代码或日志时使用 mode: "raw"。
+- 引用和提及使用 <quote id="消息ID"/>、<at id="用户ID"/>；非元素用途的 <、>、&、" 必须转义。
+
+## 资源与格式
+只有 <img> 和 <file> 的 src 支持频道资源 URI；<audio>、<video> 只能使用平台可直接访问的地址。资源引用前先确认 URI 存在，解析失败的资源元素会被丢弃，其余消息仍继续发送；平台不支持的修饰元素不要作为结构依赖。`;
+}
+
+/** A polish failure or rejection never blocks delivery: the original draft is sent once. */
+async function polishedMessages(
+  polish: SendMessageToolOptions["polish"],
+  input: SendMessageInput,
+  currentTurnMessages: readonly AgentMessage[],
+  signal: AbortSignal | undefined,
+): Promise<readonly string[]> {
+  if (!polish) return input.messages;
+  try {
+    const turnContext = buildPolisherTurnContext(currentTurnMessages);
+    return (
+      validatePolishedMessages(input.messages, await polish({ facts: input.facts ?? [], messages: input.messages, turnContext, signal })) ?? input.messages
+    );
+  } catch {
+    return input.messages;
+  }
+}
+
+/** Paragraph splitting is a delivery fallback, not a rewrite of tool inputs or receipt indexes. */
+function splitMessageParagraphs(elements: readonly Element[]): Element[][] {
+  if (!hasParagraphBreak(elements)) return [[...elements]];
+  const segments: Element[][] = [];
+  let prefix: Element[] = [];
+  const hasContent = (element: Element): boolean => {
+    if (element.type === "text") return String(element.attrs.content ?? "").trim().length > 0;
+    if (element.type === "quote" || element.type === "at") return false;
+    return !element.children.length || element.children.some(hasContent);
+  };
+  for (const paragraph of splitParagraphElements(elements)) {
+    const current = [...prefix, ...paragraph];
+    if (current.some(hasContent)) {
+      segments.push(current);
+      prefix = [];
+    } else {
+      // Keep quote/mention-only prefixes with the following text instead of sending them alone.
+      prefix = current.filter((element) => element.type !== "text");
+    }
+  }
+  if (prefix.length) segments.push(prefix);
+  return segments;
+}
+
+/** Keep empty edge parts until recursion finishes so breaks can cross container boundaries. */
+function splitParagraphElements(elements: readonly Element[]): Element[][] {
+  const segments: Element[][] = [];
+  let current: Element[] = [];
+  for (const element of elements) {
+    const parts =
+      element.type === "text"
+        ? String(element.attrs.content ?? "")
+            .split(PARAGRAPH_BREAK)
+            .map((text) => (text.length ? [h.text(text)] : []))
+        : element.children.length
+          ? splitParagraphElements(element.children).map((children) =>
+              children.some((child) => child.type !== "text" || String(child.attrs.content ?? "").trim()) ? [h(element.type, element.attrs, children)] : [],
+            )
+          : [[element]];
+    for (const [index, part] of parts.entries()) {
+      if (index > 0) {
+        segments.push(current);
+        current = [];
+      }
+      current.push(...part);
+    }
+  }
+  segments.push(current);
+  return segments;
+}
+
+function hasParagraphBreak(elements: readonly Element[]): boolean {
+  return elements.some((element) =>
+    element.type === "text" ? PARAGRAPH_BREAK.test(String(element.attrs.content ?? "")) : hasParagraphBreak(element.children),
+  );
+}
+
+function formatOutputParagraph(elements: readonly Element[]): string {
+  return elements.map((element) => (element.type === "text" ? String(element.attrs.content ?? "") : String(element))).join("");
+}
+
+function pacedDelay(segment: readonly Element[], pacing: PacingConfig, elapsed: number): number {
+  const characters = segment.reduce((total, element) => total + elementTextLength(element), 0);
+  const delay = Math.min(Math.max(250, Math.ceil((characters / pacing.charactersPerSecond) * 1000)), 10_000);
+  return elapsed + delay >= pacing.maxTotalDelayMs ? 250 : Math.round(delay);
+}
+
+function elementTextLength(element: Element): number {
+  return (
+    (typeof element.attrs.content === "string" ? element.attrs.content.length : 0) +
+    element.children.reduce((total, child) => total + elementTextLength(child), 0)
+  );
+}
+
+function sleep(timeout: number, signal?: AbortSignal): Promise<void> {
+  if (timeout <= 0 || signal?.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeout);
+    signal?.addEventListener("abort", finish, { once: true });
+  });
+}
+
 function describeBytes(bytes: Uint8Array, mediaType?: string): string {
-  const image = detectedMediaType(bytes);
+  const image = detectImageMediaType(bytes);
   if (image) return `[图片资源，${image}，${formatBytes(bytes.byteLength)}]`;
   try {
     const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -169,35 +587,22 @@ function describeBytes(bytes: Uint8Array, mediaType?: string): string {
   }
 }
 
-function detectedMediaType(bytes: Uint8Array): string | undefined {
-  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
-  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
-  if (
-    bytes.length >= 6 &&
-    bytes[0] === 0x47 &&
-    bytes[1] === 0x49 &&
-    bytes[2] === 0x46 &&
-    bytes[3] === 0x38 &&
-    (bytes[4] === 0x37 || bytes[4] === 0x39) &&
-    bytes[5] === 0x61
-  )
-    return "image/gif";
-  if (
-    bytes.length >= 12 &&
-    bytes[0] === 0x52 &&
-    bytes[1] === 0x49 &&
-    bytes[2] === 0x46 &&
-    bytes[8] === 0x57 &&
-    bytes[9] === 0x45 &&
-    bytes[10] === 0x42 &&
-    bytes[11] === 0x50
-  )
-    return "image/webp";
-  return undefined;
-}
-
 function formatBytes(length: number): string {
   if (length >= 1024 * 1024) return `${(length / (1024 * 1024)).toFixed(1)} MiB`;
   if (length >= 1024) return `${(length / 1024).toFixed(1)} KiB`;
   return `${length} B`;
+}
+
+export function createFinishTool(): AgentTool<Record<string, never>, { ok: true }> {
+  return {
+    name: "finish",
+    terminal: true,
+    description:
+      "结束本轮，不发送任何消息。当你判断当前场景不需要你参与、或已经做完该做的事且没有要说的话时使用。保持沉默是一个完整的选择，不需要为了确认收到或维持礼貌而发言。",
+    inputSchema: jsonSchema<Record<string, never>>({
+      type: "object",
+      properties: {},
+    }),
+    execute: async () => ({ ok: true }),
+  };
 }

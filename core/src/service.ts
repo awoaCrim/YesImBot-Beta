@@ -3,9 +3,14 @@ import { resolve } from "node:path";
 import { type Context, Service } from "koishi";
 
 import { Agents } from "./agents/index.js";
+import { PolisherRegistry } from "./agents/polisher.js";
 import { Channels } from "./channels/index.js";
+import type { ChannelContext } from "./channels/index.js";
 import { registerSessionCommands } from "./commands/index.js";
 import { Config } from "./config.js";
+import type { ConversationReadOptions } from "./conversations/index.js";
+import { MessageBatchRegistry } from "./message-batches/index.js";
+import type { MessageRecord } from "./messages/index.js";
 import { Messenger } from "./messengers/index.js";
 import { ModelService } from "./models/index.js";
 import { registerPlatforms } from "./platforms/index.js";
@@ -21,10 +26,14 @@ export default class YesImBotService extends Service<Config> {
 
   public readonly model: ModelService;
   public readonly messenger: Pick<Messenger, "use" | "post">;
+  public readonly message: Pick<MessageBatchRegistry, "use">;
   public readonly agent: Pick<Agents, "use" | "will">;
+  public readonly polisher: Pick<PolisherRegistry, "use" | "profile">;
   public readonly resource: Resources;
+  public readonly conversation: { read: (context: ChannelContext, options: ConversationReadOptions) => Promise<MessageRecord[]> };
 
   private readonly channels: Channels;
+  private readonly messageOwner: MessageBatchRegistry;
   private readonly runtimes: Runtimes;
   private readonly messengerOwner: Messenger;
   private readonly commandDisposer: () => void;
@@ -36,23 +45,32 @@ export default class YesImBotService extends Service<Config> {
     config = Config(config ?? {}) as Config;
     this.config = config;
     this.logger.level = config.logLevel ?? 2;
-    this.model = new ModelService(ctx, { basePath: config.basePath, logLevel: config.logLevel });
+    this.model = new ModelService(ctx, {
+      basePath: config.basePath,
+      auxiliaryModel: config.auxiliaryModel,
+      logLevel: config.logLevel,
+    });
     this.channels = new Channels(ctx, {
       basePath: config.basePath || ctx.baseDir,
       logLevel: config.logLevel,
       imageInput: config.imageInput,
       readTimeoutMs: config.resourceReadTimeout * 1000,
-      compactConfig: { minMessages: config.session.compact.minMessages, maxFailures: config.session.compact.maxFailures },
+      compactConfig: config.session.compact,
     });
     const agentsLogger = ctx.logger("yesimbot.agents");
     agentsLogger.level = config.logLevel ?? 2;
     const agents = new Agents(ctx);
-    this.runtimes = new Runtimes(ctx, this.channels, this.model, config, agents);
+    const polishers = new PolisherRegistry({ logger: ctx.logger("yesimbot.polisher") });
+    this.messageOwner = new MessageBatchRegistry();
+    this.runtimes = new Runtimes(ctx, this.channels, this.model, config, agents, this.messageOwner, polishers);
     this.messengerOwner = new Messenger(ctx, config, this.channels, this.runtimes);
     this.messenger = this.messengerOwner;
+    this.message = this.messageOwner;
     this.agent = agents;
+    this.polisher = polishers;
     this.resource = this.channels;
     this.commandDisposer = registerSessionCommands(ctx, this.runtimes, { authority: 4 });
+    this.conversation = { read: (context, options) => this.channels.readConversation(context, options) };
   }
 
   public override async start(): Promise<void> {

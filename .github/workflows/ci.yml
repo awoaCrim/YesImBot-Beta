@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.14.0"
+      - name: Locate the pinned Yarn cache
+        id: yarn-cache
+        run: echo "path=$(node .yarn/releases/yarn-4.12.0.cjs config get cacheFolder)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ steps.yarn-cache.outputs.path }}
+          key: yarn-${{ runner.os }}-4.12.0-${{ hashFiles('yarn.lock') }}
+          restore-keys: yarn-${{ runner.os }}-4.12.0-
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .turbo
+          key: turbo-${{ runner.os }}-node24-${{ hashFiles('yarn.lock') }}-${{ github.sha }}
+          restore-keys: turbo-${{ runner.os }}-node24-${{ hashFiles('yarn.lock') }}-
+      - name: Immutable install
+        run: node .yarn/releases/yarn-4.12.0.cjs install --immutable
+      - name: Quality gates (before generated lib files exist)
+        run: |
+          node .yarn/releases/yarn-4.12.0.cjs lint
+          node .yarn/releases/yarn-4.12.0.cjs fmt:check
+          node .yarn/releases/yarn-4.12.0.cjs check-types
+          node .yarn/releases/yarn-4.12.0.cjs build
+          node .yarn/releases/yarn-4.12.0.cjs test
+          python3 -m compileall -q scripts
+          python3 -m unittest discover -s scripts/tests -v
+      - name: Pack the trusted build once
+        if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+        run: python3 scripts/release.py pack --source-sha "$SOURCE_SHA" --run-id "$RUN_ID" --repository "$REPOSITORY"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+        with:
+          name: release-${{ github.sha }}
+          path: |
+            .release/bundle/payload.tar.gz
+            .release/bundle/manifest.json
+            .release/bundle/runner.py
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30

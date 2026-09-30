@@ -54,7 +54,6 @@ npx vitest run core/tests/channel-runtime.test.ts
 npx vitest run core/tests/runtime-manager.test.ts
 npx vitest run core/tests/storage.test.ts
 npx vitest run core/tests/gateway-delivery.test.ts
-npx vitest run plugins/memos-client/tests/tools.test.ts
 ```
 
 - Root `yarn test` runs workspaces with a `test` script; Turbo task `test` depends on `build`.
@@ -92,7 +91,6 @@ npx vitest run plugins/memos-client/tests/tools.test.ts
 | `plugins/console/`        | `koishi-plugin-yesimbot-console`             |
 | `plugins/workspace/`      | `koishi-plugin-yesimbot-workspace`           |
 | `plugins/mcp-client/`     | `koishi-plugin-yesimbot-mcp-client`          |
-| `plugins/memos-client/`   | `koishi-plugin-yesimbot-memos-client`        |
 | `plugins/global-brain/`   | `koishi-plugin-yesimbot-global-brain`        |
 | `plugins/onebot-utils/`   | `koishi-plugin-yesimbot-onebot-utils`        |
 | `plugins/search-service/` | `koishi-plugin-yesimbot-search-service`      |

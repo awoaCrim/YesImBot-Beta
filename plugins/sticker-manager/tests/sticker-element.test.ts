@@ -38,6 +38,7 @@ function config(overrides: Partial<StickerConfig> = {}): StickerConfig {
     tagRandomRange: 1,
     sendStaticAsGif: true,
     stickerElement: true,
+    enableSteal: true,
     ...overrides,
   };
 }

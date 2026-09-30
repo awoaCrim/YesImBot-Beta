@@ -1,7 +1,6 @@
 <div align="center">
   <img src="assets/logo.png" width="60%" alt="Athena Logo" />
 
-[![npm](https://img.shields.io/npm/v/koishi-plugin-yesimbot?style=flat-square)](https://www.npmjs.com/package/koishi-plugin-yesimbot)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 ![Language](https://img.shields.io/badge/language-TypeScript-brightgreen?style=flat-square)
 ![Status](https://img.shields.io/badge/status-beta-yellow?style=flat-square)
@@ -21,27 +20,44 @@ _让 AI 更像人类，让聊天更有温度_
 
 ## Features
 
-- **消息优先的运行时** — `@yesimbot/agent-runtime` 将“观察”与“发言”分离：普通消息进入频道历史，Will 决定等待或触发模型回合；忙时事件加入当前 turn，不创建第二个流消费者。
-- **多模型即插即用** — 通过 provider 插件接入 OpenAI、Anthropic、DeepSeek、Google 等模型，并通过 `models.json` 管理模型注册与默认值。
-- **强大的插件体系** — 工具、提示词、消息转换、生命周期钩子，每个维度都可扩展。插件按 `pre` / normal / `post` 顺序编排。
-- **频道存储与资源** — 公开的 `ChannelScope` 只携带当前 `platform`、`selfId`、`channelId` 与 `isDirect`。Core 在内部由 shared/direct tuple 推导存储目录；不会公开频道 identity。每个频道目录保存 `channel.json`、JSONL、assets、workspace 与插件数据。
-- **平台输入边界** — 平台注册 `PlatformTranslator`；无精确或显式 `"*"` Translator 时，`message-created` 的非空 message ID 默认透传元素，媒体持久化与自定义事件仍需平台 Translator。Translator 在 Session 生命周期内接收频道 `AssetStore`，直接返回最终 Message/Event record，Gateway 负责被动回复。
-- **丰富的能力插件** — 虚拟文件系统与 Bash 沙箱、MCP 客户端、Skill 加载、Web 搜索、MemOS Cloud 记忆、OneBot 工具、贴纸处理等。
-- **Koishi 原生集成** — 作为 `koishi-plugin-yesimbot` 运行，复用 Koishi 生态的适配器、中间件和插件体系。
+- **会看气氛的群聊机器人** — 不只会回复 @：能根据关键词、引用、图片和当前场景决定是加入、等待还是沉默。
+- **多模型即插即用** — 接入 OpenAI、Anthropic、DeepSeek、Google 等模型，在配置里选一个聊天模型就能开始使用。
+- **可选长期记忆** — 安装 MemOS 或全局脑插件后，机器人可以记住跨会话的偏好、事实和经历。
+- **能做事而不只是聊天** — 通过工作区、搜索、MCP、OneBot 工具等插件，机器人可以处理文件、联网查资料、调用外部服务和群管理工具。
+- **按需扩展** — 插件系统支持工具、提示词和生命周期扩展；日常使用只需要在 Koishi 控制台启用。
+- **Koishi 原生集成** — 复用 Koishi 的适配器、中间件、控制台和数据库生态。
+
+## 安装 YesImBot Launcher
+
+当前 v4 的官方安装入口是 YesImBot Launcher。
+
+```bash
+# Linux / WSL / macOS
+curl -fsSL https://raw.githubusercontent.com/YesWeAreBot/launcher/main/install.sh | sh
+```
+
+```powershell
+# Windows PowerShell
+irm https://raw.githubusercontent.com/YesWeAreBot/launcher/main/install.ps1 | iex
+```
+
+- Linux/WSL/macOS 默认安装到 `~/.local/bin`。
+- Windows 默认安装到 `%LOCALAPPDATA%\YesImBot\bin`。
+
+安装完成后运行 `yesimbot-cli --help` 验证。Launcher 仓库：[YesWeAreBot/launcher](https://github.com/YesWeAreBot/launcher)。
 
 ## Quick Start
 
-YesImBot 作为 Koishi 插件运行，安装方式与普通 Koishi 插件一致：
+> [!WARNING]
+> 当前 v4 尚未发布到 npm，也没有上架 Koishi 插件市场；请使用 Launcher 接入源码。
+
+Launcher 安装完成后，运行：
 
 ```bash
-# 使用 yarn（推荐）
-yarn add koishi-plugin-yesimbot
-
-# 或使用 npm
-npm install koishi-plugin-yesimbot
+yesimbot-cli init
 ```
 
-然后在 Koishi 配置文件中启用插件，配置你偏好的模型 provider 即可开始使用。
+`init` 会创建 Koishi App，并从 GitHub `dev` 分支接入 YesImBot v4 源码；结束后按提示选择是否立即启动。之后在 Koishi 控制台启用 `yesimbot`、模型服务插件，并配置聊天模型与允许响应的频道。
 
 > [!TIP]
 > 想了解详细的配置与使用方式？请查阅[官方文档站](https://docs.yesimbot.chat/)。
@@ -103,16 +119,54 @@ allowedChannels:
 
 活动 Runtime 会在创建时快照模型能力、`imageInput`、Will、提示词与插件。Core 不提供 `reload()`：配置、模型或插件变化会在 Runtime 因停止或 shared Bot 变更而替换后生效。
 
+#### 模型思考等级
+
+四个内置 Provider（Google、OpenAI、Anthropic、DeepSeek）支持在各自的 `chatModels` 模型行上配置统一的思考等级。等级固定为：
+
+`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`
+
+`thinkingLevel` 不填写时不新增任何 thinking 参数，继续使用 Provider 默认行为；配置跟随具体模型，因此主聊天、消息润色、记忆和其它 auxiliary 请求解析到同一模型时会使用同一设置，不需要在某个用途的调用点单独传参。
+
+```yaml
+chatModels:
+  - id: gemini-3.7-flash
+    toolCall: true
+    reasoning: true
+    thinkingLevel: high
+    # 原生值由 Provider 解释；null 表示该统一等级不受此模型支持
+    thinkingLevelMap:
+      xhigh: high
+      max: null
+```
+
+`thinkingLevelMap` 是可选的逐模型原生映射。Google 使用 `thinkingConfig.thinkingLevel`，OpenAI 使用 `reasoningEffort`，Anthropic 使用 `effort`，DeepSeek 使用 `thinking` 与 `reasoningEffort`。不同模型或 Provider 不支持某个等级时可写 `null`；显式请求不可用等级会按固定顺序优先夹到更高的可用等级，再向更低等级寻找，并记录 warning，不会发送无效原生值。`reasoning: false` 的模型只保留 `off`。
+
+也可以在 `data/yesimbot/models.json` 的 `chat` 覆盖中调整已注册模型：
+
+```json
+{
+  "chat": {
+    "openai:gpt-5": {
+      "thinkingLevel": "high",
+      "thinkingLevelMap": { "xhigh": "xhigh", "max": null }
+    }
+  }
+}
+```
+
+DeepSeek 原有的全局 `thinking` 默认值和模型 ID `:level` 后缀仍然有效；后缀优先级高于模型行的 `thinkingLevel`。本配置只改变模型请求设置，不会自动修改生产配置或部署。
+
 ## Plugins
 
 YesImBot 的能力通过插件系统按需加载。
+
+> 当前 v4 插件随 Launcher 源码接入一起提供，不在 npm 或插件市场中逐包安装。
 
 | 插件        | 包名                                    | 能力                                |
 | ----------- | --------------------------------------- | ----------------------------------- |
 | 控制台      | `koishi-plugin-yesimbot-console`        | 自定义 Koishi 首页与 WebUI          |
 | 工作区      | `koishi-plugin-yesimbot-workspace`      | 文件操作、命令执行与 Skill 目录访问 |
 | MCP 客户端  | `koishi-plugin-yesimbot-mcp-client`     | 通过 MCP 协议接入外部工具服务       |
-| MemOS       | `koishi-plugin-yesimbot-memos-client`   | 接入 MemOS Cloud 长期记忆           |
 | 搜索        | `koishi-plugin-yesimbot-search-service` | 网络搜索与信息检索                  |
 | OneBot 工具 | `koishi-plugin-yesimbot-onebot-utils`   | OneBot 平台工具集成                 |
 | 贴纸        | `koishi-plugin-yesimbot-sticker`        | 表情与贴纸处理                      |
@@ -127,6 +181,8 @@ OneBot Translator 内置于 `koishi-plugin-yesimbot`，通过同一 PlatformTran
 | Anthropic | `@yesimbot/koishi-plugin-provider-anthropic` |
 | DeepSeek  | `@yesimbot/koishi-plugin-provider-deepseek`  |
 | Google    | `@yesimbot/koishi-plugin-provider-google`    |
+
+Provider 不绑定具体厂商：OpenAI Provider 可通过 `baseURL` 接入任意 OpenAI-compatible API；各 Provider 支持克隆多开，只需保证实例 `id` 唯一。
 
 ## Architecture
 
@@ -158,11 +214,22 @@ yarn turbo run test --filter=@yesimbot/agent-runtime
 yarn turbo run check-types --filter=koishi-plugin-yesimbot
 ```
 
+开发、迁移和部署约束见 [docs/DEVELOPMENT-GUIDELINES.md](docs/DEVELOPMENT-GUIDELINES.md)。
+
 ## Community
 
 [![QQ Group](https://img.shields.io/badge/QQ-857518324-blue?style=flat-square)](http://qm.qq.com/cgi-bin/qm/qr?_wv=1027&k=k3O5_1kNFJMERGxBOj1ci43jHvLvfru9&authKey=TkOxmhIa6kEQxULtJ0oMVU9FxoY2XNiA%2B7bQ4K%2FNx5%2F8C8ToakYZeDnQjL%2B31Rx%2B&noverify=0&group_code=857518324)
 [![GitHub Issues](https://img.shields.io/badge/Issues-GitHub-181717?style=flat-square&logo=github)](https://github.com/YesWeAreBot/YesImBot/issues)
 [![Documentation](https://img.shields.io/badge/DOCS-docs.yesimbot.chat-blue?style=flat-square)](https://docs.yesimbot.chat)
+
+---
+
+## Sponsors
+
+感谢以下赞助者对 YesImBot 的支持：
+
+- Preca（QQ 2379626851）
+- [Miaow](https://github.com/MiaowFISH)（QQ 1293865264）
 
 ---
 
