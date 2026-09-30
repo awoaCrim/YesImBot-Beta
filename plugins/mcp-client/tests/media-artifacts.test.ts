@@ -35,8 +35,6 @@ import McpClientPlugin from "../src/index";
 
 const PNG_BASE64 = "iVBORw0KGgo="; // decodes to a tiny PNG header
 
-type ArtifactWriter = { readonly put: ReturnType<typeof vi.fn> };
-
 function createContext() {
   const scopedLogger = { debug: vi.fn(), error: vi.fn(), info: vi.fn(), success: vi.fn(), warn: vi.fn() };
   const rootLogger = Object.assign(
@@ -48,7 +46,7 @@ function createContext() {
   const artifactPut = vi.fn(async (bytes: Uint8Array, metadata: { mediaType?: string; filename?: string }) => {
     void bytes;
     void metadata;
-    return "artifact://tools-snap/019d3b7e-1bd0-7e4f-9c5d-5bf3fd41f1d4";
+    return "artifact://tools-listSnapshots/019d3b7e-1bd0-7e4f-9c5d-5bf3fd41f1d4";
   });
   const artifactForTool = vi.fn(() => ({ put: artifactPut }));
   const ctx = {
@@ -69,7 +67,7 @@ function createContext() {
   return { ctx, disposers, plugins, artifactForTool, artifactPut };
 }
 
-function createClient(toolNames: string[] = ["snap"]) {
+function createClient(toolNames: string[] = ["listSnapshots"]) {
   return {
     callTool: vi.fn(),
     close: vi.fn(async () => undefined),
@@ -78,11 +76,14 @@ function createClient(toolNames: string[] = ["snap"]) {
   };
 }
 
-async function buildPlugin(serverName = "tools", toolNames: string[] = ["snap"]) {
+async function buildPlugin(serverName = "tools", toolNames: string[] = ["listSnapshots"]) {
   const { ctx, plugins, artifactForTool, artifactPut } = createContext();
   const client = createClient(toolNames);
   mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn(async () => undefined) } });
-  const plugin = new McpClientPlugin(ctx as never, { mcpServers: { [serverName]: { type: "http", url: "https://example.test/mcp" } } });
+  const plugin = new McpClientPlugin(ctx as never, {
+    allowedScopes: [{ platform: "test", channelId: "room" }],
+    mcpServers: { [serverName]: { type: "http", url: "https://example.test/mcp" } },
+  });
   await plugin.start();
   const agentPlugin = await plugins[0]!.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" } as never, {} as never);
   if (!agentPlugin) throw new Error("MCP runtime plugin was not created");
@@ -102,10 +103,10 @@ describe("McpClientPlugin media outputs", () => {
 
     expect(modelOutput).toMatchObject({ type: "text" });
     const value = (modelOutput as { value: string }).value;
-    expect(value).toContain("artifact://tools-snap/019d3b7e-1bd0-7e4f-9c5d-5bf3fd41f1d4");
+    expect(value).toContain("artifact://tools-listSnapshots/019d3b7e-1bd0-7e4f-9c5d-5bf3fd41f1d4");
     expect(value).not.toContain("iVBORw0KGgo");
     expect(value).not.toContain("base64");
-    expect(artifactForTool).toHaveBeenCalledWith("tools-snap");
+    expect(artifactForTool).toHaveBeenCalledWith("tools-listSnapshots");
     const [bytes, metadata] = artifactPut.mock.calls[0]!;
     expect([...bytes]).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
     expect(metadata).toEqual({ mediaType: "image/png", filename: "mcp-image" });

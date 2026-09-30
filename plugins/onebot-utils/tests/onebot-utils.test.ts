@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
     const: vi.fn<() => unknown>(),
     number: vi.fn<() => unknown>(),
     object: vi.fn<() => unknown>(),
+    string: vi.fn<() => unknown>(),
     union: vi.fn<() => unknown>(),
   },
 }));
@@ -18,6 +19,7 @@ vi.mock("koishi", () => {
     default: vi.fn<() => unknown>().mockReturnThis(),
     description: vi.fn<() => unknown>().mockReturnThis(),
     min: vi.fn<() => unknown>().mockReturnThis(),
+    required: vi.fn<() => unknown>().mockReturnThis(),
     role: vi.fn<() => unknown>().mockReturnThis(),
   });
 
@@ -26,6 +28,7 @@ vi.mock("koishi", () => {
   mocks.schema.const.mockImplementation(chain);
   mocks.schema.number.mockImplementation(chain);
   mocks.schema.object.mockImplementation(chain);
+  mocks.schema.string.mockImplementation(chain);
   mocks.schema.union.mockImplementation(chain);
 
   return {
@@ -106,7 +109,10 @@ async function createRuntime(
   config: Record<string, unknown> = {},
 ): Promise<{ getForwardTool: () => AgentTool; getTools: () => Promise<AgentTool[]> }> {
   const { ctx, plugins } = createContext();
-  const plugin = new OnebotUtilsPlugin(ctx as never, { enabledTools: DEFAULT_ENABLED_TOOLS, ...config } as never);
+  const plugin = new OnebotUtilsPlugin(
+    ctx as never,
+    { allowedScopes: [{ platform: "onebot", channelId: "group" }], enabledTools: DEFAULT_ENABLED_TOOLS, ...config } as never,
+  );
   await plugin.start();
   const runtimePlugin = await plugins[0]!.setup(createChannelContext() as never, bot as never);
   if (!runtimePlugin) throw new Error("OneBot runtime plugin was not created");
@@ -137,9 +143,9 @@ describe("onebot-utils plugin", () => {
   });
 
   it("declares the enabled-tool configuration fields", () => {
-    const fields = mocks.schema.object.mock.calls[0]?.[0] as Record<string, unknown>;
-    expect(Object.keys(fields)).toEqual(["enabledTools", "parseImages", "attachImageSummary", "maxForwardPageChars"]);
-    expect(mocks.schema.array).toHaveBeenCalledOnce();
+    const fields = mocks.schema.object.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(Object.keys(fields)).toEqual(["allowedScopes", "enabledTools", "parseImages", "attachImageSummary", "maxForwardPageChars"]);
+    expect(mocks.schema.array).toHaveBeenCalledTimes(2);
     expect(mocks.schema.union).toHaveBeenCalledOnce();
     expect(mocks.schema.const).toHaveBeenCalledTimes(10);
     expect(mocks.schema.boolean).toHaveBeenCalledTimes(2);
@@ -154,11 +160,33 @@ describe("onebot-utils plugin", () => {
     await expect(plugins[0]!.setup({ type: "guild", platform: "discord", channelId: "channel", guildId: "channel" } as never, {} as never)).resolves.toBeNull();
   });
 
+  it("hides OneBot tools from scopes outside the allowlist", async () => {
+    const { ctx, plugins } = createContext();
+    const plugin = new OnebotUtilsPlugin(
+      ctx as never,
+      {
+        allowedScopes: [{ platform: "onebot", channelId: "*", userId: "100" }],
+        enabledTools: ["onebot_set_qq_profile"],
+      } as never,
+    );
+    await plugin.start();
+
+    const denied = await plugins[0]!.setup(createChannelContext() as never, {} as never);
+    expect(await getTools(denied!)).toEqual([]);
+
+    const allowed = await plugins[0]!.setup(
+      { type: "direct", platform: "onebot", channelId: "private:100", userId: "100", selfId: "bot" } as never,
+      {} as never,
+    );
+    expect((await getTools(allowed!)).map((tool) => tool.name)).toEqual(["onebot_set_qq_profile"]);
+  });
+
   it("exposes the migrated OneBot tools", async () => {
     const { ctx, plugins } = createContext();
     const plugin = new OnebotUtilsPlugin(
       ctx as never,
       {
+        allowedScopes: [{ platform: "onebot", channelId: "group" }],
         enabledTools: [
           "onebot_get_forward_message",
           "onebot_send_forward_message",

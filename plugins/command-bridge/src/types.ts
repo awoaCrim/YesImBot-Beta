@@ -1,3 +1,5 @@
+import type { ToolAccessRule } from "koishi-plugin-yesimbot";
+
 export type TrustMode = "locked" | "full";
 
 export type UserActorMode = "disabled" | "any";
@@ -7,6 +9,8 @@ export type InteractiveMode = "reject" | "ask";
 export type CommandActor = { kind: "agent" } | { kind: "user"; userId: string };
 
 export interface CommandBridgeConfig {
+  /** Command bridge tools are exposed only to explicitly authorized scopes. */
+  allowedScopes?: ToolAccessRule[];
   trustMode: TrustMode;
   allowCommands: string[];
   hardDeny: string[];
