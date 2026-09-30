@@ -29,6 +29,19 @@ export function assemblePostHistoryInstructions(card: CharacterCardV3, context: 
   return render(card.data.post_history_instructions, context);
 }
 
+/** The exact prompt material the roleplay plugin would inject, reused by an active polisher. */
+export function assembleRoleProfile(card: CharacterCardV3, context: CBSContext): { roleInstructions?: string; characterDefinition?: string } {
+  const instructionExtension = assembleInstructionExtension(card, context);
+  const postHistoryInstructions = assemblePostHistoryInstructions(card, context);
+  const roleInstructions = [instructionExtension, postHistoryInstructions].filter((section) => section.length > 0).join("\n\n");
+  const characterDefinition = assembleCharacterDefinition(card, context);
+
+  return {
+    ...(roleInstructions.length > 0 ? { roleInstructions } : {}),
+    ...(characterDefinition.length > 0 ? { characterDefinition } : {}),
+  };
+}
+
 function render(value: string, context: CBSContext): string {
   return renderCBS(value, context).text.trim();
 }

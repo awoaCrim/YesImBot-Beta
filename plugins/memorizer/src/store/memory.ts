@@ -1,11 +1,17 @@
 import { randomUUID } from "node:crypto";
 
-import type { Context, Database, Field, Types } from "koishi";
+import type { Context, Field, Types } from "koishi";
 import type { ChannelContext } from "koishi-plugin-yesimbot";
 
+import { cosineSimilarity, memoryEmbeddingText, usableEmbedding, type EmbeddingIndexer } from "../semantic.js";
 import { retentionScore, type Memory, type MemoryCreateInput, type MemoryQuery, type MemoryRow, type MemoryType, type MemoryUpdateInput } from "../types.js";
 
 export const MEMORY_TABLE = "yesimbot_memory";
+
+/** Ranking half-life used when a caller does not pass one. */
+const DEFAULT_HALF_LIFE_DAYS = 90;
+/** Active memories re-vectorised per maintenance sweep. */
+const REINDEX_BATCH = 64;
 
 const MEMORY_FIELDS = {
   id: "string",
@@ -31,6 +37,17 @@ const MEMORY_FIELDS = {
   embeddingModel: { type: "string", nullable: true, initial: null },
 } satisfies Field.Extension<MemoryRow, Types>;
 
+export interface SemanticOptions {
+  readonly minSimilarity: number;
+  readonly boostWeight: number;
+}
+
+export interface MemoryStoreOptions {
+  readonly indexer?: EmbeddingIndexer;
+  readonly semantic?: SemanticOptions;
+  readonly halfLifeDays?: number;
+}
+
 export interface PruneOptions {
   readonly halfLifeDays: number;
   readonly forgottenGraceDays: number;
@@ -44,16 +61,32 @@ export interface PrunePlan {
 
 export class MemoryStore {
   private readonly ctx: Context;
+  private readonly indexer: EmbeddingIndexer | undefined;
+  private readonly semantic: SemanticOptions;
+  private readonly halfLifeDays: number;
   private mutationTail: Promise<void> = Promise.resolve();
 
-  public constructor(ctx: Context) {
+  public constructor(ctx: Context, options: MemoryStoreOptions = {}) {
     this.ctx = ctx;
+    this.indexer = options.indexer;
+    this.semantic = options.semantic ?? { minSimilarity: 0.35, boostWeight: 1 };
+    this.halfLifeDays = options.halfLifeDays ?? DEFAULT_HALF_LIFE_DAYS;
     this.ctx.model.extend(MEMORY_TABLE, MEMORY_FIELDS);
   }
   public create(input: MemoryCreateInput, id = randomUUID()): Promise<Memory> {
     return this.mutate(async () => {
       const now = Date.now();
-      const row = toRow({ id, ...input, status: "active", createdAt: now, updatedAt: now, lastAccessedAt: now, accessCount: 0 });
+      const vector = await this.embedDocument(input.content, input.tags ?? []);
+      const row = toRow({
+        id,
+        ...input,
+        ...vector,
+        status: "active",
+        createdAt: now,
+        updatedAt: now,
+        lastAccessedAt: now,
+        accessCount: 0,
+      });
       await this.ctx.model.create(MEMORY_TABLE, row);
       return fromRow(row);
     });
@@ -69,9 +102,11 @@ export class MemoryStore {
   public update(id: string, input: MemoryUpdateInput): Promise<Memory> {
     return this.mutate(async () => {
       const existing = await this.require(id);
-      const next = toRow({
-        ...existing,
-        ...input,
+      const merged = { ...existing, ...input, id };
+      const vector = await this.reindexIfNeeded(existing, merged);
+      const row = toRow({
+        ...merged,
+        ...vector,
         id,
         status: existing.status,
         createdAt: existing.createdAt,
@@ -79,8 +114,8 @@ export class MemoryStore {
         lastAccessedAt: existing.lastAccessedAt,
         accessCount: existing.accessCount,
       });
-      await this.ctx.model.set(MEMORY_TABLE, { id }, next);
-      return fromRow(next);
+      await this.ctx.model.set(MEMORY_TABLE, { id }, row);
+      return fromRow(row);
     });
   }
 
@@ -88,9 +123,11 @@ export class MemoryStore {
     return this.mutate(async () => {
       await this.require(mergedId);
       const canonical = await this.require(canonicalId);
-      const next = toRow({
-        ...canonical,
-        ...input,
+      const merged = { ...canonical, ...input, id: canonicalId };
+      const vector = await this.reindexIfNeeded(canonical, merged);
+      const row = toRow({
+        ...merged,
+        ...vector,
         id: canonicalId,
         status: canonical.status,
         createdAt: canonical.createdAt,
@@ -98,9 +135,9 @@ export class MemoryStore {
         lastAccessedAt: canonical.lastAccessedAt,
         accessCount: canonical.accessCount,
       });
-      await this.ctx.model.set(MEMORY_TABLE, { id: canonicalId }, next);
+      await this.ctx.model.set(MEMORY_TABLE, { id: canonicalId }, row);
       await this.ctx.model.remove(MEMORY_TABLE, { id: mergedId });
-      return fromRow(next);
+      return fromRow(row);
     });
   }
 
@@ -123,21 +160,90 @@ export class MemoryStore {
   }
 
   public queryVisible(context: ChannelContext, userIds: readonly string[], query: MemoryQuery = {}): Promise<Memory[]> {
+    return this.searchVisible(context, userIds, query).then((result) => result.memories);
+  }
+
+  /**
+   * Visibility-filtered retrieval. Without `semantic` this is the historical
+   * keyword/tag filter ranked by retention. With `semantic` and a configured
+   * embedding model, the keyword filter becomes a signal instead of a hard
+   * gate: a memory is recalled when it matches the keywords or is similar
+   * enough to the query, and ranking blends similarity into retention.
+   */
+  public searchVisible(context: ChannelContext, userIds: readonly string[], query: MemoryQuery = {}): Promise<{ memories: Memory[]; semanticUsed: boolean }> {
     return this.mutate(async () => {
+      const now = Date.now();
+      const halfLifeDays = query.halfLifeDays ?? this.halfLifeDays;
       const scopes = query.scopes ?? ["channel", "user", "shared"];
-      const terms = query.query?.toLocaleLowerCase();
+      const terms = query.query?.toLocaleLowerCase().trim();
       const requiredTags = query.tags ?? [];
       const rows = (await this.ctx.model.get(MEMORY_TABLE, {})) as MemoryRow[];
-      const memories = rows
+      const pool = rows.map(fromRow).filter((memory) => {
+        if (memory.status !== "active" || !scopes.includes(memory.scope) || !isVisible(memory, context, userIds)) return false;
+        if (query.types && !query.types.includes(memory.type)) return false;
+        return requiredTags.every((tag) => memory.tags.includes(tag));
+      });
+      const matchesKeywords = (memory: Memory) => !terms || `${memory.content}\n${memory.tags.join("\n")}`.toLocaleLowerCase().includes(terms);
+      const byRetention = (left: Memory, right: Memory) =>
+        retentionScore(right, now, halfLifeDays) * right.confidence - retentionScore(left, now, halfLifeDays) * left.confidence;
+      const limit = (values: Memory[]) => (query.limit === undefined ? values : values.slice(0, query.limit));
+
+      const indexer = this.indexer;
+      if (!query.semantic || !indexer || !terms) return { memories: limit(pool.filter(matchesKeywords).sort(byRetention)), semanticUsed: false };
+
+      const queryVector = await indexer.embed(`${indexer.queryPrefix}${query.query!.trim()}`);
+      if (!queryVector) return { memories: limit(pool.filter(matchesKeywords).sort(byRetention)), semanticUsed: false };
+
+      let semanticUsed = false;
+      const scored: Array<{ memory: Memory; score: number }> = [];
+      for (const memory of pool) {
+        const stored = usableEmbedding(memory, indexer.modelId);
+        const similarity = stored ? Math.max(0, cosineSimilarity(queryVector, stored)) : undefined;
+        if (similarity !== undefined) semanticUsed = true;
+        if (!matchesKeywords(memory) && (similarity === undefined || similarity < this.semantic.minSimilarity)) continue;
+        scored.push({
+          memory,
+          score: retentionScore(memory, now, halfLifeDays) * memory.confidence * (1 + this.semantic.boostWeight * (similarity ?? 0)),
+        });
+      }
+      scored.sort((left, right) => right.score - left.score);
+      return { memories: limit(scored.map((entry) => entry.memory)), semanticUsed };
+    });
+  }
+
+  /**
+   * Backfill vectors for memories written before an embedding model existed, or
+   * produced by a different model. Vector calls run outside the mutation tail so
+   * a bulk reindex cannot stall recall.
+   */
+  public async reindex(limit = REINDEX_BATCH): Promise<number> {
+    const indexer = this.indexer;
+    if (!indexer) return 0;
+    const stale = await this.mutate(async () => {
+      const rows = (await this.ctx.model.get(MEMORY_TABLE, {})) as MemoryRow[];
+      return rows
         .map(fromRow)
-        .filter((memory) => {
-          if (memory.status !== "active" || !scopes.includes(memory.scope) || !isVisible(memory, context, userIds)) return false;
-          if (query.types && !query.types.includes(memory.type)) return false;
-          if (terms && !`${memory.content}\n${memory.tags.join("\n")}`.toLocaleLowerCase().includes(terms)) return false;
-          return requiredTags.every((tag) => memory.tags.includes(tag));
-        })
-        .sort((left, right) => retentionScore(right, Date.now(), 90) * right.confidence - retentionScore(left, Date.now(), 90) * left.confidence);
-      return query.limit === undefined ? memories : memories.slice(0, query.limit);
+        .filter((memory) => memory.status === "active" && !usableEmbedding(memory, indexer.modelId))
+        .slice(0, limit);
+    });
+    let indexed = 0;
+    for (const memory of stale) {
+      const vector = await this.embedDocument(memory.content, memory.tags);
+      if (!vector.embedding) continue;
+      await this.mutate(async () => {
+        await this.ctx.model.set(MEMORY_TABLE, { id: memory.id }, { embedding: vector.embedding, embeddingModel: vector.embeddingModel });
+      });
+      indexed += 1;
+    }
+    return indexed;
+  }
+
+  public missingEmbeddings(): Promise<number> {
+    return this.mutate(async () => {
+      const indexer = this.indexer;
+      if (!indexer) return 0;
+      const rows = (await this.ctx.model.get(MEMORY_TABLE, {})) as MemoryRow[];
+      return rows.map(fromRow).filter((memory) => memory.status === "active" && !usableEmbedding(memory, indexer.modelId)).length;
     });
   }
 
@@ -177,6 +283,27 @@ export class MemoryStore {
     const row = ((await this.ctx.model.get(MEMORY_TABLE, { id })) as MemoryRow[])[0];
     if (!row) throw new Error(`memory ${id} not found`);
     return fromRow(row);
+  }
+
+  /** Build a document vector, or an explicit clear when indexing is unavailable. */
+  private async embedDocument(content: string, tags: readonly string[]): Promise<{ embedding?: number[]; embeddingModel?: string }> {
+    const indexer = this.indexer;
+    if (!indexer) return {};
+    const vector = await indexer.embed(memoryEmbeddingText({ content, tags }));
+    return vector ? { embedding: vector, embeddingModel: indexer.modelId } : { embedding: undefined, embeddingModel: undefined };
+  }
+
+  /**
+   * Recompute the vector after a content or tag edit. A stale vector is always
+   * cleared when it cannot be refreshed, because otherwise it would keep
+   * describing text that no longer exists.
+   */
+  private async reindexIfNeeded(before: Memory, after: Memory): Promise<{ embedding?: number[]; embeddingModel?: string }> {
+    if (before.content === after.content && before.tags.join("\u0000") === after.tags.join("\u0000")) return {};
+    const indexer = this.indexer;
+    if (!indexer) return { embedding: undefined, embeddingModel: undefined };
+    const vector = await indexer.embed(memoryEmbeddingText(after));
+    return vector ? { embedding: vector, embeddingModel: indexer.modelId } : { embedding: undefined, embeddingModel: undefined };
   }
 }
 

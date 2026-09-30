@@ -80,6 +80,10 @@ export interface MemoryQuery {
   readonly scopes?: MemoryScope[];
   readonly types?: MemoryType[];
   readonly limit?: number;
+  /** Broaden the keyword filter with vector similarity when an embedding model is configured. */
+  readonly semantic?: boolean;
+  /** Ranking half-life; kept in sync with the configured `halfLifeDays`. */
+  readonly halfLifeDays?: number;
 }
 
 export interface MemoryEvidence {
@@ -121,7 +125,8 @@ export interface MemorySearchReport {
 }
 
 export interface MemorizerConfig {
-  readonly model: string;
+  /** @deprecated Auxiliary routing is owned by YesImBot config. */
+  readonly model?: string;
   readonly embeddingModel?: string;
   readonly dataPath?: string;
   readonly batchDelayMs?: number;
@@ -131,6 +136,17 @@ export interface MemorizerConfig {
   readonly halfLifeDays?: number;
   readonly forgottenGraceDays?: number;
   readonly maxActivePerScope?: number;
+  /** Minimum cosine similarity for a vector-only match to be recalled. */
+  readonly semanticMinSimilarity?: number;
+  /** Ranking multiplier strength: score = retention x confidence x (1 + weight x similarity). */
+  readonly semanticBoostWeight?: number;
+  /**
+   * Overrides the query-side retrieval instruction. When unset, the prefix is
+   * derived from the embedding model family, because some models (bge-*-zh)
+   * expect an instruction on the query side only and document vectors never
+   * use it. An explicit empty string disables the instruction entirely.
+   */
+  readonly semanticQueryPrefix?: string;
 }
 
 declare module "koishi" {

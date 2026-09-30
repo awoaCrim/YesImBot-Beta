@@ -11,7 +11,10 @@ const context = {
   baseDir: "/tmp",
   logger: () => ({ warn: vi.fn(), success: vi.fn(), info: vi.fn() }),
   yesimbot: {
-    model: { resolveChatModel: vi.fn(() => ({ model: {} })) },
+    model: {
+      resolveChatModel: vi.fn(() => ({ model: {} })),
+      resolveAuxiliaryModel: vi.fn(() => ({ model: {} })),
+    },
     agent: { use: vi.fn(() => vi.fn()) },
     conversation: { read: vi.fn() },
   },

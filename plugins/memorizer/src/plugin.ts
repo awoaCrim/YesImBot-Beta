@@ -1,5 +1,4 @@
 import { jsonSchema, type AgentMessage, type AgentTool, type AgentToolExecuteContext } from "@yesimbot/agent-runtime";
-import { embed, type EmbeddingModel } from "ai";
 import { isMessage, type ChannelContext, type ConversationReadOptions, type MessageRecord } from "koishi-plugin-yesimbot";
 
 import { MemoryStore } from "./store/memory.js";
@@ -17,7 +16,7 @@ const RECALL_SCHEMA = jsonSchema<RecallInput>({
       description: "按记忆类型过滤",
     },
     scope: { type: "string", enum: ["channel", "user", "shared"], description: "限定记忆范围" },
-    semantic: { type: "boolean", description: "是否启用语义向量检索（需要 embedding 模型）" },
+    semantic: { type: "boolean", description: "启用语义召回：关键词命中之外，还会召回向量相似度足够高的记忆，并把相似度并入排序" },
     limit: { type: "integer", minimum: 1, maximum: 50, description: "最大返回条数" },
   },
   additionalProperties: false,
@@ -76,39 +75,37 @@ export function createChannelTools(
     readConversation: (context: ChannelContext, options: ConversationReadOptions) => Promise<MessageRecord[]>;
     rearm: () => Promise<void>;
     search: (input: SearchInput, execution: AgentToolExecuteContext) => Promise<MemorySearchReport>;
-    embeddingModel?: EmbeddingModel;
   },
 ): AgentTool[] {
   const recall: AgentTool<RecallInput, { memories: MemoryRecall[]; semanticUsed: boolean }> = {
     name: "recall",
-    description: "检索当前频道、当前轮参与者和全局可见的长期记忆。",
+    description:
+      "检索当前频道、当前轮参与者和全局可见的长期记忆。可按 query、tags、types、scope、limit 过滤；关键词不足时可将 semantic 设为 true，返回结果包含证据数量和相对时间。",
+
     inputSchema: RECALL_SCHEMA,
     execute: async (input, execution) => {
       const current = execution as unknown as AgentToolExecuteContext;
       const userIds = participants(current.messages);
-      let semanticUsed = false;
-      if (input.semantic && options.embeddingModel && input.query) {
-        try {
-          await embed({ model: options.embeddingModel, value: input.query });
-          semanticUsed = true;
-        } catch {
-          semanticUsed = false;
-        }
-      }
-      const memories = await store.queryVisible(context, userIds, {
+      const result = await store.searchVisible(context, userIds, {
         query: input.query,
         tags: input.tags,
         types: input.types,
         scopes: input.scope ? [input.scope] : undefined,
         limit: input.limit,
+        semantic: input.semantic,
       });
-      await store.touch(memories.map((memory) => memory.id));
-      return { memories: await Promise.all(memories.map(async (memory) => toRecall(memory, options.evidenceCount))), semanticUsed };
+      await store.touch(result.memories.map((memory) => memory.id));
+      return {
+        memories: await Promise.all(result.memories.map(async (memory) => toRecall(memory, options.evidenceCount))),
+        semanticUsed: result.semanticUsed,
+      };
     },
   };
   const remember: AgentTool<RememberInput, { queued: true; pendingId: string; sourceCount: number }> = {
     name: "remember",
-    description: "将当前频道的指定消息上下文加入长期记忆整理队列。",
+    description:
+      "将当前频道的指定消息上下文加入后台长期记忆整理队列。content 写要保留的事实或偏好，sources 必须是相关 messageId；可选 scope 控制记忆可见范围。",
+
     inputSchema: REMEMBER_SCHEMA,
     execute: async (input, execution) => {
       const sources = [...new Set(input.sources)];
@@ -133,7 +130,8 @@ export function createChannelTools(
   };
   const search: AgentTool<SearchInput, MemorySearchReport> = {
     name: "search",
-    description: "让记忆代理基于已授权的记忆和证据生成结构化报告。",
+    description: "让记忆代理基于已授权的记忆和证据生成结构化报告。query 必填；需要复杂交叉验证时使用，简单事实优先使用 recall。",
+
     inputSchema: SEARCH_SCHEMA,
     execute: (input, execution) => options.search(input, execution as unknown as AgentToolExecuteContext),
   };

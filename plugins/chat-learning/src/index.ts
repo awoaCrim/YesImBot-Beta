@@ -3,7 +3,7 @@ import { dirname, join, resolve } from "node:path";
 
 import type { AgentEntry, AgentPlugin, AgentPluginRuntime, AgentStorage, PrepareStepContext } from "@yesimbot/agent-runtime";
 import { createMessageEntry } from "@yesimbot/agent-runtime";
-import type { ModelMessage } from "ai";
+import type { LanguageModel, ModelMessage } from "ai";
 import { Context, Logger, Schema, Universal, type Command, type Session } from "koishi";
 import { createMessage, isMessage, type ChannelContext, type DeliveredPayload } from "koishi-plugin-yesimbot";
 
@@ -65,17 +65,15 @@ export const Config: Schema<ChatLearningConfig> = Schema.object({
   globalSyncIntervalMinutes: Schema.number().min(1).max(1440).default(60).description("跨群规则同步最小间隔分钟数"),
   minGlobalChannels: Schema.number().min(1).max(100).default(2).description("全局规则至少出现的频道数"),
   maxGlobalPatterns: Schema.number().min(1).max(50).default(8).description("每轮最多注入的全局规律数"),
-  summaryModel: Schema.dynamic("registry.chatModels").description(
-    "用于提炼本群规律的模型；留空则使用 Core 默认 chat 模型，没有可用模型时不生成 local_patterns",
-  ),
+  summaryModel: Schema.dynamic("registry.chatModels").description("启用本群规律提炼；实际统一使用 YesImBot auxiliaryModel，留空则关闭"),
   embeddingModel: Schema.dynamic("registry.embeddingModels").default("").description("用于语义归并全局规律的 embedding 模型；留空则不使用 embedding"),
   embeddingSimilarity: Schema.number().min(0).max(1).default(0.92).description("embedding 语义归并阈值，越高要求越相似"),
   maxModelThreads: Schema.number().min(1).max(10).default(3).description("每次模型标注最多使用几条完整对话线程"),
   maxModelThreadMessages: Schema.number().min(4).max(100).default(30).description("每条线程最多送入模型的消息数"),
-  reflectionModel: Schema.dynamic("registry.chatModels").default("").description("可选：用独立模型评价 bot 最近发言并生成风格反思；留空则关闭"),
+  reflectionModel: Schema.dynamic("registry.chatModels").default("").description("可选：使用 auxiliaryModel 评价 bot 最近发言并生成风格反思；留空则关闭"),
   maxInjectedReflections: Schema.number().min(1).max(10).default(3).description("每次注入提示词末尾的最近反思条数"),
   injectStyleAsSystem: Schema.boolean().default(false).description("将 chat-learning 风格参考作为 system 消息注入；默认使用尾部 user 消息以兼容更多 provider"),
-  finalStyleModel: Schema.dynamic("registry.chatModels").default("").description("可选：在 bot 最终发言发出前用独立模型按本群风格改写；留空则关闭"),
+  finalStyleModel: Schema.dynamic("registry.chatModels").default("").description("可选：在 bot 最终发言发出前使用 auxiliaryModel 按本群风格改写；留空则关闭"),
 });
 
 const LINK_KINDS = new Set<LinkKind | "*">(["quote", "reply", "at", "adjacent", "entity", "*"]);
@@ -356,7 +354,7 @@ export default class ChatLearningPlugin {
           const styleBlock = buildPromptBlock(state, undefined, config, globalPatterns, globalChains, globalStylePatterns, globalMemeTemplates);
           if (!styleBlock) continue;
           try {
-            const ref = ctx.yesimbot.model.resolveChatModel(modelId);
+            const ref = ctx.yesimbot.model.resolveAuxiliaryModel("utility");
             const cacheKey = reflectionCacheKey(styleBlock, current.text);
             const cached = reflectionResultCache.get(cacheKey);
             const next = cached ?? (await reflectOnSentMessage(ref.model, styleBlock, current.text));
@@ -409,7 +407,7 @@ export default class ChatLearningPlugin {
           const reference = buildReferenceBlock();
           if (reference) {
             try {
-              next = await rewriteAssistantEntries(next, ctx.yesimbot.model.resolveChatModel(finalStyleModelId).model, reference);
+              next = await rewriteAssistantEntries(next, ctx.yesimbot.model.resolveAuxiliaryModel("utility").model, reference);
               logger.debug("chat_learning.final_style_rewritten", { scope, entries: next.length });
             } catch (cause) {
               logger.warn("chat_learning.final_style_rewrite_failed", { scope, cause: cause instanceof Error ? cause.message : String(cause) });
@@ -898,19 +896,22 @@ export default class ChatLearningPlugin {
       const segments = segmentTurns(turns);
       const links = buildLinks(turns);
       const modelId = resolveChatLearningModelId(this.ctx, config);
-      const patterns = modelId
-        ? await classifyPatternsWithModel(
-            this.ctx.yesimbot.model.resolveChatModel(modelId).model,
+      let patterns: Awaited<ReturnType<typeof classifyPatternsWithModel>>;
+      if (modelId) {
+        try {
+          patterns = await classifyPatternsWithModel(
+            this.ctx.yesimbot.model.resolveAuxiliaryModel("utility").model,
             turns,
             segments,
             links,
             { maxThreads: config.maxModelThreads, maxThreadMessages: config.maxModelThreadMessages },
             this.modelCache,
-          ).catch((cause) => {
-            this.logger.warn("chat_learning.global_classify_failed", { model: modelId, cause: cause instanceof Error ? cause.message : String(cause) });
-            return undefined;
-          })
-        : undefined;
+          );
+        } catch (cause) {
+          this.logger.warn("chat_learning.global_classify_failed", { model: modelId, cause: cause instanceof Error ? cause.message : String(cause) });
+          patterns = undefined;
+        }
+      }
       const responsePatterns = patterns?.responsePatterns ?? [];
       const initiationPatterns = patterns?.initiationPatterns ?? [];
       const chainPatterns = await enrichChainStyles(
@@ -997,7 +998,7 @@ async function enrichWithModel(
   const modelId = resolveChatLearningModelId(ctx, config);
   if (!modelId) return state;
   try {
-    const ref = ctx.yesimbot.model.resolveChatModel(modelId);
+    const ref = ctx.yesimbot.model.resolveAuxiliaryModel("utility");
     const patterns = await classifyPatternsWithModel(
       ref.model,
       state.turns,
@@ -1033,7 +1034,12 @@ async function enrichChainStyles(
   const modelId = resolveChatLearningModelId(ctx, config);
   if (!modelId) return chainPatterns;
   const existingByKey = new Map(existingChains.map((chain) => [chain.chain.join(">"), chain]));
-  const ref = ctx.yesimbot.model.resolveChatModel(modelId);
+  let model: LanguageModel;
+  try {
+    model = ctx.yesimbot.model.resolveAuxiliaryModel("utility").model;
+  } catch {
+    return chainPatterns;
+  }
   const limited = chainPatterns.slice(0, config.maxGlobalPatterns);
   const enriched = await Promise.all(
     limited.map(async (pattern) => {
@@ -1044,7 +1050,7 @@ async function enrichChainStyles(
       if (existing?.style && existing.styleSampleId === sampleId) {
         return { ...pattern, style: existing.style, styleSampleId: existing.styleSampleId };
       }
-      const style = await generateChainStyle(ref.model, pattern.chain, pattern.sample, cache);
+      const style = await generateChainStyle(model, pattern.chain, pattern.sample, cache);
       return style ? { ...pattern, style, styleSampleId: sampleId } : pattern;
     }),
   );
@@ -1057,14 +1063,20 @@ async function buildGlobalMemeTemplates(ctx: Context, config: ChatLearningConfig
     frequency: pattern.channels.reduce((sum, channel) => sum + channel.frequency, 0),
   }));
   const modelId = resolveChatLearningModelId(ctx, config);
-  const model = modelId ? ctx.yesimbot.model.resolveChatModel(modelId).model : undefined;
+  let model: LanguageModel | undefined;
+  if (modelId) {
+    try {
+      model = ctx.yesimbot.model.resolveAuxiliaryModel("utility").model;
+    } catch {
+      model = undefined;
+    }
+  }
   return buildMemeTemplates(model, phrases, Date.now(), cache);
 }
 
-function resolveChatLearningModelId(ctx: Context, config: ChatLearningConfig): string | undefined {
+function resolveChatLearningModelId(_ctx: Context, config: ChatLearningConfig): string | undefined {
   const configured = config.summaryModel?.trim();
-  if (configured) return configured;
-  return ctx.yesimbot.model.getDefaultChatModelId();
+  return configured || undefined;
 }
 
 function reflectionCacheKey(styleBlock: string, text: string): string {

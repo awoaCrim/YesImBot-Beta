@@ -65,7 +65,7 @@ export async function runSearch(input: SearchInput): Promise<MemorySearchReport>
   const tools: AgentTool[] = [
     {
       name: "query_memories",
-      description: "查询当前可见的记忆。可多次调用，用不同关键词和过滤条件扩展搜索范围。",
+      description: "查询当前可见的记忆。可多次调用，用不同关键词、语义召回和过滤条件扩展搜索范围。",
       inputSchema: jsonSchema<MemoryQuery>({
         type: "object",
         properties: {
@@ -77,6 +77,7 @@ export async function runSearch(input: SearchInput): Promise<MemorySearchReport>
             items: { type: "string", enum: ["fact", "preference", "event", "relationship", "knowledge", "experience"] },
             description: "按类型过滤",
           },
+          semantic: { type: "boolean", description: "启用语义召回：关键词未命中但向量相似度足够高的记忆也会被纳入，并按相似度加权重排" },
           limit: { type: "integer", minimum: 1, maximum: 50, description: "最大返回条数" },
         },
         additionalProperties: false,
@@ -111,7 +112,7 @@ export async function runSearch(input: SearchInput): Promise<MemorySearchReport>
 ## 搜索策略
 
 1. 先用关键词 query_memories 进行初步搜索
-2. 如果结果不足，尝试不同关键词、不同 scope 或 type 组合扩展搜索
+2. 如果结果不足，尝试不同关键词、开启 semantic 语义召回、或调整 scope / type 组合扩展搜索
 3. 对关键记忆使用 read_evidence 验证原始证据
 4. 综合所有发现，用 submit_report 提交结构化报告
 
