@@ -2,6 +2,7 @@ import type { CharacterCardV3 } from "@risuai/ccardlib";
 import { createAgentChannel, createMemoryStorage, createPluginHost, createStateManager } from "@yesimbot/agent-runtime";
 import { describe, expect, it } from "vitest";
 
+import { assembleRoleProfile } from "../src/prompt.js";
 import { createRoleplayPlugin } from "../src/roleplay.js";
 
 function createCard(): CharacterCardV3 {
@@ -29,6 +30,30 @@ function createCard(): CharacterCardV3 {
 }
 
 describe("roleplay agent plugin", () => {
+  it("delegates the same card instructions and definition without injecting them into the main Agent", async () => {
+    const card = createCard();
+    card.data.system_prompt = "Roleplay as {{char}} for {{user}}";
+    card.data.post_history_instructions = "Always speak in character to {{user}}";
+    const profile = assembleRoleProfile(card, { charName: "Athena", userName: "direct-user", pickCache: new Map() });
+    expect(profile.roleInstructions).toContain("Roleplay as Athena for direct-user");
+    expect(profile.roleInstructions).toContain("Always speak in character to direct-user");
+    expect(profile.characterDefinition).toContain("Name: Athena");
+    const storage = createMemoryStorage();
+    const channel = createAgentChannel();
+    const state = createStateManager({ storage });
+    const host = createPluginHost({
+      plugins: [createRoleplayPlugin({ card, greeting: "Hello {{user}}", userName: "direct-user", delegatePrompts: true })],
+      runtime: { id: "channel", channel, state, storage },
+    });
+    await host.init();
+    expect(host.stablePromptBlocks).toEqual([]);
+    const messages = [{ role: "user" as const, content: "hello" }];
+    expect(await host.helpers.prepareStep(messages, { runtime: { id: "channel" }, channel, state, turnId: "turn", stepNumber: 0 })).toEqual(messages);
+    expect(await storage.read()).toEqual([
+      expect.objectContaining({ type: "message", data: expect.objectContaining({ role: "assistant", content: "Hello direct-user" }) }),
+    ]);
+  });
+
   it("persists the rendered first greeting for an empty session", async () => {
     const storage = createMemoryStorage();
     const channel = createAgentChannel();
@@ -84,13 +109,20 @@ describe("roleplay agent plugin", () => {
     const first = await host.helpers.prepareStep([{ role: "user", content: "hello" }], context);
     const second = await host.helpers.prepareStep([{ role: "user", content: "hello" }], context);
 
-    expect(host.stablePromptBlocks).toEqual([expect.objectContaining({ role: "system", content: expect.stringContaining("Protect direct-user.") })]);
+    expect(host.stablePromptBlocks).toEqual([
+      expect.objectContaining({
+        role: "system",
+        content: expect.stringContaining("Protect direct-user."),
+      }),
+    ]);
     expect(JSON.stringify(host.stablePromptBlocks)).toContain("<example_dialogues>");
+    expect(JSON.stringify(host.stablePromptBlocks)).toContain("Answer direct-user last.");
     expect(first).toEqual([
       { role: "system", content: "Name: Athena\n\nA dark character.\n\nPersonality:\nMood: kind.\n\nScenario:\nRoll: 5." },
       { role: "user", content: "hello" },
-      { role: "system", content: "Answer direct-user last." },
     ]);
+    const firstNonSystem = first.findIndex((message) => message.role !== "system");
+    expect(first.slice(firstNonSystem + 1)).not.toContainEqual(expect.objectContaining({ role: "system" }));
     expect(second).toEqual(first);
   });
 });

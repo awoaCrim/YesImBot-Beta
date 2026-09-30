@@ -10,10 +10,14 @@ export interface RoleplayAgentPluginOptions {
   readonly greeting: string;
   readonly random?: () => number;
   readonly userName: string;
+  /** Shared per-channel placeholder state used by the role profile and greeting. */
+  readonly context?: CBSContext;
+  /** True when an active polisher owns style, so card prompts must stay out of the main Agent. */
+  readonly delegatePrompts?: boolean;
 }
 
 export function createRoleplayPlugin(options: RoleplayAgentPluginOptions): AgentPlugin {
-  const context: CBSContext = {
+  const context: CBSContext = options.context ?? {
     charName: options.card.data.nickname ?? options.card.data.name,
     pickCache: new Map<string, string>(),
     random: options.random,
@@ -22,20 +26,26 @@ export function createRoleplayPlugin(options: RoleplayAgentPluginOptions): Agent
   const instructionExtension = assembleInstructionExtension(options.card, context);
   const characterDefinition = assembleCharacterDefinition(options.card, context);
   const postHistoryInstructions = assemblePostHistoryInstructions(options.card, context);
+  const stableInstructions = [instructionExtension, postHistoryInstructions].filter((section) => section.length > 0).join("\n\n");
   const greeting = renderCBS(options.greeting, context).text;
   const prefix = characterDefinition.length > 0 ? [{ role: "system" as const, content: characterDefinition }] : [];
-  const suffix = postHistoryInstructions.length > 0 ? [{ role: "system" as const, content: postHistoryInstructions }] : [];
-
-  return {
+  const delegate = options.delegatePrompts === true;
+  const plugin: AgentPlugin = {
     name: "roleplay",
-    appendSystemPrompt: () => instructionExtension || undefined,
     async init(runtime) {
       const entries = await runtime.storage.read();
       if (entries.some((entry) => entry.type === "message") || greeting.length === 0) return;
       await runtime.storage.append(createMessageEntry(createAssistantMessage(greeting)));
     },
-    prepareStep(messages) {
-      return [...prefix, ...messages, ...suffix];
-    },
   };
+
+  // Google providers reject system messages after conversation history, so card instructions stay in
+  // the frozen leading system prompt. A delegated prompt goes to the polisher profile instead, which
+  // keeps persona-specific roleplay instructions out of the main Agent.
+  if (!delegate) {
+    plugin.appendSystemPrompt = () => stableInstructions || undefined;
+    plugin.prepareStep = (messages) => [...prefix, ...messages];
+  }
+
+  return plugin;
 }
