@@ -145,7 +145,7 @@ function formatStickerPrompt(config: StickerConfig): string {
     "在已决定回应的轻松互动中，表情包也可以作为自然回应：开心、得意、吐槽、害羞或简短情绪反应时，可主动选一张合适的已有表情包，不必等对方要求。",
     "发送文字前先决定本轮只发文字、只发表情包，还是文字后接表情包；不合适时可省略，不要为完成规则强行发送。",
     "sticker_send 负责平台发送；同一轮最多实际发送一张，成功后不能再次发送。",
-    "若本轮同时发送文字和表情包，先调用 send_message 并设置 continue=true，再调用 terminal 的 sticker_send；只发表情包时直接调用 sticker_send。",
+    "若本轮同时发送文字和表情包，先调用 send_message 并设置 continue=true，再调用 terminal 的 sticker_send；只发表情包时直接调用 terminal 的 sticker_send。",
     "发送表情包必须调用 sticker_send；不要直接输出 <sticker/>，它只用于内部历史投影，不会发送到平台。",
     "不要编造或直接输出 artifact://、asset://、workspace:// 等资源 URI；sticker_search 返回的 id 只能传给 sticker_send。",
     ...(config.enableSteal ? ["sticker_steal 可收藏当前消息中的图片。"] : []),

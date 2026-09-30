@@ -52,6 +52,10 @@ describe("Config schema", () => {
           minMessages: number;
           maxFailures: number;
           inlineFragments: number;
+          mode: "summary" | "compartment";
+          chunkMessages: number;
+          chunkChars: number;
+          assistantAsFacts: boolean;
         };
       };
     };
@@ -63,6 +67,10 @@ describe("Config schema", () => {
       minMessages: 15,
       maxFailures: 3,
       inlineFragments: 3,
+      mode: "summary",
+      chunkMessages: 20,
+      chunkChars: 12_000,
+      assistantAsFacts: false,
     });
   });
 

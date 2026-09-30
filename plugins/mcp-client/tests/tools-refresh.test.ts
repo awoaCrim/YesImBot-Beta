@@ -115,7 +115,10 @@ describe("mcp-client tool registry", () => {
     const { ctx, disposers, plugins } = createContext();
     mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
 
-    const plugin = new McpClientPlugin(ctx as never, { mcpServers: { docs: { type: "http", url: "https://example.test/mcp" } } });
+    const plugin = new McpClientPlugin(ctx as never, {
+      allowedScopes: [{ platform: "test", channelId: "room" }],
+      mcpServers: { docs: { type: "http", url: "https://example.test/mcp" } },
+    });
 
     await plugin.start();
 
@@ -137,7 +140,10 @@ describe("mcp-client tool registry", () => {
     const { ctx, plugins } = createContext();
     mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
 
-    const plugin = new McpClientPlugin(ctx as never, { mcpServers: { luckin: { type: "http", url: "https://example.test/mcp" } } });
+    const plugin = new McpClientPlugin(ctx as never, {
+      allowedScopes: [{ platform: "test", channelId: "room" }],
+      mcpServers: { luckin: { type: "http", url: "https://example.test/mcp" } },
+    });
     await plugin.start();
 
     const channelScope = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as never;
@@ -160,12 +166,33 @@ describe("mcp-client tool registry", () => {
     expect(client.callTool).not.toHaveBeenCalled();
   });
 
+  it("hides the catalog from scopes outside the allowlist", async () => {
+    const { client } = createClient([["search"]]);
+    const { ctx, plugins } = createContext();
+    mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
+
+    const plugin = new McpClientPlugin(ctx as never, {
+      allowedScopes: [{ platform: "test", channelId: "*", userId: "100" }],
+      mcpServers: { docs: { type: "http", url: "https://example.test/mcp" } },
+    });
+    await plugin.start();
+
+    const denied = await plugins[0]!.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" } as never, {} as never);
+    expect(await resolveToolNames(denied!)).toEqual([]);
+
+    const allowed = await plugins[0]!.setup({ type: "direct", platform: "test", channelId: "private:100", userId: "100", selfId: "bot" } as never, {} as never);
+    expect(await resolveToolNames(allowed!)).toEqual(["docs-search"]);
+  });
+
   it("disambiguates exposed names after sanitization", async () => {
     const { client } = createClient([["search/tool", "search.tool"]]);
     const { ctx, plugins } = createContext();
     mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
 
-    const plugin = new McpClientPlugin(ctx as never, { mcpServers: { docs: { type: "http", url: "https://example.test/mcp" } } });
+    const plugin = new McpClientPlugin(ctx as never, {
+      allowedScopes: [{ platform: "test", channelId: "room" }],
+      mcpServers: { docs: { type: "http", url: "https://example.test/mcp" } },
+    });
     await plugin.start();
 
     const channelScope = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as never;

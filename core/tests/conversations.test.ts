@@ -523,6 +523,77 @@ describe("Conversation.compact", () => {
 function spokenEntry(id: string, timestamp: number, content: string) {
   return createEntry("message", { id, timestamp, role: "assistant", content }, { id, timestamp });
 }
+describe("Conversation compartment mode", () => {
+  it("creates bounded incremental compartments with stable expansion metadata", async () => {
+    generateText.mockReset().mockResolvedValueOnce({ text: "事实一" }).mockResolvedValueOnce({ text: "事实二" });
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-compartment-"));
+    roots.push(root);
+    const conversation = new Conversation(root, { minMessages: 1, maxFailures: 3, mode: "compartment", chunkMessages: 2, chunkChars: 10_000 });
+    await conversation.init();
+    await conversation.storage.append(
+      createEntry("message", { id: "m1", timestamp: 1, role: "user", content: "第一条" }, { id: "m1", timestamp: 1 }),
+      createEntry("message", { id: "m2", timestamp: 2, role: "user", content: "第二条" }, { id: "m2", timestamp: 2 }),
+      createEntry("message", { id: "m3", timestamp: 3, role: "user", content: "第三条" }, { id: "m3", timestamp: 3 }),
+    );
+
+    await expect(conversation.compact("manual", { model: {} as never })).resolves.toEqual({ compacted: true });
+    const compacts = (await conversation.storage.read()).filter((entry) => entry.type === "compact");
+    expect(compacts).toHaveLength(2);
+    expect(compacts[0]).toMatchObject({
+      type: "compact",
+      data: { mode: "compartment", compartmentId: compacts[0]!.id, compartmentLabel: "compartment-1", firstEntryId: "m1", lastEntryId: "m2" },
+    });
+    expect(compacts[1]).toMatchObject({ data: { parentCompactId: compacts[0]!.id, firstEntryId: "m3", lastEntryId: "m3" } });
+    expect(generateText).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps successful chunks when a later historian call fails and resumes the raw tail", async () => {
+    generateText.mockReset().mockResolvedValueOnce({ text: "第一段" }).mockRejectedValueOnce(new Error("temporary"));
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-compartment-retry-"));
+    roots.push(root);
+    const conversation = new Conversation(root, { minMessages: 1, maxFailures: 3, mode: "compartment", chunkMessages: 1, chunkChars: 10_000 });
+    await conversation.init();
+    await conversation.storage.append(
+      createEntry("message", { id: "m1", timestamp: 1, role: "user", content: "一" }, { id: "m1", timestamp: 1 }),
+      createEntry("message", { id: "m2", timestamp: 2, role: "user", content: "二" }, { id: "m2", timestamp: 2 }),
+    );
+
+    await expect(conversation.compact("manual", { model: {} as never })).resolves.toEqual({ compacted: true, reason: "partial_failure" });
+    expect((await conversation.storage.read()).filter((entry) => entry.type === "compact")).toHaveLength(1);
+
+    generateText.mockResolvedValueOnce({ text: "第二段" });
+    await expect(conversation.compact("manual", { model: {} as never })).resolves.toEqual({ compacted: true });
+    const compacts = (await conversation.storage.read()).filter((entry) => entry.type === "compact");
+    expect(compacts).toHaveLength(2);
+    expect(compacts[1]!.data.firstEntryId).toBe("m2");
+  });
+
+  it("expands only the current conversation's raw records with bounded pagination", async () => {
+    generateText.mockReset().mockResolvedValue({ text: "历史事实" });
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-compartment-expand-"));
+    roots.push(root);
+    const conversation = new Conversation(root, { minMessages: 1, maxFailures: 3, mode: "compartment", chunkMessages: 3, chunkChars: 10_000 });
+    await conversation.init();
+    await conversation.storage.append(
+      createEntry("message", { id: "m1", timestamp: 1, role: "user", content: "原始一" }, { id: "m1", timestamp: 1 }),
+      createEntry("message", { id: "m2", timestamp: 2, role: "user", content: "原始二" }, { id: "m2", timestamp: 2 }),
+    );
+    await conversation.compact("manual", { model: {} as never });
+    const compact = (await conversation.storage.read()).find((entry) => entry.type === "compact")!;
+    const beforeStorage = await conversation.storage.read();
+    const beforeCalls = generateText.mock.calls.length;
+    const first = await conversation.expandCompartment(compact.id, { limit: 1 });
+    expect(first).toMatchObject({ compartmentId: compact.id, offset: 0, limit: 1, total: 2, nextOffset: 1 });
+    expect(first.entries[0]).toMatchObject({ entryId: "m1", role: "user", text: "原始一" });
+    await expect(conversation.expandCompartment(compact.id, { offset: 1, limit: 50 })).resolves.toMatchObject({
+      entries: [{ entryId: "m2", text: "原始二" }],
+    });
+    expect(generateText).toHaveBeenCalledTimes(beforeCalls);
+    expect(await conversation.storage.read()).toEqual(beforeStorage);
+    await expect(conversation.expandCompartment("missing")).rejects.toThrow("was not found");
+  });
+});
+
 describe("Conversation archiving policies", () => {
   it("keeps the storage facade on the new active file after archiving", async () => {
     const root = await mkdtemp(join(tmpdir(), "yesimbot-storage-facade-"));

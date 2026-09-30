@@ -30,27 +30,21 @@ const config: StickerConfig = {
 type ScriptedCall = { toolName: string; input: Record<string, unknown> };
 
 function scriptedModel(calls: readonly ScriptedCall[]) {
-  let index = 0;
   return new MockLanguageModelV3({
-    doStream: async () => {
-      const call = calls[index];
-      if (!call) throw new Error("unexpected model request after the scripted calls");
-      const id = `call-${index++}`;
-      return {
-        stream: convertArrayToReadableStream([
-          { type: "stream-start", warnings: [] },
-          { type: "tool-input-start", id, toolName: call.toolName },
-          { type: "tool-input-delta", id, delta: JSON.stringify(call.input) },
-          { type: "tool-input-end", id },
-          { type: "tool-call", toolCallId: id, toolName: call.toolName, input: JSON.stringify(call.input) },
-          {
-            type: "finish",
-            finishReason: { unified: "tool-calls", raw: "tool-calls" },
-            usage: { inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 1, text: 1, reasoning: 0 } },
-          },
-        ]),
-      };
-    },
+    doStream: calls.map((call, index) => ({
+      stream: convertArrayToReadableStream([
+        { type: "stream-start", warnings: [] },
+        { type: "tool-input-start", id: `call-${index}`, toolName: call.toolName },
+        { type: "tool-input-delta", id: `call-${index}`, delta: JSON.stringify(call.input) },
+        { type: "tool-input-end", id: `call-${index}` },
+        { type: "tool-call", toolCallId: `call-${index}`, toolName: call.toolName, input: JSON.stringify(call.input) },
+        {
+          type: "finish",
+          finishReason: { unified: "tool-calls", raw: "tool-calls" },
+          usage: { inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 1, text: 1, reasoning: 0 } },
+        },
+      ]),
+    })),
   });
 }
 

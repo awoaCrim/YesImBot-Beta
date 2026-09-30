@@ -5,7 +5,7 @@ import { h, type Element, type Universal } from "koishi";
 export const PARAGRAPH_BREAK = /\r?\n[^\S\r\n]*\r?\n(?:[^\S\r\n]*\r?\n)*/;
 
 const MARK = "\u0000";
-const ELEMENT_OR_PARAGRAPH = new RegExp(String.raw`<!--[\s\S]*?-->|<\/?[a-z][a-z0-9-]*(?:[^"'<>]|"[^"]*"|'[^']*')*>|(${PARAGRAPH_BREAK.source})`, "gi");
+const ELEMENT_OR_PARAGRAPH = new RegExp(String.raw`<!--[\s\S]*?-->|<\/?[a-z][a-z0-9-]*(?:[^\"'<>]|\"[^\"]*\"|'[^']*')*>|(${PARAGRAPH_BREAK.source})`, "gi");
 
 export interface MessageQuote {
   readonly messageId: string;

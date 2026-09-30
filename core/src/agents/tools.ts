@@ -3,6 +3,7 @@ import { generateText, type LanguageModel } from "ai";
 import { h, type Bot, type Element } from "koishi";
 
 import type { PacingConfig } from "../config.js";
+import type { CompartmentExpansionRecord, Conversation } from "../conversations/index.js";
 import { PARAGRAPH_BREAK, parseReply } from "../messages/index.js";
 import { detectImageMediaType, prepareOutputSegments, ResourceReadError, type ChannelResources } from "../resources/index.js";
 import { buildPolisherTurnContext, validatePolishedMessages, type PolisherTurnContext } from "./polisher.js";
@@ -346,6 +347,51 @@ async function describeImageBytes(options: {
     ],
   });
   return result.text;
+}
+
+export type ExpandCompartmentInput = { compartmentId: string; offset?: number; limit?: number };
+
+export type ExpandCompartmentOutput =
+  | {
+      ok: true;
+      compartmentId: string;
+      label?: string;
+      offset: number;
+      limit: number;
+      total: number;
+      entries: readonly CompartmentExpansionRecord[];
+      nextOffset?: number;
+    }
+  | { ok: false; error: { name: string; message: string } };
+
+/** Read-only access to the current channel's raw source records behind one compartment summary. */
+export function createExpandCompartmentTool(conversation: Conversation): AgentTool<ExpandCompartmentInput, ExpandCompartmentOutput> {
+  return {
+    name: "ctx_expand",
+    description:
+      "只读展开当前频道会话中的一个历史 compartment。只能使用压缩历史中明确给出的 compartmentId；按 offset/limit 分页读取原始对话，不调用模型、不修改会话。未知 ID、跨频道 ID 或没有原始边界时返回错误。",
+    inputSchema: jsonSchema<ExpandCompartmentInput>({
+      type: "object",
+      properties: {
+        compartmentId: { type: "string", minLength: 1, description: "压缩历史中显示的 compartmentId" },
+        offset: { type: "integer", minimum: 0, description: "分页偏移，默认 0" },
+        limit: { type: "integer", minimum: 1, maximum: 50, description: "每页最多 50 条原始记录，默认 50" },
+      },
+      required: ["compartmentId"],
+      additionalProperties: false,
+    }),
+    execute: async (input) => {
+      try {
+        const result = await conversation.expandCompartment(input.compartmentId, { offset: input.offset, limit: input.limit });
+        return { ok: true as const, ...result };
+      } catch (cause) {
+        return {
+          ok: false as const,
+          error: { name: "CompartmentExpansionError", message: cause instanceof Error ? cause.message : String(cause) },
+        };
+      }
+    },
+  };
 }
 
 export function createDescribeImageTool(model: LanguageModel, resources: ChannelResources): AgentTool<DescribeImageInput, DescribeImageOutput> {

@@ -699,6 +699,7 @@ describe("ChannelRuntime scheduling", () => {
       const tools = vi.mocked(createAgent).mock.calls.at(-1)?.[0].tools ?? [];
       const send = tools.find((tool) => tool.name === "send_message");
       const finish = tools.find((tool) => tool.name === "finish");
+      expect(tools.map((tool) => tool.name)).toContain("ctx_expand");
       expect(typeof send?.terminal).toBe("function");
       expect(finish?.terminal).toBe(true);
     } finally {

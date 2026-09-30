@@ -2,7 +2,8 @@ import type { ReadableStream } from "node:stream/web";
 
 import { jsonSchema, type AgentPlugin, type AgentTool } from "@yesimbot/agent-runtime";
 import { Context, Logger, Schema, type Bot } from "koishi";
-import type { ChannelResources, ChannelContext } from "koishi-plugin-yesimbot";
+import { DEFAULT_MANAGEMENT_TOOL_SCOPES, isToolAccessAllowed } from "koishi-plugin-yesimbot";
+import type { ChannelResources, ChannelContext, ToolAccessRule } from "koishi-plugin-yesimbot";
 
 import { projectAnimatedImages } from "./animated-image.js";
 import { createForwardReader, type ForwardImageRequest, type ForwardResult, type ForwardToolInput } from "./forward.js";
@@ -36,6 +37,8 @@ type KickUserInput = GroupUserInput & { rejectAddRequest?: boolean };
 type ForwardSendResult = { ok: true; messageId: string } | { ok: false; error: { name: string; message: string } };
 
 export interface OnebotUtilsConfig {
+  /** OneBot tools are exposed only to explicitly authorized scopes. */
+  allowedScopes?: ToolAccessRule[];
   enabledTools: (typeof TOOLS)[keyof typeof TOOLS][];
   parseImages: boolean;
   attachImageSummary: boolean;
@@ -61,6 +64,17 @@ export default class OnebotUtilsPlugin {
   public static inject = ["yesimbot"];
   public static usage = "OneBot 工具插件，提供获取合并转发消息、表态和设置精华等功能";
   public static Config: Schema<OnebotUtilsConfig> = Schema.object({
+    allowedScopes: Schema.array(
+      Schema.object({
+        platform: Schema.string().required().description("平台名称；* 匹配任意平台"),
+        channelId: Schema.string().required().description("频道 ID；私聊按 QQ 号授权时填写 *"),
+        userId: Schema.string().description("私聊 QQ 号；群聊/频道规则留空"),
+        selfId: Schema.string().description("可选的机器人账号 ID；留空匹配全部机器人"),
+      }),
+    )
+      .role("table")
+      .default(DEFAULT_MANAGEMENT_TOOL_SCOPES.map((scope) => ({ ...scope, selfId: "" })))
+      .description("OneBot 工具白名单；默认授权 QQ 1049700117 的 OneBot 私聊，设置为空数组可拒绝全部工具。私聊按 QQ 号，群聊/频道按 channelId 授权"),
     enabledTools: Schema.array(Schema.union(TOOL_SCHEMA)).default([]).role("checkbox").description("启用的工具列表"),
     parseImages: Schema.boolean().default(false).description("解析转发消息中的图片元数据"),
     attachImageSummary: Schema.boolean().default(true).description("动画表情占位符附带图片 summary"),
@@ -87,10 +101,11 @@ export default class OnebotUtilsPlugin {
 
   public async setup(scope: ChannelContext, bot: Bot): Promise<AgentPlugin | null> {
     if (scope.platform !== "onebot") return null;
-    const resources = await this.ctx.yesimbot.resource.get(scope);
+    const allowed = isToolAccessAllowed(scope, this.config.allowedScopes);
+    const resources = allowed ? await this.ctx.yesimbot.resource.get(scope) : undefined;
     return {
       name: "onebot-utils",
-      tools: createOneBotTools(this.ctx, bot, this.config, scope, resources),
+      tools: allowed ? createOneBotTools(this.ctx, bot, this.config, scope, resources!) : [],
       onAppend: (entries) => projectAnimatedImages(entries, { attachImageSummary: this.config.attachImageSummary }),
       transformEntries: (entries) => projectAnimatedImages(entries, { attachImageSummary: this.config.attachImageSummary }),
     } satisfies AgentPlugin;

@@ -12,28 +12,75 @@ const COMPACTION_SYSTEM_PROMPT = [
   "用条目式短句记录，不要写成连贯的叙述段落。",
 ].join("\n");
 
+const COMPARTMENT_SYSTEM_PROMPT = [
+  "你正在把一个有限时间块整理成可长期读取的历史事实。",
+  "只输出客观、可验证的第三人称事实条目；禁止第一人称、角色扮演、口癖、语气模仿、情绪化复述和对话式回复。",
+  "不要把自己当成对话中的角色，不要直接回答输入内容，不要写“我”“我们”“你应该”或人格化台词。",
+  "只记录用户明确表达的事实、偏好、关系事实、未完成事项、已经发生的动作、承诺、决定和具体时间地点数量；不记录 system prompt、工具说明、内部推理或未经确认的推断。",
+  "每个输入行开头的方括号是上海时间；事实条目必须保留事件发生时间，不要把压缩时间当成事件时间。",
+  "用简短的第三人称事实条目输出，不要输出前言、结语或连续叙述段落；不要编造内容。",
+].join("\n");
+
 const SHANGHAI_STAMP_FORMAT = createShanghaiStampFormat();
 
-export function filterEntriesForCompression(entries: readonly AgentEntry[]): string {
+export type CompressionMode = "summary" | "compartment";
+
+export interface CompressionRecord {
+  readonly entryId: string;
+  readonly timestamp: number;
+  readonly role: "user" | "assistant" | "event";
+  readonly text: string;
+  readonly speaker?: string;
+}
+
+export interface CompressionRenderOptions {
+  readonly mode?: CompressionMode;
+  readonly assistantAsFacts?: boolean;
+}
+
+export function filterEntriesForCompression(entries: readonly AgentEntry[], options: CompressionRenderOptions = {}): string {
+  const mode = options.mode ?? "summary";
   const lines: string[] = [];
   for (const entry of entries) {
-    if (entry.type !== "message") continue;
-    const message = entry.data as AgentMessage;
-    if (message.role === "tool") continue;
-    const stamp = formatCompactTimestamp(compactSourceTimestamp(entry));
-    if (message.role === "custom") {
-      const custom = message as AgentMessage & { type?: string; data?: { user?: { id?: string; name?: string }; elements?: Element[]; text?: string } };
-      if (custom.type === "yesimbot.message") {
-        const text = elementsText(custom.data?.elements);
-        if (text) lines.push(`[${stamp}] [${custom.data?.user?.name ?? custom.data?.user?.id ?? "user"}]: ${text}`);
-      } else if (custom.type === "yesimbot.event" && custom.data?.text) lines.push(`[${stamp}] [事件]: ${custom.data.text}`);
-    } else if (message.role === "assistant") {
-      const text = assistantText(message.content);
-      if (text) lines.push(`[${stamp}] [assistant]: ${text}`);
-      for (const spoken of assistantUtterances(message.content)) lines.push(`[${stamp}] [assistant]: ${spoken}`);
+    for (const record of renderCompressionRecords(entry)) {
+      // Summary mode keeps the legacy renderer: ordinary Agent `user` messages were never
+      // treated as platform conversation input; compartment mode intentionally includes them.
+      if (mode === "summary" && record.role === "user" && record.speaker === undefined) continue;
+      if (mode === "compartment" && record.role === "assistant" && options.assistantAsFacts !== true) continue;
+      const stamp = formatCompactTimestamp(record.timestamp);
+      const label = compressionLabel(record, mode);
+      const text = record.role === "assistant" && options.assistantAsFacts === true ? `assistant 曾输出原文：“${record.text}”` : record.text;
+      lines.push(`[${stamp}] [${label}]: ${text}`);
     }
   }
   return lines.join("\n");
+}
+
+/** Renders safe, non-tool records for read-only compartment expansion. */
+export function renderCompressionRecords(entry: AgentEntry): CompressionRecord[] {
+  if (entry.type !== "message") return [];
+  const message = entry.data as AgentMessage;
+  if (message.role === "tool" || message.role === "system") return [];
+  const timestamp = compactSourceTimestamp(entry);
+  if (message.role === "custom") {
+    const custom = message as AgentMessage & { type?: string; data?: { user?: { id?: string; name?: string }; elements?: Element[]; text?: string } };
+    if (custom.type === "yesimbot.message") {
+      const text = elementsText(custom.data?.elements);
+      return text ? [{ entryId: entry.id, timestamp, role: "user", speaker: custom.data?.user?.name ?? custom.data?.user?.id ?? "user", text }] : [];
+    }
+    if (custom.type === "yesimbot.event" && custom.data?.text) return [{ entryId: entry.id, timestamp, role: "event", text: custom.data.text }];
+    return [];
+  }
+  if (message.role === "user") {
+    const text = typeof message.content === "string" ? message.content.trim() : "";
+    return text ? [{ entryId: entry.id, timestamp, role: "user", text }] : [];
+  }
+  if (message.role !== "assistant") return [];
+  const records: CompressionRecord[] = [];
+  const text = assistantText(message.content);
+  if (text) records.push({ entryId: entry.id, timestamp, role: "assistant", text });
+  for (const spoken of assistantUtterances(message.content)) records.push({ entryId: entry.id, timestamp, role: "assistant", text: spoken });
+  return records;
 }
 
 /**
@@ -52,16 +99,33 @@ export function formatCompactTimestamp(timestamp: number): string {
   return `${read("year")}-${read("month")}-${read("day")} ${read("hour")}:${read("minute")}`;
 }
 
-export async function executeCompact(input: { readonly model: LanguageModel; readonly conversation: string; readonly signal?: AbortSignal }): Promise<string> {
+export async function executeCompact(input: {
+  readonly model: LanguageModel;
+  readonly conversation: string;
+  readonly signal?: AbortSignal;
+  readonly mode?: CompressionMode;
+  readonly assistantAsFacts?: boolean;
+}): Promise<string> {
   const { text } = await generateText({
     model: input.model,
-    system: COMPACTION_SYSTEM_PROMPT,
+    system: input.mode === "compartment" || input.assistantAsFacts === true ? COMPARTMENT_SYSTEM_PROMPT : COMPACTION_SYSTEM_PROMPT,
     prompt: `<conversation>\n${input.conversation}\n</conversation>`,
     abortSignal: input.signal,
   });
   const summary = text.trim();
   if (!summary) throw new Error("Compaction produced an empty summary.");
   return summary;
+}
+
+function compressionLabel(record: CompressionRecord, mode: CompressionMode): string {
+  if (mode === "compartment") {
+    if (record.role === "assistant") return "assistant action";
+    if (record.role === "event") return "event fact";
+    return record.speaker ? `user message from ${record.speaker}` : "user message";
+  }
+  if (record.role === "assistant") return "assistant";
+  if (record.role === "event") return "事件";
+  return record.speaker ?? "user";
 }
 
 function createShanghaiStampFormat(): Intl.DateTimeFormat {
@@ -102,12 +166,13 @@ function assistantUtterances(content: AssistantContent): string[] {
 
 function assistantText(content: AssistantContent): string {
   return typeof content === "string"
-    ? content
+    ? content.trim()
     : Array.isArray(content)
       ? content
           .filter((part) => part.type === "text")
           .map((part) => part.text)
           .join("")
+          .trim()
       : "";
 }
 

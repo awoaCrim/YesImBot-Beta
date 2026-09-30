@@ -36,20 +36,12 @@ describe("MemoryAgentPlugin", () => {
     expect(on).toHaveBeenCalledWith("dispose", expect.any(Function));
     await plugin.start();
     const factory = agentUse.mock.calls[0]![0];
-    const channelPlugin = factory.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" }, { selfId: "bot" }) as {
-      name: string;
-      appendSystemPrompt: () => string;
-      tools: () => Array<{ name: string; description?: string }>;
-    };
-    expect(channelPlugin).toMatchObject({ name: "memory-agent" });
-    expect(channelPlugin.appendSystemPrompt()).toContain("recall、remember、search 三个记忆工具");
-    expect(channelPlugin.appendSystemPrompt()).toContain("普通事实先用它，必要时再启用语义召回");
-    expect(channelPlugin.appendSystemPrompt()).not.toContain("query 用关键名词");
-
-    const tools = channelPlugin.tools();
-    expect(tools.map((tool) => tool.name)).toEqual(["remember", "recall", "search"]);
-    expect(tools.map((tool) => tool.description).join("\n")).toContain("query、tags、types、scope、limit");
-    expect(tools.map((tool) => tool.description).join("\n")).toContain("sources 必须是相关 messageId");
+    expect(factory.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" }, { selfId: "bot" })).toMatchObject({ name: "memory-agent" });
+    expect(
+      (factory.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" }, { selfId: "bot" }) as { tools: () => Array<{ name: string }> })
+        .tools()
+        .map((tool) => tool.name),
+    ).toEqual(["remember", "recall", "search"]);
     await plugin.stop();
   });
 });

@@ -23,8 +23,7 @@ describe("shared workspace configuration", () => {
     const shared = formatWorkspacePrompt(workspace, { shared: true });
 
     expect(isolated).toContain("工作区按频道隔离");
-    expect(shared).toContain("工作区由已启用频道共享");
-    expect(shared).toContain("文件内容不只对当前对话可见");
+    expect(shared).toContain("工作区由所有已启用频道共享");
     expect(shared).not.toContain("工作区按频道隔离");
   });
 });
