@@ -6,6 +6,7 @@ import { z } from "zod";
 import { createAgent } from "../src/agent.js";
 import { ToolConflictError } from "../src/errors.js";
 import type { AgentInternalEvent } from "../src/event.js";
+import type { AgentMessage } from "../src/message.js";
 import { createUserMessage } from "../src/message.js";
 import { mergeTools, runAfterToolHooks, runBeforeToolHooks } from "../src/tools.js";
 
@@ -103,6 +104,104 @@ function createSingleToolCallModel() {
   } as unknown as LanguageModelV3 & { observedPrompts: LanguageModelV3CallOptions["prompt"][]; observedToolNames: string[][] };
 }
 
+function createFinalizeToolLoopModel(input = "{}") {
+  const stopReason = "stop" as unknown as LanguageModelV3FinishReason;
+  const toolCallsReason = "tool-calls" as unknown as LanguageModelV3FinishReason;
+  let callCount = 0;
+  const observedPrompts: LanguageModelV3CallOptions["prompt"][] = [];
+
+  return {
+    specificationVersion: "v3",
+    provider: "mock-provider",
+    modelId: "mock-model",
+    supportedUrls: {},
+    async doGenerate() {
+      throw new Error("not implemented");
+    },
+    async doStream(options: LanguageModelV3CallOptions) {
+      observedPrompts.push(structuredClone(options.prompt));
+      callCount += 1;
+      if (callCount > 1) {
+        return {
+          stream: new ReadableStream<LanguageModelV3StreamPart>({
+            start(controller) {
+              controller.enqueue({ type: "stream-start", warnings: [] });
+              controller.enqueue({ type: "text-start", id: "unexpected" });
+              controller.enqueue({ type: "text-delta", id: "unexpected", delta: "unexpected" });
+              controller.enqueue({ type: "text-end", id: "unexpected" });
+              controller.enqueue({
+                type: "finish",
+                finishReason: stopReason,
+                usage: { inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 1, text: 1, reasoning: 0 } },
+              });
+              controller.close();
+            },
+          }),
+        };
+      }
+
+      return {
+        stream: new ReadableStream<LanguageModelV3StreamPart>({
+          start(controller) {
+            controller.enqueue({ type: "stream-start", warnings: [] });
+            controller.enqueue({ type: "tool-input-start", id: "call_finalize", toolName: "finalize" });
+            controller.enqueue({ type: "tool-input-delta", id: "call_finalize", delta: input });
+            controller.enqueue({ type: "tool-input-end", id: "call_finalize" });
+            controller.enqueue({ type: "tool-call", toolCallId: "call_finalize", toolName: "finalize", input });
+            controller.enqueue({
+              type: "finish",
+              finishReason: toolCallsReason,
+              usage: { inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 1, text: 0, reasoning: 0 } },
+            });
+            controller.close();
+          },
+        }),
+      };
+    },
+    observedPrompts,
+  } as unknown as LanguageModelV3 & { observedPrompts: LanguageModelV3CallOptions["prompt"][] };
+}
+
+function createInfiniteToolLoopModel() {
+  const toolCallsReason = "tool-calls" as unknown as LanguageModelV3FinishReason;
+  let callCount = 0;
+  const observedPrompts: LanguageModelV3CallOptions["prompt"][] = [];
+
+  return {
+    specificationVersion: "v3",
+    provider: "mock-provider",
+    modelId: "mock-model",
+    supportedUrls: {},
+    async doGenerate() {
+      throw new Error("not implemented");
+    },
+    async doStream(options: LanguageModelV3CallOptions) {
+      observedPrompts.push(structuredClone(options.prompt));
+      callCount += 1;
+      const toolCallId = `call_${callCount}`;
+
+      return {
+        stream: new ReadableStream<LanguageModelV3StreamPart>({
+          start(controller) {
+            controller.enqueue({ type: "stream-start", warnings: [] });
+            controller.enqueue({ type: "tool-input-start", id: toolCallId, toolName: "inspect" });
+            controller.enqueue({ type: "tool-input-delta", id: toolCallId, delta: "{}" });
+            controller.enqueue({ type: "tool-input-end", id: toolCallId });
+            controller.enqueue({ type: "tool-call", toolCallId, toolName: "inspect", input: "{}" });
+            controller.enqueue({
+              type: "finish",
+              finishReason: toolCallsReason,
+              usage: { inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 1, text: 0, reasoning: 0 } },
+            });
+            controller.close();
+          },
+        }),
+      };
+    },
+    observedPrompts,
+  } as unknown as LanguageModelV3 & { observedPrompts: LanguageModelV3CallOptions["prompt"][] };
+}
+
 describe("tools", () => {
   it("throws on duplicate tool names", () => {
     expect(() =>
@@ -113,14 +212,89 @@ describe("tools", () => {
     ).toThrow(ToolConflictError);
   });
 
-  it("registers an optional terminal tool with the model", async () => {
+  it("registers a terminal tool with the model", async () => {
     const model = createToolModel();
-    const agent = createAgent({ model, terminalTool: { name: "finalize", description: "结束本轮回复" } });
+    const agent = createAgent({ model, tools: [{ name: "finalize", terminal: true, inputSchema: z.object({}), execute: async () => ({ ok: true }) }] });
 
     agent.send(createUserMessage("hello"));
     await agent.wait();
 
     expect(model.observedToolNames[0]).toContain("finalize");
+  });
+
+  it("stops the turn when all tool calls in a step are terminal", async () => {
+    const model = createFinalizeToolLoopModel();
+    const onTurnFinish = vi.fn();
+    const agent = createAgent({
+      model,
+      tools: [{ name: "finalize", terminal: true, inputSchema: z.object({}), execute: async () => ({ ok: true }) }],
+      plugins: [{ name: "result-observer", onTurnFinish }],
+    });
+
+    agent.send(createUserMessage("hello"));
+    await agent.wait();
+
+    expect(model.observedPrompts).toHaveLength(1);
+    expect(agent.isIdle()).toBe(true);
+    expect(onTurnFinish).toHaveBeenCalledWith(expect.objectContaining({ status: "done" }), expect.any(Object));
+  });
+
+  it("stops the turn when a predicate terminal tool decides from its input", async () => {
+    const model = createFinalizeToolLoopModel('{"continue":false}');
+    const agent = createAgent({
+      model,
+      tools: [
+        {
+          name: "finalize",
+          terminal: (input: { continue?: boolean }) => !input.continue,
+          inputSchema: z.object({ continue: z.boolean().optional() }),
+          execute: async () => ({ ok: true }),
+        },
+      ],
+    });
+
+    agent.send(createUserMessage("hello"));
+    await agent.wait();
+
+    expect(model.observedPrompts).toHaveLength(1);
+  });
+
+  it("continues the turn when a predicate terminal tool opts into another step", async () => {
+    const model = createFinalizeToolLoopModel('{"continue":true}');
+    const agent = createAgent({
+      model,
+      tools: [
+        {
+          name: "finalize",
+          terminal: (input: { continue?: boolean }) => !input.continue,
+          inputSchema: z.object({ continue: z.boolean().optional() }),
+          execute: async () => ({ ok: true }),
+        },
+      ],
+    });
+
+    agent.send(createUserMessage("hello"));
+    await agent.wait();
+
+    expect(model.observedPrompts).toHaveLength(2);
+  });
+
+  it("caps the tool loop at the configured maxSteps", async () => {
+    const model = createInfiniteToolLoopModel();
+    const onTurnFinish = vi.fn();
+    const agent = createAgent({
+      model,
+      maxSteps: 2,
+      tools: [{ name: "inspect", inputSchema: z.object({}), execute: async () => "ok" }],
+      plugins: [{ name: "result-observer", onTurnFinish }],
+    });
+
+    agent.send(createUserMessage("hello"));
+    await agent.wait();
+
+    expect(model.observedPrompts).toHaveLength(2);
+    expect(agent.isIdle()).toBe(true);
+    expect(onTurnFinish).toHaveBeenCalledWith(expect.objectContaining({ status: "done" }), expect.any(Object));
   });
 
   it("copies descriptors from every stable tool source", () => {
@@ -250,7 +424,7 @@ describe("tools", () => {
   });
 
   it("injects turn execution context into stable tool calls", async () => {
-    const seen: Array<{ runtimeId: string; toolCallId: string; turnId: string; hasSignal: boolean }> = [];
+    const seen: Array<{ runtimeId: string; toolCallId: string; turnId: string; hasSignal: boolean; messages: readonly string[] }> = [];
     const agent = createAgent({
       id: "runtime_tools",
       model: createSingleToolCallModel(),
@@ -267,8 +441,10 @@ describe("tools", () => {
                   toolCallId: context.toolCallId,
                   turnId: context.turnId,
                   hasSignal: context.abortSignal instanceof AbortSignal,
+                  messages: context.messages.map((message) => (message.role === "user" && typeof message.content === "string" ? message.content : "other")),
                 });
-                return "ok";
+                const mutableSnapshot = context.messages as AgentMessage[];
+                expect(() => mutableSnapshot.push(createUserMessage("mutated"))).not.toThrow();
               },
             },
           ],
@@ -280,10 +456,13 @@ describe("tools", () => {
     await agent.wait();
     expect(agent.isIdle()).toBe(true);
 
-    expect(seen).toEqual([{ runtimeId: "runtime_tools", toolCallId: "call_1", turnId, hasSignal: true }]);
+    expect(seen).toEqual([{ runtimeId: "runtime_tools", toolCallId: "call_1", turnId, hasSignal: true, messages: ["hello"] }]);
+    expect((await agent.storage.read()).filter((entry) => entry.type === "message").map((entry) => entry.data)).not.toContainEqual(
+      expect.objectContaining({ role: "user", content: "mutated" }),
+    );
   });
 
-  it("reports cumulative usage for a multi-step tool turn", async () => {
+  it("reports cumulative usage and the latest provider-step usage separately", async () => {
     const onTurnFinish = vi.fn();
     const agent = createAgent({
       model: createSingleToolCallModel(),
@@ -294,7 +473,10 @@ describe("tools", () => {
     await agent.wait();
 
     expect(onTurnFinish).toHaveBeenCalledWith(
-      expect.objectContaining({ usage: expect.objectContaining({ inputTokens: 2, outputTokens: 2, totalTokens: 4 }) }),
+      expect.objectContaining({
+        usage: expect.objectContaining({ inputTokens: 2, outputTokens: 2, totalTokens: 4 }),
+        latestStepUsage: expect.objectContaining({ inputTokens: 1, outputTokens: 1, totalTokens: 2 }),
+      }),
       expect.any(Object),
     );
   });

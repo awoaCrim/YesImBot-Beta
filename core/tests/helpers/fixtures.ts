@@ -23,8 +23,19 @@ export function defaultConfig(overrides: Partial<Config> = {}): Config {
     resourceReadTimeout: 30,
     will: { engine: "routing", direct: "trigger", mention: "trigger", group: "wait" },
     pacing: { charactersPerSecond: 8, maxTotalDelayMs: 60_000 },
-    customInnerThought: false,
-    session: { compact: { responseIdleMinutes: 120, minMessages: 20, maxFailures: 3, model: undefined }, archive: { maxKB: 5 * 1024 } },
+    customInnerThought: true,
+    session: {
+      compact: {
+        responseIdleMinutes: 0,
+        checkIntervalMinutes: 30,
+        turnThreshold: 50,
+        minMessages: 15,
+        maxFailures: 3,
+        inlineFragments: 3,
+        model: undefined,
+      },
+      archive: { maxKB: 5 * 1024 },
+    },
     ...overrides,
   };
 }

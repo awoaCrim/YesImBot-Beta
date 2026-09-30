@@ -2,7 +2,7 @@ import { readFile, stat } from "node:fs/promises";
 import type { ReadableStream } from "node:stream/web";
 import { fileURLToPath } from "node:url";
 
-import { h, type Context, type Element, type Logger } from "koishi";
+import { h, type Context, type Element } from "koishi";
 
 import type { AssetStore } from "./asset.js";
 import type { ChannelResources } from "./index.js";
@@ -43,10 +43,10 @@ interface ResourceProbe {
 export async function persistElements(ctx: Context, elements: readonly Element[], resources: ChannelResources): Promise<Element[]> {
   const budget: ResourceBudget = { images: 0, files: 0, bytes: 0 };
   const prepared = await Promise.all(elements.map((element) => persistElement(ctx, element, resources.assets, budget)));
-  const logger = resourceLogger(ctx);
+  const logger = ctx.logger("yesimbot.resources");
   const imageCount = countElements(prepared, "img");
   const fileCount = countElements(prepared, "file");
-  if ((imageCount || fileCount) && logger) {
+  if (imageCount || fileCount) {
     logger.debug("resources.input.persisted", { imageCount, fileCount });
   }
   return prepared;
@@ -93,7 +93,7 @@ async function storeTextFile(ctx: Context, element: Element, store: AssetStore, 
 }
 
 function fileName(element: Element): string | undefined {
-  for (const key of ["title", "file"] as const) {
+  for (const key of ["title", "name", "file"] as const) {
     const value = element.attrs[key];
     if (typeof value === "string" && value.length > 0) return value;
   }
@@ -224,14 +224,6 @@ function decodeBase64Url(src: string, maxBytes: number): Uint8Array | null {
   const decoded = new Uint8Array(Buffer.from(payload, "base64"));
   if (decoded.byteLength > maxBytes) throw new Error("Resource exceeds byte limit");
   return decoded;
-}
-
-function resourceLogger(ctx: Context): Pick<Logger, "debug"> | undefined {
-  try {
-    return ctx.logger("yesimbot.resources");
-  } catch {
-    return undefined;
-  }
 }
 
 function countElements(elements: readonly Element[], type: string): number {

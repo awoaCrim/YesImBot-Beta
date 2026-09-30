@@ -9,6 +9,7 @@ import {
   assembleEvent,
   createEvent,
   createMessage,
+  formatCurrentInput,
   formatInput,
   isEvent,
   isMessage,
@@ -42,7 +43,7 @@ declare module "koishi-plugin-yesimbot" {
 // Event
 // ---------------------------------------------------------------------------
 
-function messageRecord(overrides: { timestamp?: number } = {}): MessageRecord {
+function messageRecord(overrides: { timestamp?: number; quote?: MessageRecord["quote"] } = {}): MessageRecord {
   return {
     platform: "test",
     selfId: "bot-1",
@@ -51,6 +52,7 @@ function messageRecord(overrides: { timestamp?: number } = {}): MessageRecord {
     messageId: "m1",
     elements: [h.text("hello")],
     timestamp: overrides.timestamp ?? 1234,
+    ...(overrides.quote ? { quote: overrides.quote } : {}),
   };
 }
 
@@ -122,9 +124,11 @@ describe("Event", () => {
     expect(isEvent(badEvent)).toBe(true);
   });
 
-  it("Message type exposes elements and messageId", () => {
+  it("Message type exposes elements, messageId, and an optional normalized quote", () => {
     expectTypeOf<Message["data"]["elements"]>().toBeArray();
     expectTypeOf<Message["data"]["messageId"]>().toBeString();
+    expectTypeOf<Message["data"]["quote"]>().toEqualTypeOf<MessageRecord["quote"]>();
+    expectTypeOf<NonNullable<MessageRecord["quote"]>["author"]>().toEqualTypeOf<{ readonly id: string; readonly isBot?: boolean } | undefined>();
   });
 
   it("Event type exposes eventType and text", () => {
@@ -246,15 +250,16 @@ describe("Event", () => {
 
 const ASSET_ID = "00000000000000000000000000000000";
 
-function miMessageRecord(overrides: { timestamp?: number } = {}): MessageRecord {
+function miMessageRecord(overrides: { timestamp?: number; quote?: MessageRecord["quote"]; elements?: readonly Element[] } = {}): MessageRecord {
   return {
     platform: scope.platform,
     selfId: scope.selfId,
     channel: { id: scope.channelId },
     user: { id: "10001", name: "Alice" },
     messageId: "m-1",
-    elements: [h.text("hello")],
+    elements: overrides.elements ?? [h.text("hello")],
     timestamp: overrides.timestamp ?? Date.parse("2026-07-18T12:34:00.000Z"),
+    ...(overrides.quote ? { quote: overrides.quote } : {}),
   };
 }
 
@@ -297,6 +302,23 @@ describe("formatInput", () => {
     expect(project(input)).toEqual({ role: "user", content: '[time="2026/7/25 20:34" sender="Alice (10001)" id="m-1"]\nhello' });
   });
 
+  it("marks the current message body without hiding its observation header", () => {
+    const input = createMessage(
+      miMessageRecord({
+        elements: [h("at", { id: "bot-1" }), h.text(" ?")],
+      }),
+    );
+    const content = String(formatCurrentInput(input).content);
+    const markerStart = content.indexOf("[CURRENT_MESSAGE]");
+    const markerEnd = content.indexOf("[/CURRENT_MESSAGE]");
+
+    expect(markerStart).toBeGreaterThan(0);
+    expect(markerEnd).toBeGreaterThan(markerStart);
+    expect(content.slice(0, markerStart)).toContain('sender="Alice (10001)"');
+    expect(content.slice(0, markerStart)).toContain('id="m-1"');
+    expect(content.slice(markerStart, markerEnd)).toContain('<at id="bot-1"/> ?');
+  });
+
   it("hydrates JSONL-replayed Elements before rendering", async () => {
     const replayed = JSON.parse(JSON.stringify(createMessage(miMessageRecord()))) as Input;
 
@@ -308,6 +330,166 @@ describe("formatInput", () => {
     expect(first.content).toContain("\nhello");
   });
 
+  it("renders a normalized quote before the current message", async () => {
+    const quotedAsset = "11111111111111111111111111111111";
+    const currentAsset = "22222222222222222222222222222222";
+    const input = createMessage(
+      miMessageRecord({
+        quote: { messageId: "quoted-1", elements: [h("img", { id: quotedAsset })] },
+        elements: [h("img", { id: currentAsset }), h.text("如何评价")],
+      }),
+    );
+
+    const result = await project(input);
+    const content = String(result.content);
+    const quoteStart = content.indexOf('[QUOTED_MESSAGE id="quoted-1"]');
+    const quoteEnd = content.indexOf("[/QUOTED_MESSAGE]", quoteStart);
+
+    expect(quoteStart).toBeGreaterThanOrEqual(0);
+    expect(quoteEnd).toBeGreaterThan(quoteStart);
+    expect(content.slice(quoteStart, quoteEnd)).toContain(`[图片：asset://${quotedAsset}]`);
+    expect(content.slice(quoteStart, quoteEnd)).not.toContain(currentAsset);
+    expect(content.indexOf("如何评价")).toBeGreaterThan(quoteEnd);
+  });
+
+  it("does not duplicate quote content when current elements already contain a quote element", async () => {
+    const input = createMessage(
+      miMessageRecord({
+        quote: { messageId: "quoted-1", elements: [h.text("quoted content")] },
+        elements: [h("quote", { id: "quoted-1" }, [h.text("quoted content")]), h.text("继续")],
+      }),
+    );
+
+    const result = await project(input);
+
+    expect(String(result.content)).toContain('[QUOTED_MESSAGE id="quoted-1"]');
+    expect(String(result.content).match(/quoted content/g)).toHaveLength(1);
+    expect(String(result.content)).toContain("quoted content");
+    expect(String(result.content)).toContain("继续");
+  });
+
+  it.each(["10002", "bot-1"])("separates the quoted sender %s from the current sender", (sender) => {
+    const record = miMessageRecord({ quote: { messageId: "quoted-1", author: { id: sender }, elements: [h.text("their words")] } });
+    const result = String(project(createMessage(record)).content);
+    expect(result).toContain('sender="Alice (10001)"');
+    expect(result).toContain(`[QUOTED_MESSAGE id="quoted-1" sender="${sender}"]\ntheir words\n[/QUOTED_MESSAGE]\nhello`);
+    expect(record.quote?.author?.id).toBe(sender);
+  });
+
+  it("does not invent a quoted sender when author metadata is absent or empty", () => {
+    for (const author of [undefined, { id: "" }]) {
+      const input = createMessage(miMessageRecord({ quote: { messageId: "quoted-1", author, elements: [h.text("their words")] } }));
+      expect(String(project(input).content)).toContain('[QUOTED_MESSAGE id="quoted-1"]\ntheir words');
+    }
+  });
+
+  it("JSON-escapes quote IDs and authors without adding observation lines", () => {
+    const input = createMessage(miMessageRecord({ quote: { messageId: 'q"\n1', author: { id: 'u"\n2' }, elements: [h.text("words")] } }));
+    expect(String(project(input).content).split("\n")[1]).toBe(String.raw`[QUOTED_MESSAGE id="q\"\n1" sender="u\"\n2"]`);
+  });
+
+  it.each(["quote", "reply"])("preserves normalized content and author with an inline %s placeholder", (type) => {
+    const input = createMessage(
+      miMessageRecord({
+        quote: { messageId: "quoted-1", author: { id: "10002" }, elements: [h.text("their words")] },
+        elements: [h(type, { id: "quoted-1" }), h("at", { id: "bot-1" }), h.text("what do you think?")],
+      }),
+    );
+    const result = String(project(input).content);
+    expect(result).toContain('[QUOTED_MESSAGE id="quoted-1" sender="10002"]\ntheir words');
+    expect(result.match(/their words/g)).toHaveLength(1);
+    expect(result).not.toContain(`<${type}`);
+    expect(result).toContain('<at id="bot-1"/>what do you think?');
+  });
+
+  it("deduplicates nested matching quotes without mutating replayed elements", () => {
+    const input = JSON.parse(
+      JSON.stringify(
+        createMessage(
+          miMessageRecord({
+            quote: { messageId: "quoted-1", author: { id: "10002" }, elements: [h.text("their words")] },
+            elements: [h("message", {}, [h("reply", { id: "quoted-1" }, [h.text("their words")]), h.text("current words")])],
+          }),
+        ),
+      ),
+    ) as Message;
+    const before = JSON.stringify(input);
+    const result = String(project(input).content);
+    expect(result).toContain('[QUOTED_MESSAGE id="quoted-1" sender="10002"]');
+    expect(result.match(/their words/g)).toHaveLength(1);
+    expect(result).toContain("current words");
+    expect(JSON.stringify(input)).toBe(before);
+    expect(String(project(input).content)).toBe(result);
+  });
+
+  it.each(["other-quote", undefined])("does not drop or reattribute an inline quote with ID %s", (id) => {
+    const input = createMessage(
+      miMessageRecord({
+        quote: { messageId: "quoted-1", author: { id: "10002" }, elements: [h.text("normalized words")] },
+        elements: [h("quote", id ? { id } : {}, [h.text("other words")]), h.text("current words")],
+      }),
+    );
+    const result = String(project(input).content);
+    expect(result).toContain('[QUOTED_MESSAGE id="quoted-1" sender="10002"]\nnormalized words\n[/QUOTED_MESSAGE]');
+    expect(result).toContain("other words");
+    expect(result).toContain("current words");
+  });
+
+  it("keeps inline content if the normalized quote has no elements", () => {
+    const input = createMessage(
+      miMessageRecord({
+        quote: { messageId: "quoted-1", author: { id: "10002" }, elements: [] },
+        elements: [h("quote", { id: "quoted-1" }, [h.text("only inline words")]), h.text("current words")],
+      }),
+    );
+    const result = String(project(input).content);
+    expect(result).toContain('[QUOTED_MESSAGE id="quoted-1" sender="10002"]');
+    expect(result).toContain("only inline words");
+  });
+
+  it("preserves legacy inline-only quotes without inventing normalized metadata", () => {
+    const input = createMessage(miMessageRecord({ elements: [h("quote", { id: "legacy" }, [h.text("legacy words")]), h.text("current words")] }));
+    const result = String(project(input).content);
+    expect(result).not.toContain("[QUOTED_MESSAGE");
+    expect(result).toContain('<quote id="legacy">legacy words</quote>current words');
+  });
+
+  it("keeps normalized quote assets after JSONL replay", async () => {
+    const quotedAsset = "33333333333333333333333333333333";
+    const replayed = JSON.parse(
+      JSON.stringify(
+        createMessage(
+          miMessageRecord({
+            quote: { messageId: "quoted-3", elements: [h("img", { id: quotedAsset })] },
+            elements: [h.text("评价一下")],
+          }),
+        ),
+      ),
+    ) as Input;
+
+    const result = await project(replayed);
+
+    expect(result.content).toContain('[QUOTED_MESSAGE id="quoted-3"]');
+    expect(result.content).toContain(`[图片：asset://${quotedAsset}]`);
+    expect(result.content).toContain("评价一下");
+  });
+
+  it("does not duplicate quote content when current elements contain a reply element", async () => {
+    const input = createMessage(
+      miMessageRecord({
+        quote: { messageId: "quoted-2", elements: [h.text("quoted content")] },
+        elements: [h("reply", { id: "quoted-2" }, [h.text("quoted content")]), h.text("继续")],
+      }),
+    );
+
+    const result = await project(input);
+
+    expect(String(result.content)).toContain('[QUOTED_MESSAGE id="quoted-2"]');
+    expect(String(result.content).match(/quoted content/g)).toHaveLength(1);
+    expect(String(result.content)).toContain("quoted content");
+    expect(String(result.content)).toContain("继续");
+  });
+
   it("formats events from only eventType and text", async () => {
     const event: Event = createEvent(miFormatterVariantRecord());
     const result = await project(event);
@@ -315,6 +497,19 @@ describe("formatInput", () => {
     expect(result.content).toContain('"eventType":"formatter.variant"');
     expect(result.content).toContain('"text":"variant"');
     expect(result.content).not.toContain("extra");
+  });
+
+  it("marks a runtime event as the current turn instead of a continuation request", async () => {
+    const event: Event = createEvent(miFormatterVariantRecord());
+    const result = await project(event);
+    const content = String(result.content);
+
+    const boundary = content.indexOf("[SYSTEM_NOTIFICATION]");
+    expect(content).toContain("current runtime event for this turn");
+    expect(content).toContain("not a continuation of the previous user request");
+    expect(content).toContain("do not treat an earlier user message as a new request");
+    expect(content.indexOf("current runtime event for this turn")).toBeLessThan(boundary);
+    expect(content.indexOf("eventType")).toBeGreaterThan(boundary);
   });
 
   it("renders persisted image references as safe asset text without bytes", async () => {
@@ -348,12 +543,14 @@ describe("formatInput", () => {
     expect(result.content).toContain(`asset://${ASSET_ID}`);
   });
 
-  it("formats delivery-failed notifications without instruction text", async () => {
+  it("formats delivery-failed notifications with the generic current-turn boundary", async () => {
     const event: Event = createEvent(miDeliveryFailureRecord());
     const result = await project(event);
+    const content = String(result.content);
 
-    expect(result.content).toContain("[SYSTEM_NOTIFICATION]");
-    expect(result.content).toContain('"eventType":"delivery.failed"');
+    expect(content).toContain("[SYSTEM_NOTIFICATION]");
+    expect(content).toContain("not a continuation of the previous user request");
+    expect(content).toContain('"eventType":"delivery.failed"');
   });
 });
 
@@ -438,6 +635,12 @@ describe("parseReply", () => {
     const segments = parseReply("<text>visible<inner_thought>private</inner_thought> after</text>");
     expect(segments).toHaveLength(1);
     expect(text(segments[0])).toBe("visible after");
+  });
+
+  it("keeps a reply tag as an ordinary unknown element now that delivery is explicit", () => {
+    const segments = parseReply("思考内容<reply>这是最终回复</reply>尾巴");
+    expect(segments).toHaveLength(1);
+    expect(text(segments[0])).toBe("思考内容<reply>这是最终回复</reply>尾巴");
   });
 
   it("does not create empty segments around message boundaries", () => {

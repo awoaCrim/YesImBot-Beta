@@ -9,7 +9,7 @@ import SearchService from "../src/index.js";
 const runtime = { defaultLimit: 5, maxLimit: 10, timeoutMs: 1_000, blacklist: [] };
 const logger = { error: vi.fn() };
 
-async function promptFor(provider: "tavily" | "searxng"): Promise<string> {
+async function snapshotFor(provider: "tavily" | "searxng"): Promise<{ prompt: string; tools: Array<{ name: string; description?: string }> }> {
   const serviceLogger = { error: vi.fn(), info: vi.fn() };
   const ctx = { logger: vi.fn(() => serviceLogger), on: vi.fn(), yesimbot: { agent: { use: vi.fn(() => () => undefined) } } };
   const config =
@@ -21,7 +21,12 @@ async function promptFor(provider: "tavily" | "searxng"): Promise<string> {
   await service.start();
   try {
     const plugin = service.setup({} as never, {} as never);
-    return (plugin?.appendSystemPrompt as () => string)();
+    if (!plugin || typeof plugin.appendSystemPrompt !== "function") throw new Error("search plugin was not initialized");
+    const tools = Array.isArray(plugin.tools) ? plugin.tools : [];
+    return {
+      prompt: plugin.appendSystemPrompt(),
+      tools: tools.map((tool) => ({ name: tool.name, description: tool.description })),
+    };
   } finally {
     await service.stop();
   }
@@ -56,9 +61,17 @@ describe("search backend tool names", () => {
     expect(backend.createSearchTool().name).toBe("searxng_web_search");
   });
 
-  it("describes the selected backend's concrete tool names", async () => {
-    await expect(promptFor("tavily")).resolves.toContain("`tavily_web_search`");
-    await expect(promptFor("tavily")).resolves.toContain("`tavily_web_scrape`");
-    await expect(promptFor("searxng")).resolves.toContain("`searxng_web_search`");
+  it("keeps provider-specific names in tools instead of the shared system prompt", async () => {
+    const tavily = await snapshotFor("tavily");
+    expect(tavily.prompt).not.toContain("tavily_web_search");
+    expect(tavily.prompt).not.toContain("tavily_web_scrape");
+    expect(tavily.prompt).toContain("当前提供的 web search 工具");
+    expect(tavily.tools.map((tool) => tool.name)).toEqual(["tavily_web_search", "tavily_web_scrape"]);
+    expect(tavily.tools.map((tool) => tool.description).join("\n")).toContain("tavily_web_search");
+
+    const searxng = await snapshotFor("searxng");
+    expect(searxng.prompt).not.toContain("searxng_web_search");
+    expect(searxng.prompt).toContain("当前提供的 web search 工具");
+    expect(searxng.tools.map((tool) => tool.name)).toEqual(["searxng_web_search"]);
   });
 });

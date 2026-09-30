@@ -16,7 +16,7 @@ vi.mock("ai", async (importOriginal) => {
 import { generateText } from "ai";
 
 import { Agents, type ChannelPlugin } from "../src/agents/index.js";
-import { createDescribeImageTool } from "../src/agents/tools.js";
+import { createDescribeImageTool, createReadTool } from "../src/agents/tools.js";
 import { type WillEngine, type WillPlugin } from "../src/agents/will.js";
 import type { ChannelContext } from "../src/channels/index.js";
 import { createMessage, type MessageRecord } from "../src/messages/index.js";
@@ -60,6 +60,8 @@ describe("createDescribeImageTool", () => {
     const parts = options.messages[0]!.content;
     expect(parts[0]).toMatchObject({ type: "text" });
     expect(parts[0]!.text).toContain("图片里有什么？");
+    expect(parts[0]!.text).toContain("区分可见事实与推测");
+    expect(parts[0]!.text).toContain("无法确认具体身份");
     expect(parts[1]).toMatchObject({ type: "file", mediaType: "image/png" });
     expect(parts[1]!.data).toEqual(PNG_BYTES);
   });
@@ -106,6 +108,32 @@ describe("createDescribeImageTool", () => {
     await expect(tool.execute({ uri: `asset://${id}`, question: "什么" }, { toolCallId: "call", abortSignal: undefined } as never)).resolves.toEqual({
       error: "vision_call_failed: boom",
     });
+  });
+
+  it("automatically uses the configured vision model for read fallback", async () => {
+    const resources = await createResources();
+    const id = await resources.assets.put(PNG_BYTES);
+    vi.mocked(generateText).mockResolvedValueOnce({
+      text: "图片里是一只猫",
+      steps: [],
+      warnings: [],
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    } as never);
+    const tool = createReadTool(resources, { mode: "vision", visionModel: {} as never });
+
+    const result = await tool.execute({ uri: `asset://${id}` }, { toolCallId: "read-call", turnId: "turn-1", abortSignal: undefined } as never);
+
+    expect(result).toMatchObject({
+      uri: `asset://${id}`,
+      mediaType: "image/png",
+      imageMode: "vision",
+      text: "图片里是一只猫",
+    });
+    expect(JSON.stringify(result)).not.toContain(Buffer.from(PNG_BYTES).toString("base64"));
+    const options = vi.mocked(generateText).mock.calls.at(-1)?.[0] as {
+      messages: Array<{ content: Array<{ type: string; data?: Uint8Array; mediaType?: string }> }>;
+    };
+    expect(options.messages[0]!.content[1]).toMatchObject({ type: "file", data: PNG_BYTES, mediaType: "image/png" });
   });
 });
 
@@ -215,6 +243,7 @@ describe("Agents", () => {
     expect(willEngine.decide(message(0, [h.at("bot-1")]), { activeTurnId: null })).toBe("trigger");
     expect(willEngine.decide(message(0), { activeTurnId: null })).toBe("wait");
     expect(directWillEngine.decide(message(0), { activeTurnId: null })).toBe("wait");
-    expect(Object.keys(willEngine)).toEqual(["decide"]);
+    expect(Object.keys(willEngine)).toEqual(["decide", "debug"]);
+    expect(willEngine.debug?.()).toMatchObject({ engine: "default" });
   });
 });

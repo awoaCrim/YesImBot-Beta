@@ -1,0 +1,11 @@
+{
+  "hostname": "your-server-hostname",
+  "sourceRoot": "/absolute/path/to/yesimbot",
+  "containerSourceRoot": "/koishi/yesimbot",
+  "dataRoot": "/absolute/path/to/business-data",
+  "configPath": "/absolute/path/to/koishi.yml",
+  "stateRoot": "/absolute/path/to/release-state",
+  "container": "your-koishi-container",
+  "napcat": "your-napcat-container",
+  "healthUrl": "http://127.0.0.1:15140/"
+}

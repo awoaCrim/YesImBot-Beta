@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("koishi", async () => import("@koishijs/core"));
 
-import { ModelService } from "../src/models/index.js";
+import { AuxiliaryModelError, ModelService } from "../src/models/index.js";
 
 type ModelProvider = Parameters<ModelService["register"]>[0];
 
@@ -44,11 +44,11 @@ function createProviderWithImage(): ModelProvider {
   };
 }
 
-async function createModelService(models: unknown, basePath?: string, provider?: ModelProvider): Promise<ModelService> {
+async function createModelService(models: unknown, basePath?: string, provider?: ModelProvider, auxiliaryModel?: string): Promise<ModelService> {
   const directory = basePath ?? (await createModelsPath(models)).slice(0, -"/models.json".length);
   const ctx = new Context();
   ctx.baseDir = "/";
-  const service = new ModelService(ctx as never, { basePath: directory });
+  const service = new ModelService(ctx as never, { basePath: directory, auxiliaryModel });
   await service.start();
   service.register(provider ?? createProvider());
   return service;
@@ -87,6 +87,54 @@ describe("models.json modalities", () => {
     expect(service.getProvider("openai")).toBe(provider);
   });
 
+  it("increments the model revision when providers register and unregister", async () => {
+    const path = await createModelsPath({});
+    const directory = path.slice(0, -"/models.json".length);
+    const ctx = new Context();
+    ctx.baseDir = "/";
+    const service = new ModelService(ctx as never, { basePath: directory });
+    await service.start();
+    const before = service.revision;
+    const dispose = service.register(createProvider());
+    expect(service.revision).toBeGreaterThan(before);
+    const registered = service.revision;
+    dispose();
+    expect(service.revision).toBeGreaterThan(registered);
+  });
+  it("loads and isolates model-level thinking settings", async () => {
+    const chat = vi.fn(() => ({}) as never);
+    const provider: ModelProvider = {
+      ...createProvider(),
+      chat,
+      chatModels: () => [
+        {
+          id: "gpt-4o",
+          thinkingLevel: "medium",
+          thinkingLevelMap: { medium: "medium", high: "high" },
+        },
+      ],
+    };
+    const service = await createModelService(
+      {
+        chat: {
+          "openai:gpt-4o": {
+            thinkingLevel: "high",
+            thinkingLevelMap: { high: "high" },
+          },
+        },
+      },
+      undefined,
+      provider,
+    );
+
+    const first = service.resolveChatModel("openai:gpt-4o");
+    expect(chat).toHaveBeenCalledWith("gpt-4o", expect.objectContaining({ thinkingLevel: "high", thinkingLevelMap: { medium: "medium", high: "high" } }));
+    expect(first.entry).toMatchObject({ thinkingLevel: "high", thinkingLevelMap: { medium: "medium", high: "high" } });
+    first.entry.thinkingLevelMap!.high = "low";
+
+    expect(service.resolveChatModel("openai:gpt-4o").entry.thinkingLevelMap).toEqual({ medium: "medium", high: "high" });
+  });
+
   it("loads independent input and output modality arrays when their values are supported", async () => {
     const service = await createModelService({ chat: { "openai:gpt-4o": { modalities: { input: ["image"], output: ["text"] } } } });
 
@@ -115,6 +163,69 @@ describe("models.json modalities", () => {
     const service = await createModelService(JSON.parse(await readFile(path, "utf8")), path.slice(0, -"/models.json".length), createProviderWithImage());
 
     expect(service.resolveChatModel("openai:gpt-4o").entry.modalities?.input).toBeUndefined();
+  });
+
+  it("fails closed when a provider does not declare image tool-result support", async () => {
+    const service = await createModelService({});
+
+    expect(service.resolveChatModel("openai:gpt-4o").capabilities).toEqual({ imageToolResult: "unknown", historyProjection: "default" });
+  });
+
+  it("propagates explicit unsupported image tool-result transport capabilities", async () => {
+    const provider: ModelProvider = {
+      ...createProvider(),
+      chatCapabilities: vi.fn(() => ({ imageToolResult: "unsupported" as const })),
+    };
+    const service = await createModelService({}, undefined, provider);
+
+    expect(service.resolveChatModel("openai:gpt-4o").capabilities).toEqual({ imageToolResult: "unsupported", historyProjection: "default" });
+    expect(provider.chatCapabilities).toHaveBeenCalledWith("gpt-4o");
+  });
+
+  it("resolves provider-scoped history projection capabilities and defaults unknown providers", async () => {
+    const provider: ModelProvider = {
+      ...createProvider(),
+      chatCapabilities: vi.fn(() => ({ imageToolResult: "native" as const, historyProjection: "gemini-native" as const })),
+    };
+    const service = await createModelService({}, undefined, provider);
+
+    expect(service.resolveChatModel("openai:gpt-4o").capabilities.historyProjection).toBe("gemini-native");
+
+    const defaultService = await createModelService({});
+    expect(defaultService.resolveChatModel("openai:gpt-4o").capabilities.historyProjection).toBe("default");
+  });
+
+  it("resolves the configured auxiliary model with an explicit route", async () => {
+    const service = await createModelService({}, undefined, undefined, "openai:gpt-4o");
+
+    expect(service.resolveAuxiliaryModel("memory-summary")).toMatchObject({
+      fullId: "openai:gpt-4o",
+      route: "auxiliary",
+      purpose: "memory-summary",
+      source: "config.auxiliaryModel",
+    });
+  });
+
+  it("fails closed when the auxiliary model is missing", async () => {
+    const service = await createModelService({});
+
+    expect(() => service.resolveAuxiliaryModel("utility")).toThrow(AuxiliaryModelError);
+    try {
+      service.resolveAuxiliaryModel("utility");
+    } catch (error) {
+      expect(error).toMatchObject({ code: "missing-config", purpose: "utility", route: "auxiliary" });
+    }
+  });
+
+  it("does not fall back to the registered chat model when the auxiliary model cannot resolve", async () => {
+    const service = await createModelService({}, undefined, undefined, "openai:missing-model");
+
+    expect(() => service.resolveAuxiliaryModel("utility")).toThrow(AuxiliaryModelError);
+    try {
+      service.resolveAuxiliaryModel("utility");
+    } catch (error) {
+      expect(error).toMatchObject({ code: "unresolvable-model", modelId: "openai:missing-model" });
+    }
   });
   it("includes a provider tool set with the resolved chat model", async () => {
     const tools = { web_search: { type: "provider", id: "test.web_search", inputSchema: {} as never } } as ToolSet;

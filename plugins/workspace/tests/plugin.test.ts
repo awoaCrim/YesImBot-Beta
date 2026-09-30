@@ -9,7 +9,8 @@ vi.mock("koishi", async () => {
   return { Context: class {}, Logger: class {}, Schema };
 });
 
-import WorkspacePlugin from "../src/index.js";
+import WorkspacePlugin, { isHostExecAllowed } from "../src/index.js";
+import { formatHostExecPrompt, formatWorkspacePrompt } from "../src/prompt.js";
 import type { WorkspacePluginConfig } from "../src/types.js";
 
 async function createWorkspace() {
@@ -44,6 +45,45 @@ async function createWorkspace() {
 }
 
 describe("WorkspacePlugin", () => {
+  it("keeps sandbox and host boundaries in their respective prompts", () => {
+    const sandboxPrompt = formatWorkspacePrompt({
+      config: { bash: { cwd: "/workspace", network: undefined } },
+      defaultTimeoutMs: 1_000,
+      mounts: [{ path: "/home/workspace", kind: "persistent" }],
+    } as never);
+    expect(sandboxPrompt).toContain("just-bash 虚拟沙箱");
+    expect(sandboxPrompt).toContain("宿主机文件和二进制不可见");
+    expect(sandboxPrompt).toContain("workspace://");
+    expect(sandboxPrompt).toContain("asset://");
+    expect(sandboxPrompt).toContain("skill://<skill-name>/SKILL.md");
+    expect(sandboxPrompt).not.toContain("SSH1 宿主机管理工具");
+
+    const hostPrompt = formatHostExecPrompt(5_000);
+    expect(hostPrompt).toContain("SSH1 宿主机管理工具");
+    expect(hostPrompt).toContain("当前命令以 host 用户 anon 运行");
+    expect(hostPrompt).toContain("先用 id、pwd、docker ps、systemctl is-system-running 等只读检查");
+    expect(hostPrompt).toContain("不要读取、打印或复制 API key");
+    expect(hostPrompt).toContain("ok、exitCode");
+  });
+
+  it("matches Host execution only for the exact Anon direct scope", () => {
+    const rule = { platform: "onebot", channelId: "private:1049700117", userId: "1049700117", selfId: "3535802886" };
+
+    expect(isHostExecAllowed({ type: "direct", platform: "onebot", channelId: "private:1049700117", selfId: "3535802886", userId: "1049700117" }, [rule])).toBe(
+      true,
+    );
+    expect(isHostExecAllowed({ type: "direct", platform: "onebot", channelId: "private:other", selfId: "3535802886", userId: "other" }, [rule])).toBe(false);
+    expect(isHostExecAllowed({ type: "direct", platform: "onebot", channelId: "private:1049700117", selfId: "3535802886", userId: "other" }, [rule])).toBe(
+      false,
+    );
+    expect(
+      isHostExecAllowed({ type: "guild", platform: "onebot", channelId: "private:1049700117", guildId: "private:1049700117", selfId: "3535802886" }, [rule]),
+    ).toBe(false);
+    expect(isHostExecAllowed({ type: "direct", platform: "other", channelId: "private:1049700117", selfId: "3535802886", userId: "1049700117" }, [rule])).toBe(
+      false,
+    );
+  });
+
   it("registers named ResourceReader objects and one agent plugin on start", async () => {
     const fixture = await createWorkspace();
     try {

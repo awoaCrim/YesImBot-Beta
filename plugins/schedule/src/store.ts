@@ -23,6 +23,7 @@ const SCHEDULE_FIELDS = {
   channelId: "string",
   title: "string",
   prompt: "text",
+  delivery: { type: "string", initial: "channel" },
   kind: "string",
   at: { type: "string", nullable: true, initial: null },
   cron: { type: "string", nullable: true, initial: null },
@@ -33,8 +34,10 @@ const SCHEDULE_FIELDS = {
   updatedAt: "string",
 } satisfies Field.Extension<ScheduleRow, Types>;
 export type ScheduleScope = ChannelContext & { readonly selfId: string; readonly channelId: string };
+
 /** The database surface the Store needs: the raw Minato model service. */
 type ScheduleModel = Pick<Context["model"], "extend" | "get" | "create" | "set" | "remove">;
+
 /**
  * Single-table, channel-scoped Schedule persistence. Every mutation is
  * serialized through a private promise tail so create/update/pause/resume/
@@ -63,6 +66,7 @@ export class ScheduleStore {
         channelId: scope.channelId,
         title: input.title,
         prompt: input.prompt,
+        delivery: input.delivery ?? "channel",
         kind: rule.kind,
         at: rule.kind === "once" ? rule.at : null,
         cron: rule.kind === "cron" ? rule.cron : null,
@@ -93,6 +97,7 @@ export class ScheduleStore {
       }
       const title = input.title ?? row.title;
       const prompt = input.prompt ?? row.prompt;
+      const delivery = input.delivery ?? row.delivery ?? "channel";
       if (title.length > MAX_TITLE_LENGTH) {
         throw new Error(`title must not exceed ${MAX_TITLE_LENGTH} characters`);
       }
@@ -118,8 +123,8 @@ export class ScheduleStore {
         if (row.state === "enabled") next = nextRunAt(rule, now);
       }
       const updatedAt = new Date(Date.now()).toISOString();
-      await this.model.set(SCHEDULE_TABLE, { ...scopeQuery(scope), id }, { title, prompt, kind, at, cron, nextRunAt: next, updatedAt });
-      return toSchedule({ ...row, title, prompt, kind, at, cron, nextRunAt: next, updatedAt });
+      await this.model.set(SCHEDULE_TABLE, { ...scopeQuery(scope), id }, { title, prompt, delivery, kind, at, cron, nextRunAt: next, updatedAt });
+      return toSchedule({ ...row, title, prompt, delivery, kind, at, cron, nextRunAt: next, updatedAt });
     });
   }
 
@@ -278,16 +283,20 @@ export class ScheduleStore {
     return rows[0];
   }
 }
+
 /** Registers the plugin-owned single table; called once from the plugin initialization path. */
 export function registerScheduleModel(model: ScheduleModel): void {
   model.extend(SCHEDULE_TABLE, SCHEDULE_FIELDS, { primary: "id", autoInc: false });
 }
+
 function scopeQuery(scope: ScheduleScope) {
   return { type: scope.type, platform: scope.platform, selfId: scope.selfId, channelId: scope.channelId };
 }
+
 function ruleOfRow(row: ScheduleRow): ScheduleRule {
   return row.kind === "once" ? { kind: "once", at: row.at! } : { kind: "cron", cron: row.cron! };
 }
+
 function toSchedule(row: ScheduleRow): Schedule {
   const base = {
     id: row.id,
@@ -297,6 +306,7 @@ function toSchedule(row: ScheduleRow): Schedule {
     channelId: row.channelId,
     title: row.title,
     prompt: row.prompt,
+    delivery: row.delivery ?? "channel",
     state: row.state,
     nextRunAt: row.nextRunAt,
     lastResult: row.lastResult ?? undefined,
@@ -305,6 +315,7 @@ function toSchedule(row: ScheduleRow): Schedule {
   };
   return row.kind === "once" ? { ...base, kind: "once", at: row.at! } : { ...base, kind: "cron", cron: row.cron! };
 }
+
 function compareByNextRun(a: Schedule, b: Schedule): number {
   if (a.nextRunAt === null && b.nextRunAt === null) return a.id.localeCompare(b.id);
   if (a.nextRunAt === null) return 1;

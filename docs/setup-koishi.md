@@ -170,7 +170,6 @@ plugins:
     ~@yesimbot/provider-deepseek: {}
     ~@yesimbot/provider-google: {}
     ~yesimbot-mcp-client: {}
-    ~yesimbot-memos-client: {}
     ~yesimbot-onebot-utils: {}
     ~yesimbot-schedule: {}
     ~yesimbot-search-service: {}
@@ -192,6 +191,14 @@ plugins:
 2. 启用 `@yesimbot/koishi-plugin-provider-openai` 或其它 provider。
 3. 填写 API Key 和模型列表。
 4. 给 `yesimbot.chatModel` 选择一个模型。
+
+## 会话压缩片段
+
+在 Koishi 控制台的 `yesimbot.session.compact.inlineFragments` 中可设置请求上下文常驻的最近压缩片段数，默认是 `3`，必须为正整数。旧片段仍保存在会话 JSONL 中作为权威历史，并由 Core 的数据库表 `yesimbot_compact_fragment` 建立可重建的溢出索引；出现相关关键词时，Core 最多召回 3 段只读历史资料。
+
+召回严格限制在同一频道、所选会话 compact 锚点的祖先链及其来源时间边界内，不跨频道或切回旧会话后看到后续分支，也不会把召回资料写回 JSONL 或送进下一次压缩。首版使用轻量词项重合，不依赖 `yesimbot-memorizer`、embedding 或额外模型请求，因此改述或同义词可能无法命中。清空频道会先完成 JSONL 索引修复，再删除对应的片段索引；若数据库删除失败，清空会失败并保留原会话数据。
+
+自动压缩触发仍使用 provider 报告的输入 token 数超过 `100,000`；该配置只控制常驻片段数量，不改变触发策略。`yesimbot.session.compact.model` 仍可选择独立压缩模型。
 
 ## 安全行为
 

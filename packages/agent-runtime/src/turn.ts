@@ -5,6 +5,7 @@ import { createRandomId } from "./id.js";
 import { AgentMessage } from "./message.js";
 
 export type BusyBehavior = "defer" | "join" | "reject";
+export type AgentHistoryMode = "conversation" | "event";
 
 export type TurnStatus = "queued" | "running" | "done" | "failed" | "aborted";
 
@@ -13,6 +14,7 @@ export interface TurnRequest {
   readonly submittedAt: number;
   readonly messages: AgentMessage[];
   readonly signal: AbortSignal;
+  readonly historyMode: AgentHistoryMode;
   addJoined(messages: AgentMessage[], persistence?: Promise<void>): void;
   drainJoined(): Promise<AgentMessage[]>;
 }
@@ -33,6 +35,8 @@ export interface TurnResult {
   messages: AgentMessage[];
   error?: TurnError;
   usage?: Partial<LanguageModelUsage>;
+  /** Usage from the latest actual provider step, kept separate from cumulative turn usage. */
+  latestStepUsage?: Partial<LanguageModelUsage>;
 }
 
 export interface AgentWaitOptions {
@@ -105,7 +109,7 @@ export function createTurnQueue(options: TurnQueueOptions) {
       return active?.request.turnId;
     },
     isIdle,
-    enqueue(messages: AgentMessage[], behavior: BusyBehavior = "defer", persistence?: Promise<void>) {
+    enqueue(messages: AgentMessage[], behavior: BusyBehavior = "defer", persistence?: Promise<void>, historyMode: AgentHistoryMode = "conversation") {
       if (active && behavior === "reject") {
         throw new AgentBusyError();
       }
@@ -115,7 +119,7 @@ export function createTurnQueue(options: TurnQueueOptions) {
         return active.request.turnId;
       }
 
-      const queued = createQueuedTurn(messages);
+      const queued = createQueuedTurn(messages, historyMode);
       queue.push(queued);
       void pump();
       return queued.request.turnId;
@@ -160,7 +164,7 @@ export function createTurnQueue(options: TurnQueueOptions) {
   };
 }
 
-function createQueuedTurn(messages: AgentMessage[]): QueuedTurn {
+function createQueuedTurn(messages: AgentMessage[], historyMode: AgentHistoryMode): QueuedTurn {
   const controller = new AbortController();
   const joined: AgentMessage[] = [];
   const joinedPersistence: Promise<void>[] = [];
@@ -170,6 +174,7 @@ function createQueuedTurn(messages: AgentMessage[]): QueuedTurn {
     submittedAt: Date.now(),
     messages: [...messages],
     signal: controller.signal,
+    historyMode,
     addJoined(nextMessages, persistence) {
       joined.push(...nextMessages);
       if (persistence) {

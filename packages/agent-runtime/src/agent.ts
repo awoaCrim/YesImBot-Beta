@@ -1,12 +1,25 @@
-import { isLoopFinished, streamText, type LanguageModel, type LanguageModelUsage, type SystemModelMessage, type ToolSet } from "ai";
-import { z } from "zod";
+import {
+  APICallError,
+  isLoopFinished,
+  stepCountIs,
+  streamText,
+  wrapLanguageModel,
+  type LanguageModel,
+  type LanguageModelMiddleware,
+  type LanguageModelUsage,
+  type ModelMessage,
+  type StopCondition,
+  type SystemModelMessage,
+  type ToolSet,
+} from "ai";
 
 import { AgentChannel, createAgentChannel } from "./channel.js";
 import type { AgentEntry } from "./entry.js";
 import { createEventEntry, createMessageEntry } from "./entry.js";
-import { formatErrorCause, ToolConflictError } from "./errors.js";
+import { formatErrorCause, ToolConflictError, AgentProtocolError, type AgentProtocolViolation } from "./errors.js";
 import type { AgentInternalEvent, AgentInternalEventInit } from "./event.js";
 import { createDiagnostic, createInternalEvent } from "./event.js";
+import { sanitizeAgentEntriesForPersistence } from "./media.js";
 import type { AgentMessage } from "./message.js";
 import { buildModelMessages, createAssistantMessage, createToolMessage } from "./message.js";
 import type { AgentPlugin, AgentPluginRuntime, SystemPromptAppend, ToolHookContext } from "./plugin.js";
@@ -17,10 +30,48 @@ import type { AgentStorage } from "./storage.js";
 import { createMemoryStorage } from "./storage.js";
 import type { AgentToolExecuteContext } from "./tools.js";
 import { AgentTool, AgentToolSet, toAiToolSet } from "./tools.js";
-import { createTurnQueue, TurnResult, type AgentWaitOptions, type TurnRequest } from "./turn.js";
+import { createTurnQueue, TurnResult, type AgentHistoryMode, type AgentWaitOptions, type TurnRequest } from "./turn.js";
+
+const DEFAULT_MAX_STEPS = 20;
+const MAX_MODEL_RETRIES = 5;
+
+const RETRYABLE_429_ONLY_MIDDLEWARE: LanguageModelMiddleware = {
+  specificationVersion: "v3",
+  async wrapGenerate({ doGenerate }) {
+    try {
+      return await doGenerate();
+    } catch (cause) {
+      throw markNon429AsNonRetryable(cause);
+    }
+  },
+  async wrapStream({ doStream }) {
+    try {
+      return await doStream();
+    } catch (cause) {
+      throw markNon429AsNonRetryable(cause);
+    }
+  },
+};
+
+export type AgentModelRequestGuard = (context: AgentModelRequestContext) => Promise<readonly ModelMessage[] | void>;
 
 export interface AgentSendOptions {
   ifBusy?: "defer" | "join" | "reject";
+  /** Event-triggered turns must not reuse an earlier conversation request as current work. */
+  historyMode?: AgentHistoryMode;
+}
+
+export interface AgentModelRequestContext {
+  readonly model: LanguageModel;
+  readonly system: string | SystemModelMessage | readonly SystemModelMessage[] | undefined;
+  readonly messages: readonly ModelMessage[];
+  readonly tools: ToolSet;
+  readonly toolChoice?: "required";
+  readonly currentMessageIds: readonly string[];
+  readonly turnId: string;
+  readonly stepNumber: number;
+  readonly signal: AbortSignal;
+  readonly rebuildMessages: () => Promise<readonly ModelMessage[]>;
 }
 
 export interface AgentConfig {
@@ -31,7 +82,24 @@ export interface AgentConfig {
   providerTools?: ToolSet;
   storage?: AgentStorage<AgentEntry>;
   plugins?: AgentPlugin[];
-  terminalTool?: { name: string; description?: string };
+  maxSteps?: number;
+  maxRetries?: number;
+  /**
+   * Provider request hint forwarded to `streamText()`. Callers must gate this on a resolved model
+   * capability; the runtime never infers it from the provider name. `"required"` only means the
+   * model must call some available tool, so it does not replace the terminal-tool invariant.
+   */
+  toolChoice?: "required";
+  /**
+   * Runs after per-step plugin preparation and before the provider request. Returning messages
+   * replaces the request for this step; throwing prevents the provider request.
+   */
+  beforeModelRequest?: AgentModelRequestGuard;
+  /**
+   * Rejects a turn that never produced a terminal tool call instead of settling it as successful.
+   * Defaults to `false` so existing callers keep their current turn semantics.
+   */
+  requireTerminalTool?: boolean;
   initialState?: AgentState;
   defaultState?: AgentState;
 }
@@ -84,7 +152,8 @@ export function createAgent(config: AgentConfig): Agent {
 
   let model = config.model;
   const baseTools = config.tools ?? [];
-  const baseTerminalTool = config.terminalTool ? createTerminalTool(config.terminalTool) : undefined;
+  const maxSteps = Math.max(1, config.maxSteps ?? DEFAULT_MAX_STEPS);
+  const maxRetries = normalizeMaxRetries(config.maxRetries);
   let frozenSystemPrompt: string | SystemModelMessage[] | undefined;
   let frozenTools: AgentToolSet = [];
   let frozenProviderTools: ToolSet = {};
@@ -101,6 +170,7 @@ export function createAgent(config: AgentConfig): Agent {
   const turnStreams = new Map<string, Set<(event: AgentInternalEvent) => void>>();
   const turnEventBuffer = new Map<string, AgentInternalEvent[]>();
   let appendPipelineReady = Promise.resolve();
+  let activeTurnEntryCollector: ((entries: readonly AgentEntry[]) => void) | undefined;
   const submittedMessageEntries = new WeakMap<object, Array<Extract<AgentEntry, { type: "message" }>>>();
 
   const runAppendPipeline = async <T>(operation: () => Promise<T>): Promise<T> => {
@@ -137,7 +207,9 @@ export function createAgent(config: AgentConfig): Agent {
 
     return runAppendPipeline(async () => {
       const transformed = await pluginHost.helpers.onAppend(entries, runtimeContext);
-      await storage.append(...transformed);
+      const persisted = sanitizeAgentEntriesForPersistence(transformed);
+      await storage.append(...persisted);
+      activeTurnEntryCollector?.(transformed);
 
       for (const entry of transformed) {
         if (entry.type !== "message") continue;
@@ -185,7 +257,7 @@ export function createAgent(config: AgentConfig): Agent {
           : blocks.length > 0
             ? blocks
             : undefined;
-      frozenTools = [...pluginHost.stableTools, ...(baseTerminalTool ? [baseTerminalTool] : [])];
+      frozenTools = [...pluginHost.stableTools];
       frozenProviderTools = {};
       const toolNames = new Set(frozenTools.map((tool) => tool.name));
       for (const [name, tool] of Object.entries(config.providerTools ?? {})) {
@@ -203,7 +275,7 @@ export function createAgent(config: AgentConfig): Agent {
     return initPromise;
   };
 
-  const resolveTools = (turnId: string, signal?: AbortSignal): AgentToolSet => {
+  const resolveTools = (turnId: string, currentMessages: () => readonly AgentMessage[], signal?: AbortSignal): AgentToolSet => {
     const merged = frozenTools;
 
     let serial = Promise.resolve();
@@ -242,6 +314,7 @@ export function createAgent(config: AgentConfig): Agent {
                     storage,
                     turnId,
                     abortSignal: hookContext.signal,
+                    messages: [...currentMessages()],
                   };
                   const output = await raceAbort(Promise.resolve(execute(nextInput, executeContext)), hookContext.signal);
                   throwIfAborted(hookContext.signal);
@@ -278,11 +351,10 @@ export function createAgent(config: AgentConfig): Agent {
     return wrapped;
   };
 
-  const collectHistoryMessageEntries = async () => {
+  const collectPersistedEntries = async (): Promise<readonly AgentEntry[]> => {
     await appendPipelineReady;
     const rawEntries = await storage.read();
-    const entries = await pluginHost.helpers.transformEntries(rawEntries);
-    return entries.filter((entry): entry is Extract<AgentEntry, { type: "message" }> => entry.type === "message");
+    return sanitizeAgentEntriesForPersistence(rawEntries);
   };
 
   const rememberSubmittedEntries = (messages: AgentMessage[], entries: Array<Extract<AgentEntry, { type: "message" }>>) => {
@@ -321,10 +393,28 @@ export function createAgent(config: AgentConfig): Agent {
     return [...knownEntries, ...freshEntries];
   };
 
-  const buildBoundaryModelMessages = async (turnId: string, currentEntries: Array<Extract<AgentEntry, { type: "message" }>>, signal: AbortSignal) => {
-    const persisted = await collectHistoryMessageEntries();
+  const buildBoundaryModelMessages = async (
+    turnId: string,
+    currentEntries: Array<Extract<AgentEntry, { type: "message" }>>,
+    liveEntries: ReadonlyMap<string, Extract<AgentEntry, { type: "message" }>>,
+    signal: AbortSignal,
+    historyMode: AgentHistoryMode,
+  ) => {
+    const persisted = await collectPersistedEntries();
     const currentEntryIds = new Set(currentEntries.map((entry) => entry.id));
-    const history = persisted.filter((entry) => !currentEntryIds.has(entry.id)).map((entry) => entry.data);
+    // The persisted-history projection may only see messages that predate this turn; current-turn
+    // entries keep their raw assistant/tool pairing and must not be dropped as delivered output.
+    const historicalEntries = persisted.filter((entry) => entry.type !== "message" || !liveEntries.has(entry.id));
+    const projectedHistory = historyMode === "event" ? [] : await pluginHost.helpers.transformEntries(historicalEntries);
+
+    // A projection may deliberately reorder persisted history (for example, moving a compact
+    // summary before the retained tail). Keep that projected order intact, then append raw entries
+    // captured by this turn's append pipeline. Map insertion order follows durable append order,
+    // while id lookup keeps an entry stable and deduplicated across repeated boundary rebuilds.
+    const liveHistoryEntries = [...liveEntries.values()].filter((entry) => !currentEntryIds.has(entry.id));
+    const history = [...projectedHistory, ...liveHistoryEntries]
+      .filter((entry): entry is Extract<AgentEntry, { type: "message" }> => entry.type === "message")
+      .map((entry) => entry.data);
     const current = currentEntries.map((entry) => entry.data);
 
     return buildModelMessages({ history, current, pluginHost, context: { runtime: { id }, channel, state, turnId, signal } });
@@ -385,53 +475,99 @@ export function createAgent(config: AgentConfig): Agent {
 
   const executeTurn = async (request: TurnRequest): Promise<TurnResult> => {
     const allMessages: AgentMessage[] = [];
+    const liveTurnEntries = new Map<string, Extract<AgentEntry, { type: "message" }>>();
+    const rememberLiveEntries = (entries: readonly AgentEntry[]) => {
+      for (const entry of entries) {
+        if (entry.type === "message") liveTurnEntries.set(entry.id, entry);
+      }
+    };
+    activeTurnEntryCollector = rememberLiveEntries;
     let turnUsage: Partial<LanguageModelUsage> | undefined;
+    let latestStepUsage: Partial<LanguageModelUsage> | undefined;
     let currentBatch = request.messages.splice(0, request.messages.length);
     const abortSignal = request.signal;
+    // Resolved after `ensureInit()`: plugin-provided tools only exist once the plugin host is frozen.
+    let isTerminalToolCall: (call: { toolName: string; input?: unknown; invalid?: boolean }) => boolean = () => false;
+    // Terminal tools are tracked across every step of the turn: a step that only ran intermediate
+    // tools keeps the loop going, and a terminal call in any step settles the invariant.
+    let sawTerminalToolCall = false;
+    let sawIntermediateToolCall = false;
+    let sawNonEmptyText = false;
 
     try {
       await ensureInit();
+      isTerminalToolCall = createTerminalToolCallMatcher(frozenTools);
       await emitInternal({ type: "turn.start", turnId: request.turnId });
 
       while (currentBatch.length > 0) {
         const currentEntries = await persistCurrentMessages(currentBatch, request.turnId);
+        rememberLiveEntries(currentEntries);
         allMessages.push(...currentEntries.map((entry) => entry.data));
 
-        const modelMessages = await buildBoundaryModelMessages(request.turnId, currentEntries, abortSignal);
+        const modelMessages = await buildBoundaryModelMessages(request.turnId, currentEntries, liveTurnEntries, abortSignal, request.historyMode);
 
         let aborted = false;
         let persistedResponseMessageCount = 0;
+        const retry = prepareRetryModel(model, maxRetries);
+        const effectiveTools = { ...toAiToolSet(resolveTools(request.turnId, () => allMessages, abortSignal)), ...frozenProviderTools };
         const response = streamText({
-          model,
+          model: retry.model,
           system: frozenSystemPrompt,
           messages: modelMessages,
-          tools: { ...toAiToolSet(resolveTools(request.turnId, abortSignal)), ...frozenProviderTools },
-          stopWhen: isLoopFinished(),
+          tools: effectiveTools,
+          ...(config.toolChoice ? { toolChoice: config.toolChoice } : {}),
+          stopWhen: [isLoopFinished(), stepCountIs(maxSteps), allToolCallsTerminal(frozenTools)],
           abortSignal,
           prepareStep: async ({ stepNumber }) => {
             let messages = modelMessages;
             if (stepNumber > 0) {
               const joined = await request.drainJoined();
               if (joined.length === 0) {
-                messages = await buildBoundaryModelMessages(request.turnId, [], abortSignal);
+                messages = await buildBoundaryModelMessages(request.turnId, [], liveTurnEntries, abortSignal, request.historyMode);
               } else {
                 const joinedEntries = await persistCurrentMessages(joined, request.turnId);
+                rememberLiveEntries(joinedEntries);
                 allMessages.push(...joinedEntries.map((entry) => entry.data));
-                messages = await buildBoundaryModelMessages(request.turnId, joinedEntries, abortSignal);
+                messages = await buildBoundaryModelMessages(request.turnId, joinedEntries, liveTurnEntries, abortSignal, request.historyMode);
               }
             }
 
-            const prepared = await pluginHost.helpers.prepareStep(messages, {
+            const prepareContext = {
               runtime: { id },
               channel,
               state,
               turnId: request.turnId,
               stepNumber,
               signal: abortSignal,
+            };
+            const prepared = await pluginHost.helpers.prepareStep(messages, prepareContext);
+            const guard = config.beforeModelRequest;
+            if (!guard) return { messages: [...prepared] };
+
+            const guarded = await guard({
+              model: retry.model,
+              system: frozenSystemPrompt,
+              messages: prepared,
+              tools: effectiveTools,
+              ...(config.toolChoice ? { toolChoice: config.toolChoice } : {}),
+              currentMessageIds: [...liveTurnEntries.keys()],
+              turnId: request.turnId,
+              stepNumber,
+              signal: abortSignal,
+              rebuildMessages: async () => {
+                const rebuilt = await buildBoundaryModelMessages(
+                  request.turnId,
+                  [...liveTurnEntries.values()],
+                  liveTurnEntries,
+                  abortSignal,
+                  request.historyMode,
+                );
+                return pluginHost.helpers.prepareStep(rebuilt, prepareContext);
+              },
             });
-            return { messages: [...prepared] };
+            return { messages: [...(guarded ?? prepared)] };
           },
-          maxRetries: 0,
+          maxRetries: retry.maxRetries,
           onAbort() {
             aborted = true;
           },
@@ -444,15 +580,30 @@ export function createAgent(config: AgentConfig): Agent {
                 : createToolMessage(message.content),
             );
             turnUsage = mergeUsage(turnUsage, step.usage);
+            latestStepUsage = step.usage;
+
+            for (const call of step.toolCalls ?? []) {
+              if (isTerminalToolCall(call)) {
+                sawTerminalToolCall = true;
+                continue;
+              }
+              // A malformed call bought the turn nothing: it is neither a terminal action nor a
+              // completed intermediate action.
+              if (call.invalid) continue;
+              sawIntermediateToolCall = true;
+            }
+            if (typeof step.text === "string" && step.text.trim().length > 0) {
+              sawNonEmptyText = true;
+            }
 
             if (stepMessages.length > 0) {
               const stepEntries = await appendEntries(
                 stepMessages.map((message) => createMessageEntry(message)),
                 { turnId: request.turnId },
               );
-              allMessages.push(
-                ...stepEntries.filter((entry): entry is Extract<AgentEntry, { type: "message" }> => entry.type === "message").map((entry) => entry.data),
-              );
+              const liveStepEntries = stepEntries.filter((entry): entry is Extract<AgentEntry, { type: "message" }> => entry.type === "message");
+              rememberLiveEntries(liveStepEntries);
+              allMessages.push(...liveStepEntries.map((entry) => entry.data));
             }
 
             await emitInternal({
@@ -487,12 +638,17 @@ export function createAgent(config: AgentConfig): Agent {
         currentBatch = await request.drainJoined();
       }
 
+      if (config.requireTerminalTool && !sawTerminalToolCall) {
+        throw new AgentProtocolError(resolveProtocolViolation({ sawNonEmptyText, sawIntermediateToolCall }));
+      }
+
       await emitInternal({ type: "turn.done", turnId: request.turnId });
       const result: TurnResult = {
         turnId: request.turnId,
         status: "done",
         messages: allMessages,
         ...(turnUsage ? { usage: turnUsage } : {}),
+        ...(latestStepUsage ? { latestStepUsage } : {}),
       };
       await pluginHost.helpers.onTurnFinish(result, { runtime: { id }, channel, state, turnId: request.turnId });
       return result;
@@ -502,11 +658,13 @@ export function createAgent(config: AgentConfig): Agent {
       const result: TurnResult = { turnId: request.turnId, status: aborted ? "aborted" : "failed", messages: allMessages, error: diagnostic };
       await persistTerminalTurnEvent(
         aborted
-          ? { type: "turn.aborted", turnId: request.turnId, reason: formatErrorCause(error) }
+          ? { type: "turn.aborted", turnId: request.turnId, reason: formatAbortReason(error, abortSignal) }
           : { type: "turn.failed", turnId: request.turnId, error: diagnostic },
       );
       await pluginHost.helpers.onTurnFinish(result, { runtime: { id }, channel, state, turnId: request.turnId });
       return result;
+    } finally {
+      if (activeTurnEntryCollector === rememberLiveEntries) activeTurnEntryCollector = undefined;
     }
   };
 
@@ -546,7 +704,7 @@ export function createAgent(config: AgentConfig): Agent {
         });
       }
 
-      const turnId = turnQueue.enqueue([message], options.ifBusy, persistence);
+      const turnId = turnQueue.enqueue([message], options.ifBusy, persistence, options.historyMode);
       if (turnId !== activeTurnId) {
         void emitInternal({ type: "turn.queued", turnId });
       }
@@ -582,13 +740,53 @@ export function createAgent(config: AgentConfig): Agent {
   return agent;
 }
 
-function createTerminalTool(config: NonNullable<AgentConfig["terminalTool"]>): AgentTool {
-  return {
-    name: config.name,
-    description: config.description ?? "结束本轮回复，不输出任何对外内容。",
-    inputSchema: z.object({}),
-    execute: async () => ({ ok: true }),
+/**
+ * Shared terminal-tool decision used by both the stop condition and the final protocol check, so a
+ * tool can never end the loop without also satisfying the terminal invariant.
+ */
+function createTerminalToolCallMatcher(tools: AgentToolSet): (call: { toolName: string; input?: unknown; invalid?: boolean }) => boolean {
+  const always = new Set<string>();
+  const predicates = new Map<string, (input: unknown) => boolean>();
+  for (const tool of tools) {
+    if (tool.terminal === true) always.add(tool.name);
+    else if (typeof tool.terminal === "function") predicates.set(tool.name, tool.terminal as (input: unknown) => boolean);
+  }
+  return (call) => {
+    if (call.invalid) return false;
+    if (always.has(call.toolName)) return true;
+    const predicate = predicates.get(call.toolName);
+    if (!predicate) return false;
+    try {
+      return predicate(call.input);
+    } catch {
+      return false;
+    }
   };
+}
+
+/**
+ * Stops the turn when every tool call in the final step is terminal. Tools declaring
+ * `terminal: true` always qualify; predicate tools decide from the model-generated input, so a
+ * single tool can both end the turn and opt into another step. Invalid calls never qualify.
+ */
+// eslint-disable-next-line typescript/no-explicit-any
+function allToolCallsTerminal(tools: AgentToolSet): StopCondition<any> {
+  const isTerminal = createTerminalToolCallMatcher(tools);
+  const hasTerminalTools = tools.some((tool) => tool.terminal === true || typeof tool.terminal === "function");
+  return ({ steps }: { steps: Array<{ toolCalls: Array<{ toolName: string; input?: unknown; invalid?: boolean }> }> }) => {
+    if (!hasTerminalTools) return false;
+    const last = steps.at(-1);
+    if (!last) return false;
+    const calls = last.toolCalls;
+    if (calls.length === 0) return false;
+    return calls.every(isTerminal);
+  };
+}
+
+function resolveProtocolViolation(state: { sawNonEmptyText: boolean; sawIntermediateToolCall: boolean }): AgentProtocolViolation {
+  if (state.sawNonEmptyText) return "text-only";
+  if (state.sawIntermediateToolCall) return "non-terminal-tool";
+  return "empty-or-no-terminal-tool";
 }
 
 function mergeUsage(current: Partial<LanguageModelUsage> | undefined, next: LanguageModelUsage | undefined): Partial<LanguageModelUsage> | undefined {
@@ -605,6 +803,41 @@ function mergeUsage(current: Partial<LanguageModelUsage> | undefined, next: Lang
 
 function createAbortError(): DOMException {
   return new DOMException("Aborted", "AbortError");
+}
+
+function formatAbortReason(error: unknown, signal: AbortSignal): string {
+  const errorCause = formatErrorCause(error);
+  if (!signal.aborted || signal.reason === undefined) return errorCause;
+  return `${errorCause} (signal: ${formatErrorCause(signal.reason)})`;
+}
+
+function normalizeMaxRetries(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return 0;
+  return Math.min(MAX_MODEL_RETRIES, Math.max(0, Math.trunc(value)));
+}
+
+function prepareRetryModel(model: LanguageModel, maxRetries: number): { readonly model: LanguageModel; readonly maxRetries: number } {
+  if (maxRetries === 0 || !isLanguageModelV3(model)) return { model, maxRetries: 0 };
+  return { model: wrapLanguageModel({ model, middleware: RETRYABLE_429_ONLY_MIDDLEWARE }), maxRetries };
+}
+
+function isLanguageModelV3(model: LanguageModel): model is Parameters<typeof wrapLanguageModel>[0]["model"] {
+  return typeof model === "object" && model !== null && "specificationVersion" in model && model.specificationVersion === "v3";
+}
+
+function markNon429AsNonRetryable(cause: unknown): unknown {
+  if (!APICallError.isInstance(cause) || !cause.isRetryable || cause.statusCode === 429) return cause;
+  return new APICallError({
+    message: cause.message,
+    url: cause.url,
+    requestBodyValues: cause.requestBodyValues,
+    statusCode: cause.statusCode,
+    responseHeaders: cause.responseHeaders,
+    responseBody: cause.responseBody,
+    cause: cause.cause,
+    isRetryable: false,
+    data: cause.data,
+  });
 }
 
 function throwIfAborted(signal?: AbortSignal) {
