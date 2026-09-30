@@ -2,7 +2,7 @@ import { createCustomMessage, type AgentMessage, type CustomMessageBase } from "
 import type { UserModelMessage } from "ai";
 import { h, type Element, type Universal } from "koishi";
 
-const MARK = "\u0000";
+export const PARAGRAPH_BREAK = /\r?\n[^\S\r\n]*\r?\n(?:[^\S\r\n]*\r?\n)*/;
 
 export interface MessageQuote {
   readonly messageId: string;
@@ -225,7 +225,15 @@ export function parseReply(raw: string): Element[][] {
     flush();
     return segments;
   };
-  return split(h.parse(masked).flatMap(restore));
+  const parseSource = preserveParagraphBreaks
+    ? masked.replace(ELEMENT_OR_PARAGRAPH, (match, paragraph: string | undefined) => {
+        if (!paragraph) return match;
+        const placeholder = `${nonce}${captured.length}${MARK}`;
+        captured.push(paragraph);
+        return placeholder;
+      })
+    : masked;
+  return split(h.parse(parseSource).flatMap(restore));
 }
 
 function stripInnerThoughtRegions(source: string): string {
