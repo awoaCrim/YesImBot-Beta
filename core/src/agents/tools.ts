@@ -4,7 +4,7 @@ import { h, type Bot, type Element } from "koishi";
 
 import type { PacingConfig } from "../config.js";
 import type { CompartmentExpansionRecord, Conversation } from "../conversations/index.js";
-import { PARAGRAPH_BREAK, parseReply } from "../messages/index.js";
+import { parseReply } from "../messages/index.js";
 import { detectImageMediaType, prepareOutputSegments, ResourceReadError, type ChannelResources } from "../resources/index.js";
 import { buildPolisherTurnContext, validatePolishedMessages, type PolisherTurnContext } from "./polisher.js";
 
@@ -154,17 +154,8 @@ export function createSendMessageTool(options: SendMessageToolOptions): AgentToo
       };
       for (const [index, message] of messages.entries()) {
         try {
-          // Parse first so paragraph breaks cannot cut element syntax or expose stripped thoughts.
-          const parsed = mode === "raw" ? [[h.text(message)]] : parseReply(message, true);
-          const split = parsed.length > 1 || parsed.some(hasParagraphBreak);
-          const paragraphs = parsed.flatMap(splitMessageParagraphs);
-          const segments: { elements: Element[]; text: string }[] = [];
-          for (const paragraph of paragraphs) {
-            const text = split ? formatOutputParagraph(paragraph) : message;
-            const prepared = mode === "raw" ? [paragraph] : await prepareOutputSegments([paragraph], resources, execution.abortSignal);
-            for (const elements of prepared) segments.push({ elements, text });
-          }
-          for (const { elements: segment, text } of segments) {
+          const segments = mode === "raw" ? [[h.text(message)]] : await prepareOutputSegments(parseReply(message), resources, execution.abortSignal);
+          for (const segment of segments) {
             if (sent.length > 0) {
               const delay = pacedDelay(segment, pacing, elapsed);
               const startedAt = Date.now();
@@ -174,7 +165,7 @@ export function createSendMessageTool(options: SendMessageToolOptions): AgentToo
             if (execution.abortSignal?.aborted) return abort(index, { name: "AbortError", message: "send_message aborted" });
             const ids = await bot.sendMessage(target, segment);
             sent.push(...ids);
-            for (const id of ids) onDelivered?.({ channelId: target, messageId: id, turnId: execution.turnId, text });
+            for (const id of ids) onDelivered?.({ channelId: target, messageId: id, turnId: execution.turnId, text: message });
           }
         } catch (cause) {
           if (cause instanceof ResourceReadError) return abort(index, { name: cause.code, message: cause.message });
@@ -443,7 +434,6 @@ ${
     ? "只写清楚本轮要表达的事实、判断和交流动作，不自行添加事实或承诺；措辞风格由发送前的润色阶段处理，每条草稿独立改写，条数与顺序保持不变。"
     : `同一次调用中的 messages 属于同一个回应单元，保持一致的说话身份、语域和情绪力度。工具、搜索和图片结果只是材料；用当前 persona 自然表达。需要分条时按对话节奏处理，事实、指令、代码、链接和其他后果重大的内容保持在同一条消息内。`
 }
-不要用空行分段。平台不会把空行渲染成视觉分隔，它只是一个被吞掉的空白，让消息看起来格式奇怪。需要分开就分成多条。
 
 ${factsRequired ? "" : "尽量用文字和标点表达情绪；只有确实有助于语气时才使用 emoji。"}
 
@@ -531,67 +521,6 @@ async function polishedMessages(
   } catch {
     return input.messages;
   }
-}
-
-/** Paragraph splitting is a delivery fallback, not a rewrite of tool inputs or receipt indexes. */
-function splitMessageParagraphs(elements: readonly Element[]): Element[][] {
-  if (!hasParagraphBreak(elements)) return [[...elements]];
-  const segments: Element[][] = [];
-  let prefix: Element[] = [];
-  const hasContent = (element: Element): boolean => {
-    if (element.type === "text") return String(element.attrs.content ?? "").trim().length > 0;
-    if (element.type === "quote" || element.type === "at") return false;
-    return !element.children.length || element.children.some(hasContent);
-  };
-  for (const paragraph of splitParagraphElements(elements)) {
-    const current = [...prefix, ...paragraph];
-    if (current.some(hasContent)) {
-      segments.push(current);
-      prefix = [];
-    } else {
-      // Keep quote/mention-only prefixes with the following text instead of sending them alone.
-      prefix = current.filter((element) => element.type !== "text");
-    }
-  }
-  if (prefix.length) segments.push(prefix);
-  return segments;
-}
-
-/** Keep empty edge parts until recursion finishes so breaks can cross container boundaries. */
-function splitParagraphElements(elements: readonly Element[]): Element[][] {
-  const segments: Element[][] = [];
-  let current: Element[] = [];
-  for (const element of elements) {
-    const parts =
-      element.type === "text"
-        ? String(element.attrs.content ?? "")
-            .split(PARAGRAPH_BREAK)
-            .map((text) => (text.length ? [h.text(text)] : []))
-        : element.children.length
-          ? splitParagraphElements(element.children).map((children) =>
-              children.some((child) => child.type !== "text" || String(child.attrs.content ?? "").trim()) ? [h(element.type, element.attrs, children)] : [],
-            )
-          : [[element]];
-    for (const [index, part] of parts.entries()) {
-      if (index > 0) {
-        segments.push(current);
-        current = [];
-      }
-      current.push(...part);
-    }
-  }
-  segments.push(current);
-  return segments;
-}
-
-function hasParagraphBreak(elements: readonly Element[]): boolean {
-  return elements.some((element) =>
-    element.type === "text" ? PARAGRAPH_BREAK.test(String(element.attrs.content ?? "")) : hasParagraphBreak(element.children),
-  );
-}
-
-function formatOutputParagraph(elements: readonly Element[]): string {
-  return elements.map((element) => (element.type === "text" ? String(element.attrs.content ?? "") : String(element))).join("");
 }
 
 function pacedDelay(segment: readonly Element[], pacing: PacingConfig, elapsed: number): number {
