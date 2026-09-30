@@ -1,10 +1,10 @@
 # 自动接入 Koishi
 
-`scripts/setup-koishi.mjs` 是 YesImBot dev 分支提供的跨平台安装脚本。它负责把 yesimbot 这个 monorepo 自动接入一个 Koishi 应用，包括检查运行环境、安装依赖、构建插件和生成 Koishi 配置。
+`scripts/setup-koishi.mjs` 是 YesImBot main 分支提供的跨平台安装脚本。它负责把 yesimbot 这个 monorepo 自动接入一个 Koishi 应用，包括检查运行环境、安装依赖、构建插件和生成 Koishi 配置。
 
 ## 适用场景
 
-- 从零创建一个 Koishi 应用并接入 yesimbot dev。
+- 从零创建一个 Koishi 应用并接入 yesimbot main。
 - 把已有的 Koishi 应用切换到本地 yesimbot workspace。
 - 检查当前 Koishi 应用是否已经正确配置 yesimbot。
 
@@ -13,7 +13,7 @@
 - Node.js 18 或更高版本（脚本会自动检查）
 - Git（仅使用 `--pull` 时必须安装；本地 setup 不强制）
 - Yarn 4（脚本检测到缺失或版本不符时，会尝试通过 Corepack 自动启用）
-- 默认使用当前本地 yesimbot 源码，不自动拉取；需要同步远端 dev 时加 `--pull`
+- 默认使用当前本地 yesimbot 源码，不自动拉取；需要同步远端 main 时加 `--pull`
 - 首次运行需要联网，因为要下载 create-koishi 和 npm 依赖
 
 ## 从零安装
@@ -28,7 +28,7 @@ node scripts/setup-koishi.mjs --create-app ../my-koishi
 
 1. 使用官方 `create-koishi@latest` 在 `../my-koishi` 创建新 Koishi 应用；如果目录已存在且是有效 Koishi 应用，则直接复用。
 2. 自动检查 Node.js、Git 和 Yarn；Yarn 缺失时尝试通过 Corepack 自动启用。
-3. 默认直接使用当前本地 yesimbot 源码；传入 `--pull` 时先同步到远端 `dev` 分支。
+3. 默认直接使用当前本地 yesimbot 源码；传入 `--pull` 时先同步到远端 `main` 分支。
 4. 把 Koishi 应用路径写入 yesimbot 的本地状态文件 `.koishi-app-path`。
 5. 自动在 yesimbot 仓库内执行 `yarn install`，生成 `yarn.lock` 并安装依赖；`node_modules` 和 `yarn.lock` 已存在时跳过。
 6. 扫描 yesimbot 内的所有 Koishi 插件包。
@@ -131,7 +131,7 @@ node scripts/setup-koishi.mjs --app ../koishi-app
 | `--app <dir>` | 指定已有 Koishi 应用目录 |
 | `--create-app <dir>` | 创建新的 Koishi 应用；目录已存在且是有效 Koishi 应用时直接复用 |
 | `--check` | 只检查当前配置，不修改文件；仍会检查 Node/Git/Yarn |
-| `--pull` | 先 fetch 并 fast-forward 到远端 `dev`；此时要求 yesimbot 仓库无未提交修改 |
+| `--pull` | 先 fetch 并 fast-forward 到远端 `main`；此时要求 yesimbot 仓库无未提交修改 |
 | `--start` | 完成配置和构建后执行 `yarn dev` |
 | `--repo <url>` | 指定 yesimbot git 地址；仅在没有 origin 时使用 |
 | `--help` | 显示帮助 |
@@ -150,7 +150,7 @@ node scripts/setup-koishi.mjs
 # 接入已有应用
 node scripts/setup-koishi.mjs --app ../koishi-app
 
-# 先同步远端 dev 再接入
+# 先同步远端 main 再接入
 node scripts/setup-koishi.mjs --app ../koishi-app --pull
 
 # 创建新应用并直接启动
@@ -170,7 +170,6 @@ plugins:
     ~@yesimbot/provider-deepseek: {}
     ~@yesimbot/provider-google: {}
     ~yesimbot-mcp-client: {}
-    ~yesimbot-memos-client: {}
     ~yesimbot-onebot-utils: {}
     ~yesimbot-schedule: {}
     ~yesimbot-search-service: {}
@@ -192,6 +191,14 @@ plugins:
 2. 启用 `@yesimbot/koishi-plugin-provider-openai` 或其它 provider。
 3. 填写 API Key 和模型列表。
 4. 给 `yesimbot.chatModel` 选择一个模型。
+
+## 会话压缩片段
+
+在 Koishi 控制台的 `yesimbot.session.compact.inlineFragments` 中可设置请求上下文常驻的最近压缩片段数，默认是 `3`，必须为正整数。旧片段仍保存在会话 JSONL 中作为权威历史，并由 Core 的数据库表 `yesimbot_compact_fragment` 建立可重建的溢出索引；出现相关关键词时，Core 最多召回 3 段只读历史资料。
+
+召回严格限制在同一频道、所选会话 compact 锚点的祖先链及其来源时间边界内，不跨频道或切回旧会话后看到后续分支，也不会把召回资料写回 JSONL 或送进下一次压缩。首版使用轻量词项重合，不依赖 `yesimbot-memorizer`、embedding 或额外模型请求，因此改述或同义词可能无法命中。清空频道会先完成 JSONL 索引修复，再删除对应的片段索引；若数据库删除失败，清空会失败并保留原会话数据。
+
+自动压缩触发仍使用 provider 报告的输入 token 数超过 `100,000`；该配置只控制常驻片段数量，不改变触发策略。`yesimbot.session.compact.model` 仍可选择独立压缩模型。
 
 ## 安全行为
 

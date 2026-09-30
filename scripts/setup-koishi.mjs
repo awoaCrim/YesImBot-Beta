@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_REPO = "https://github.com/YesWeAreBot/YesImBot.git";
-const BRANCH = "dev";
+const BRANCH = "main";
 const GROUP = "group:yesimbot";
 const MIN_NODE_MAJOR = 18;
 const MIN_YARN_MAJOR = 4;
@@ -330,7 +330,7 @@ function createKoishiApp(directory) {
   }
 }
 
-function ensureDevBranch() {
+function ensureMainBranch() {
   const dirty = run("git", ["-C", yesimbotRoot, "status", "--porcelain"], { quiet: true });
   if (dirty.errorMessage || dirty.stdout.trim()) {
     fail(`${yesimbotRoot} has uncommitted changes; commit or stash them before using --pull`);
@@ -622,7 +622,7 @@ function main() {
         "  --app <dir>      target Koishi app directory (auto-detected when omitted)",
         "  --create-app <dir> create a Koishi app (reuses an existing valid app)",
         "  --check          verify the current setup without changing files",
-        "  --pull           fetch and fast-forward yesimbot to origin/dev first",
+        "  --pull           fetch and fast-forward yesimbot to origin/main first",
         "  --no-pull        use the local yesimbot repository without syncing",
         "  --start          run `yarn start` after setup",
         "  --repo <url>     git URL used when no origin remote exists",
@@ -632,7 +632,7 @@ function main() {
   }
 
   if (parsed.pull) {
-    ensureDevBranch();
+    ensureMainBranch();
   } else if (!parsed.noPull) {
     syncRepository();
   } else {
