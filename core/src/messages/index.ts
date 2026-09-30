@@ -4,6 +4,9 @@ import { h, type Element, type Universal } from "koishi";
 
 export const PARAGRAPH_BREAK = /\r?\n[^\S\r\n]*\r?\n(?:[^\S\r\n]*\r?\n)*/;
 
+const MARK = "\u0000";
+const ELEMENT_OR_PARAGRAPH = new RegExp(String.raw`<!--[\s\S]*?-->|<\/?[a-z][a-z0-9-]*(?:[^\"'<>]|\"[^\"]*\"|'[^']*')*>|(${PARAGRAPH_BREAK.source})`, "gi");
+
 export interface MessageQuote {
   readonly messageId: string;
   readonly elements: readonly Element[];
@@ -167,9 +170,10 @@ function formatQuote(quote: MessageQuote): string {
 /**
  * Parses model-authored message content into deliverable segments: `<text>` blocks are kept
  * verbatim, `<inner_thought>` regions are stripped, and `<message/>` splits the result into one
- * segment per outgoing message.
+ * segment per outgoing message. Optionally preserve paragraph breaks that element parsing would
+ * otherwise trim around tags; the sender owns whether to split those text boundaries.
  */
-export function parseReply(raw: string): Element[][] {
+export function parseReply(raw: string, preserveParagraphBreaks = false): Element[][] {
   const source = stripInnerThoughtRegions(raw.replaceAll(MARK, ""));
   const nonce = `${MARK}t${Math.random().toString(36).slice(2)}`;
   const captured: string[] = [];

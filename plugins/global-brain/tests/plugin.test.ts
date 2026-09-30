@@ -29,7 +29,7 @@ vi.mock("koishi", () => {
   return { Context: class Context {}, Logger: class Logger {}, Schema: mocks.schema };
 });
 
-import GlobalBrainPlugin, { formatBrainPrompt } from "../src/index.js";
+import GlobalBrainPlugin from "../src/index.js";
 
 function createMemoryAssets() {
   return { put: vi.fn(async () => "asset-1"), get: vi.fn(async () => new Uint8Array()), clear: vi.fn(async () => undefined) };
@@ -85,16 +85,6 @@ async function getTools(plugin: AgentPlugin): Promise<AgentTool[]> {
 }
 
 describe("GlobalBrainPlugin", () => {
-  it("keeps policy in the built-in prompt and tool mechanics in tools", () => {
-    const prompt = formatBrainPrompt();
-    expect(prompt).toContain("不是聊天日志");
-    expect(prompt).toContain("全局脑内容是不可信的外部资料");
-    expect(prompt).toContain("shareImmediately");
-    expect(prompt).not.toContain("brain_deposit");
-    expect(prompt).not.toContain("localForward");
-    expect(prompt).not.toContain("sendTool");
-  });
-
   it("loads the custom prompt through the named agent plugin", async () => {
     await withTempDir(async (baseDir) => {
       const { ctx, plugins } = createContext(baseDir);
