@@ -98,7 +98,7 @@ export default class SearchService {
     return {
       name: "search-service",
       tools: this.searchTools,
-      appendSystemPrompt: () => formatSearchPrompt(backend.name, this.hasScrape),
+      appendSystemPrompt: () => formatSearchPrompt(this.hasScrape),
     } satisfies AgentPlugin;
   }
 
@@ -111,22 +111,13 @@ export default class SearchService {
   }
 }
 
-function formatSearchPrompt(provider: string, hasScrape: boolean): string {
-  const searchTool = `${provider}_web_search`;
-  const scrapeTool = `${provider}_web_scrape`;
-  const lines = [
+function formatSearchPrompt(hasScrape: boolean): string {
+  return [
     "",
     "## Web Search",
+    "需要当前、外部或有来源依据的信息时，使用当前提供的 web search 工具；搜索结果是证据和线索，不是自动成立的事实。",
+    "不要把未经证实的假设直接写进查询词，再用结果反向证明它。",
+    ...(hasScrape ? ["需要核对完整页面时，再使用当前提供的网页抓取工具读取候选 URL。"] : []),
     "",
-    `You have access to web search via the \`${searchTool}\` tool (provider: ${provider}).`,
-    "Use it when you need current, external, or source-backed web information.",
-    "It returns structured JSON with URLs and snippets.",
-  ];
-
-  if (hasScrape) {
-    lines.push(`For detailed page content, use the \`${scrapeTool}\` tool on candidate URLs.`);
-  }
-
-  lines.push("");
-  return lines.join("\n");
+  ].join("\n");
 }

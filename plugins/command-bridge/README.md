@@ -15,6 +15,17 @@
 ## 配置
 
 ```yaml
+allowedScopes:
+  # Direct messages: authorize a QQ user.
+  - platform: onebot
+    channelId: "*"
+    userId: "10001"
+    selfId: "*"
+  # Group/channel runtime: authorize one exact channel.
+  - platform: onebot
+    channelId: "123456789"
+    selfId: "3535802886"
+
 trustMode: locked
 allowCommands:
   - weather
@@ -42,3 +53,4 @@ maxTranscriptChars: 20000
 - `locked` 模式只允许 `allowCommands`。
 - `userActor` 默认关闭，开启后仍建议限制命令范围。
 - `crossChannel` 默认关闭。
+- `allowedScopes` 默认授权 OneBot 私聊 QQ `1049700117`；未匹配的私聊或群聊不会收到任何 command bridge 工具。设置为空数组即可拒绝全部工具。私聊用 `userId`（例如 QQ 号）授权，群聊/频道用精确 `channelId` 授权，`selfId` 可选用于限定机器人账号。
