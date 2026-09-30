@@ -48,13 +48,26 @@ jobs:
           node .yarn/releases/yarn-4.12.0.cjs test
           python3 -m compileall -q scripts
           python3 -m unittest discover -s scripts/tests -v
-      - name: Pack the trusted build once
+      - name: Pack the trusted build once for Alpine runtime
         if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
         env:
           SOURCE_SHA: ${{ github.sha }}
           RUN_ID: ${{ github.run_id }}
           REPOSITORY: ${{ github.repository }}
-        run: python3 scripts/release.py pack --source-sha "$SOURCE_SHA" --run-id "$RUN_ID" --repository "$REPOSITORY"
+        run: |
+          docker run --rm \
+            --network bridge \
+            --tmpfs /tmp:rw,nosuid,nodev,size=2g \
+            --volume "$GITHUB_WORKSPACE:/workspace:rw" \
+            --workdir /workspace \
+            --env SOURCE_SHA \
+            --env RUN_ID \
+            --env REPOSITORY \
+            --env HUSKY=0 \
+            --env HOME=/tmp/home \
+            --entrypoint sh \
+            node:24.14.0-alpine3.23@sha256:7fddd9ddeae8196abf4a3ef2de34e11f7b1a722119f91f28ddf1e99dcafdf114 \
+            -ec '\n              set -eu\n              apk add --no-cache python3 make g++ git libc6-compat\n              HUSKY=0 node .yarn/releases/yarn-4.12.0.cjs install --immutable\n              python3 scripts/release.py pack --source-sha "$SOURCE_SHA" --run-id "$RUN_ID" --repository "$REPOSITORY"\n            '
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
         with:
