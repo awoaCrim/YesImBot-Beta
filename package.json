@@ -28,6 +28,11 @@
     "lint:fix": "oxlint --fix .",
     "prepare": "husky",
     "pub": "turbo run pub",
+    "release:deploy": "python scripts/release.py deploy",
+    "release:pack": "python scripts/release.py pack",
+    "release:status": "python scripts/release.py status",
+    "release:test": "python -m unittest discover -s scripts/tests",
+    "release:verify": "python scripts/release.py verify",
     "setup-koishi": "node scripts/setup-koishi.mjs",
     "setup-koishi:check": "node scripts/setup-koishi.mjs --check",
     "test": "turbo run test"
