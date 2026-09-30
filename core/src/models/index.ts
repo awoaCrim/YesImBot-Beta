@@ -31,13 +31,30 @@ export type ModelUsageEvent =
       readonly timestamp: number;
     };
 
+export type AuxiliaryPurpose = "memory-summary" | "notification" | "utility";
+
+export type AuxiliaryModelErrorCode = "missing-config" | "invalid-config" | "unresolvable-model" | "provider-unavailable" | "request-failed";
+
+export type ImageToolResultSupport = "native" | "unsupported" | "unknown";
+
+export interface ChatModelCapabilities {
+  readonly imageToolResult: ImageToolResultSupport;
+}
+
 export interface ChatModelRef {
   fullId: ModelId;
   providerId: string;
   modelId: string;
   entry: ChatModelConfig;
   model: LanguageModel;
+  capabilities: ChatModelCapabilities;
   tools?: ToolSet;
+}
+
+export interface AuxiliaryModelRef extends ChatModelRef {
+  readonly route: "auxiliary";
+  readonly purpose: AuxiliaryPurpose;
+  readonly source: "config.auxiliaryModel";
 }
 
 interface Provider {
@@ -47,6 +64,7 @@ interface Provider {
   embeddingModels(): EmbeddingModelConfig[];
   chat?(modelId: string): LanguageModel;
   embedding?(modelId: string): EmbeddingModel;
+  chatCapabilities?(modelId: string): Partial<ChatModelCapabilities> | undefined;
   tools?(modelId: string): ToolSet;
 }
 
@@ -67,6 +85,21 @@ interface EmbeddingModelRecord {
 declare module "koishi" {
   interface Events {
     "yesimbot/model-usage"(event: ModelUsageEvent): void;
+    "yesimbot/model-registry-changed"(revision: number): void;
+  }
+}
+
+export class AuxiliaryModelError extends Error {
+  public readonly route = "auxiliary" as const;
+
+  public constructor(
+    public readonly code: AuxiliaryModelErrorCode,
+    public readonly purpose: AuxiliaryPurpose,
+    public readonly source: "config.auxiliaryModel",
+    public readonly modelId?: string,
+  ) {
+    super(`Auxiliary model unavailable (${code}) for ${purpose}.`);
+    this.name = "AuxiliaryModelError";
   }
 }
 
@@ -82,6 +115,7 @@ export class ModelService {
   private defaults: { chat?: ModelId; embedding?: ModelId } = {};
   private readonly logger: Logger;
   private readonly middlewares = new Set<LanguageModelMiddleware>();
+  private revisionValue = 0;
 
   constructor(ctx: Context, config: ModelServiceConfig) {
     this.ctx = ctx;
@@ -91,6 +125,10 @@ export class ModelService {
 
     this.ctx.on("ready", this.start.bind(this));
     this.ctx.on("dispose", this.stop.bind(this));
+  }
+
+  public get revision(): number {
+    return this.revisionValue;
   }
 
   public register(provider: Provider): () => void {
@@ -114,7 +152,10 @@ export class ModelService {
 
   public middleware(middleware: LanguageModelMiddleware): () => void {
     this.middlewares.add(middleware);
-    return () => this.middlewares.delete(middleware);
+    this.bumpRevision();
+    return () => {
+      if (this.middlewares.delete(middleware)) this.bumpRevision();
+    };
   }
 
   public resolveChatModel(fullId: string, context?: ChannelContext): ChatModelRef {
@@ -154,14 +195,65 @@ export class ModelService {
         )
       : source;
     const tools = provider.tools?.(record.modelId);
+    const declaredCapabilities = provider.chatCapabilities?.(record.modelId);
+    const capabilities: ChatModelCapabilities = {
+      imageToolResult:
+        declaredCapabilities?.imageToolResult === "native" || declaredCapabilities?.imageToolResult === "unsupported"
+          ? declaredCapabilities.imageToolResult
+          : "unknown",
+    };
     return {
       fullId: record.fullId,
       providerId: record.providerId,
       modelId: record.modelId,
       entry: cloneChatModelConfig(record.config),
       model,
+      capabilities,
       tools: tools && { ...tools },
     };
+  }
+
+  public resolveAuxiliaryModel(purpose: AuxiliaryPurpose, context?: ChannelContext): AuxiliaryModelRef {
+    const source = "config.auxiliaryModel" as const;
+    const configured = this.config.auxiliaryModel;
+    if (typeof configured !== "string" || configured.trim().length === 0) {
+      const error = new AuxiliaryModelError("missing-config", purpose, source);
+      this.logAuxiliaryFailure(error);
+      throw error;
+    }
+
+    const fullId = configured.trim();
+    const parsed = parseModelId(fullId);
+    if (!parsed || parsed.model.trim().length === 0) {
+      const error = new AuxiliaryModelError("invalid-config", purpose, source, fullId);
+      this.logAuxiliaryFailure(error);
+      throw error;
+    }
+
+    if (!this.providers.has(parsed.provider)) {
+      const error = new AuxiliaryModelError("provider-unavailable", purpose, source, fullId);
+      this.logAuxiliaryFailure(error);
+      throw error;
+    }
+
+    let resolved: ChatModelRef;
+    try {
+      resolved = this.resolveChatModel(fullId, context);
+    } catch {
+      const error = new AuxiliaryModelError("unresolvable-model", purpose, source, fullId);
+      this.logAuxiliaryFailure(error);
+      throw error;
+    }
+
+    this.logger.debug("model.resolve_auxiliary", {
+      route: "auxiliary",
+      purpose,
+      source,
+      fullId: resolved.fullId,
+      provider: resolved.providerId,
+      model: resolved.modelId,
+    });
+    return { ...resolved, route: "auxiliary", purpose, source };
   }
 
   public resolveEmbedding(fullId: string, context?: ChannelContext): EmbeddingModel {
@@ -214,6 +306,16 @@ export class ModelService {
     return [...this.embeddingModels.values()].map((record) => ({ fullId: record.fullId, config: cloneEmbeddingModelConfig(record.config) }));
   }
 
+  private logAuxiliaryFailure(error: AuxiliaryModelError): void {
+    this.logger.warn("model.auxiliary_unavailable", {
+      route: error.route,
+      purpose: error.purpose,
+      source: error.source,
+      code: error.code,
+      model: error.modelId,
+    });
+  }
+
   private getModelsConfigPath(): string {
     return join(resolve(this.ctx.baseDir, this.config.basePath || this.ctx.baseDir), "models.json");
   }
@@ -253,7 +355,13 @@ export class ModelService {
     this.ctx.schema.set("registry.embeddingModels", Schema.union(embeddingOptions).default(""));
   }
 
+  private bumpRevision(): void {
+    this.revisionValue += 1;
+    this.ctx.emit("yesimbot/model-registry-changed", this.revisionValue);
+  }
+
   private refreshModels(): void {
+    this.bumpRevision();
     this.chatModels.clear();
     this.embeddingModels.clear();
     this.aliases.clear();

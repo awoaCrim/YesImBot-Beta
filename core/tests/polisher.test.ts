@@ -1,0 +1,269 @@
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("koishi", async () => import("@koishijs/core"));
+
+import {
+  createSendMessagePolisher,
+  extractProtectedTokens,
+  PolisherRegistry,
+  validatePolishedMessages,
+  type MessagePolisherCapability,
+} from "../src/agents/polisher.js";
+import { createSendMessageTool, type SendMessageToolOptions } from "../src/agents/tools.js";
+import type { ChannelContext } from "../src/channels/index.js";
+
+const context: ChannelContext = { type: "guild", platform: "test", channelId: "room", guildId: "room" };
+
+function execution() {
+  return { toolCallId: "call", turnId: "turn", abortSignal: undefined } as never;
+}
+
+function createTool(extra: { sendMessage?: ReturnType<typeof vi.fn>; polish?: SendMessageToolOptions["polish"] } = {}) {
+  const sendMessage = extra.sendMessage ?? vi.fn(async () => ["m1"]);
+  const tool = createSendMessageTool({
+    bot: { platform: "test", sendMessage } as never,
+    channelId: "room",
+    resources: {} as never,
+    pacing: { charactersPerSecond: 1000, maxTotalDelayMs: 60_000 },
+    innerThought: false,
+    ...(extra.polish ? { factsRequired: true, polish: extra.polish } : {}),
+  });
+  return { tool, sendMessage };
+}
+
+function sentPayload(sendMessage: ReturnType<typeof vi.fn>, index = 0): string {
+  return JSON.stringify(sendMessage.mock.calls[index]?.[1]);
+}
+
+function createPolishHook(polish: MessagePolisherCapability["polish"]) {
+  const registry = new PolisherRegistry();
+  registry.use({ name: "test", polish });
+  return createSendMessagePolisher({ registry, resolveProfile: async () => ({ persona: "p" }), context });
+}
+
+describe("extractProtectedTokens", () => {
+  it("extracts numeric expressions, element tags, resource URIs, and at mentions", () => {
+    expect(extractProtectedTokens('看 -12.5%、+3/4 和 asset://abc123<img src="asset://up"/> <at id="7"/> @bob @bob.example @猫-龙')).toEqual([
+      "-12.5%",
+      "+3/4",
+      "asset://abc123",
+      '<img src="asset://up"/>',
+      '<at id="7"/>',
+      "@bob",
+      "@bob.example",
+      "@猫-龙",
+    ]);
+  });
+});
+
+describe("validatePolishedMessages", () => {
+  it("accepts a same-length rewrite that preserves protected tokens", () => {
+    expect(validatePolishedMessages(['<at id="123"/> 你好，asset://abc123'], ['<at id="123"/> 你好呀，asset://abc123'])).toEqual([
+      '<at id="123"/> 你好呀，asset://abc123',
+    ]);
+  });
+
+  it("preserves unchanged tokens in each message, including repeated numbers, tags and URIs", () => {
+    const draft = ['@a <at id="7"/> asset://abc 12 12', "@b artifact://tool/xyz"];
+    expect(validatePolishedMessages(draft, [...draft])).toEqual(draft);
+  });
+
+  const protectedCases: Array<[string[], unknown]> = [
+    [["原稿 123"], ["原稿 456"]],
+    [["余额 -12 元"], ["余额 12 元"]],
+    [["价格 1.2 元"], ["价格 1,2 元"]],
+    [["进度 100%"], ["进度 100"]],
+    [["比例 1/2"], ["比例 1,2"]],
+    [['<at id="123"/> 原稿'], ['<at id="999"/> 原稿']],
+    [["asset://abc123 原稿"], ["asset://def456 原稿"]],
+    [["原稿 123"], ["原稿"]],
+    [["@a @b"], ["@b @a"]],
+    [["@bob.example"], ["@bob.other"]],
+    [["12 和 34"], ["34 和 12"]],
+    [["asset://abc 与 artifact://tool/xyz"], ["artifact://tool/xyz 与 asset://abc"]],
+    [['<at id="7"/> @a'], ['@a <at id="7"/>']],
+    [["@a @a"], ["@a @b"]],
+    [["asset://abc asset://abc"], ["asset://abc asset://def"]],
+    [["原稿"], ["原稿", "多余"]],
+    [["原稿"], [""]],
+    [["原稿"], ["   "]],
+    [["原稿"], [42]],
+    [["原稿"], "原稿"],
+  ];
+
+  it.each(protectedCases)("rejects a rewrite that changes protected tokens or shape (%j)", (original, candidate) => {
+    expect(validatePolishedMessages(original, candidate)).toBeUndefined();
+  });
+
+  it("rejects an empty draft", () => {
+    expect(validatePolishedMessages([], [])).toBeUndefined();
+  });
+});
+
+describe("PolisherRegistry", () => {
+  it("activates on registration and tracks disposal independently of the auxiliary route", async () => {
+    const registry = new PolisherRegistry();
+    const unavailable = { name: "unavailable", polish: vi.fn(async () => undefined) };
+    const available = { name: "available", polish: vi.fn(async () => ["polished"]) };
+
+    expect(registry.revision).toBe(0);
+    const disposeUnavailable = registry.use(unavailable);
+    const disposeAvailable = registry.use(available);
+    expect(registry.revision).toBe(2);
+
+    expect(registry.resolve()).toBe(unavailable);
+    disposeUnavailable();
+    expect(registry.resolve()).toBe(available);
+    disposeAvailable();
+    expect(registry.resolve()).toBeUndefined();
+    expect(registry.revision).toBe(4);
+  });
+
+  it("uses only a non-empty role profile and swallows provider failures", async () => {
+    const registry = new PolisherRegistry();
+    const empty = { name: "empty", resolve: () => undefined };
+    const broken = {
+      name: "broken",
+      resolve: () => {
+        throw new Error("boom");
+      },
+    };
+    const real = { name: "real", resolve: () => ({ roleInstructions: "stay in character" }) };
+    registry.profile(empty);
+    registry.profile(broken);
+    registry.profile(real);
+
+    await expect(registry.resolveProfile(context)).resolves.toEqual({ roleInstructions: "stay in character" });
+  });
+});
+
+describe("createSendMessageTool polisher integration", () => {
+  it("keeps the baseline schema and sends the draft unchanged without a polish hook", async () => {
+    const { tool, sendMessage } = createTool();
+    expect((tool.inputSchema as { jsonSchema: { required?: string[] } }).jsonSchema.required).toEqual(["messages"]);
+
+    await tool.execute({ messages: ["原稿"], mode: "raw" }, execution());
+
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sentPayload(sendMessage)).toContain("原稿");
+  });
+
+  it("requires facts and replaces only messages with the validated polish", async () => {
+    const polish = vi.fn(async () => ["润色后的稿子"]);
+    const { tool, sendMessage } = createTool({ polish: createPolishHook(polish) });
+    expect((tool.inputSchema as { jsonSchema: { required?: string[] } }).jsonSchema.required).toEqual(["facts", "messages"]);
+
+    const result = await tool.execute({ facts: ["可确认的事实"], messages: ["原稿"], channel: "other", mode: "raw", continue: false }, execution());
+
+    expect(result).toMatchObject({ ok: true });
+    expect(polish).toHaveBeenCalledWith(expect.objectContaining({ facts: ["可确认的事实"], messages: ["原稿"] }), context, undefined);
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessage.mock.calls[0]?.[0]).toBe("other");
+    expect(sentPayload(sendMessage)).toContain("润色后的稿子");
+    expect(sentPayload(sendMessage)).not.toContain("原稿");
+  });
+
+  it("preserves the sender's partial-failure receipt after polishing without retrying delivery", async () => {
+    const sendMessage = vi.fn().mockResolvedValueOnce(["m1"]).mockRejectedValueOnce(new Error("offline"));
+    const { tool } = createTool({ sendMessage, polish: async () => ["润色一", "润色二"] });
+
+    await expect(tool.execute({ facts: ["f"], messages: ["草稿一", "草稿二"], mode: "raw" }, execution())).resolves.toEqual({
+      ok: false,
+      error: { name: "Error", message: "offline" },
+      sent: ["m1"],
+      failedAt: 1,
+    });
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(sentPayload(sendMessage, 0)).toContain("润色一");
+    expect(sentPayload(sendMessage, 1)).toContain("润色二");
+  });
+
+  it("falls back to the original draft when the polish changes protected tokens", async () => {
+    const polish = vi.fn(async () => ["换了说法 999"]);
+    const { tool, sendMessage } = createTool({ polish: createPolishHook(polish) });
+
+    await tool.execute({ facts: ["f"], messages: ["原稿 123"], mode: "raw" }, execution());
+
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sentPayload(sendMessage)).toContain("原稿 123");
+    expect(sentPayload(sendMessage)).not.toContain("999");
+  });
+
+  it.each([
+    ["changes protected token order", ["@b @a"]],
+    ["returns the wrong number of messages", ["@a @b", "extra"]],
+    ["returns an empty message", [""]],
+  ])("rejects a raw polish callback that %s at the send boundary", async (_reason, result) => {
+    const { tool, sendMessage } = createTool({ polish: async () => result });
+    await tool.execute({ facts: ["f"], messages: ["@a @b"], mode: "raw" }, execution());
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sentPayload(sendMessage)).toContain("@a @b");
+  });
+
+  it("does not call a polisher after its capability is unregistered", async () => {
+    const registry = new PolisherRegistry();
+    const capability = { name: "test", polish: vi.fn(async () => ["不要发送"] as const) };
+    const dispose = registry.use(capability);
+    const polish = createSendMessagePolisher({ registry, resolveProfile: async () => ({ persona: "p" }), context });
+    const { tool, sendMessage } = createTool({ polish });
+
+    dispose();
+    await tool.execute({ facts: ["f"], messages: ["原稿"], mode: "raw" }, execution());
+
+    expect(capability.polish).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sentPayload(sendMessage)).toContain("原稿");
+    expect(sentPayload(sendMessage)).not.toContain("不要发送");
+  });
+
+  it("falls back if the capability is unregistered during polishing", async () => {
+    const registry = new PolisherRegistry();
+    let dispose!: () => void;
+    const capability = {
+      name: "test",
+      polish: vi.fn(async () => {
+        dispose();
+        return ["不要发送"];
+      }),
+    };
+    dispose = registry.use(capability);
+    const polish = createSendMessagePolisher({ registry, resolveProfile: async () => ({ persona: "p" }), context });
+    const { tool, sendMessage } = createTool({ polish });
+
+    await tool.execute({ facts: ["f"], messages: ["原稿"], mode: "raw" }, execution());
+
+    expect(capability.polish).toHaveBeenCalledOnce();
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sentPayload(sendMessage)).toContain("原稿");
+    expect(sentPayload(sendMessage)).not.toContain("不要发送");
+  });
+
+  it("resolves the live persona profile for each polishing call", async () => {
+    const registry = new PolisherRegistry();
+    const capability: MessagePolisherCapability = {
+      name: "test",
+      polish: vi.fn(async ({ profile }) => [profile.persona]),
+    };
+    registry.use(capability);
+    let version = 0;
+    const resolveProfile = vi.fn(async () => ({ persona: `persona-${++version}` }));
+    const polish = createSendMessagePolisher({ registry, resolveProfile, context });
+
+    await expect(polish({ facts: ["f"], messages: ["draft"] })).resolves.toEqual(["persona-1"]);
+    await expect(polish({ facts: ["f"], messages: ["draft"] })).resolves.toEqual(["persona-2"]);
+    expect(resolveProfile).toHaveBeenCalledTimes(2);
+    expect(capability.polish).toHaveBeenNthCalledWith(1, { facts: ["f"], messages: ["draft"], profile: { persona: "persona-1" } }, context, undefined);
+  });
+
+  it("falls back to the original draft when the polisher throws", async () => {
+    const { tool, sendMessage } = createTool({
+      polish: async () => {
+        throw new Error("polisher down");
+      },
+    });
+
+    await expect(tool.execute({ facts: ["f"], messages: ["原稿"], mode: "raw" }, execution())).resolves.toMatchObject({ ok: true });
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sentPayload(sendMessage)).toContain("原稿");
+  });
+});

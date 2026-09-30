@@ -3,11 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Context } from "@koishijs/core";
+import { createEntry } from "@yesimbot/agent-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("koishi", async () => import("@koishijs/core"));
 
 import { Channels } from "../src/channels/index.js";
+import { COMPACT_FRAGMENT_TABLE } from "../src/conversations/fragment-store.js";
 
 const roots: string[] = [];
 
@@ -168,6 +170,85 @@ describe("Channels", () => {
       userId: "user123",
       createdAt: "2026-08-01T00:00:00.000Z",
     });
+  });
+
+  it("does not recreate overflow rows while resetting a cold channel", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-channels-reset-cold-fragments-"));
+    roots.push(root);
+    const context = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as const;
+    const channelRoot = join(root, "channels", "guild-test-room");
+    const sessionsPath = join(channelRoot, "sessions");
+    await mkdir(sessionsPath, { recursive: true });
+    await writeFile(join(channelRoot, "channel.json"), `${JSON.stringify({ ...context, createdAt: "2026-09-24T00:00:00.000Z" })}\n`);
+    const first = createEntry(
+      "compact",
+      { summary: "old fragment", lastEntryId: "source-1", lineageId: "lineage-a", endAt: 100 },
+      { id: "compact-1", timestamp: 101 },
+    );
+    const second = createEntry(
+      "compact",
+      { summary: "new fragment", lastEntryId: "source-2", lineageId: "lineage-a", endAt: 200, parentCompactId: "compact-1" },
+      { id: "compact-2", timestamp: 201 },
+    );
+    const sessionFile = join(sessionsPath, "20260924T120000Z.jsonl");
+    await writeFile(sessionFile, `${JSON.stringify(first)}\n${JSON.stringify(second)}\n`);
+
+    const rows = new Map<string, Record<string, unknown>>();
+    const model = {
+      extend: vi.fn(),
+      get: vi.fn(async (_table: string, query: Record<string, unknown>, fields?: string[]) => {
+        const matches = [...rows.values()].filter((row) => Object.entries(query).every(([key, value]) => row[key] === value));
+        return fields ? matches.map((row) => Object.fromEntries(fields.map((field) => [field, row[field]]))) : matches;
+      }),
+      set: vi.fn(async (_table: string, query: Record<string, unknown>, values: Record<string, unknown>) => {
+        for (const [id, row] of rows) if (Object.entries(query).every(([key, value]) => row[key] === value)) rows.set(id, { ...row, ...values });
+      }),
+      create: vi.fn(async (_table: string, row: Record<string, unknown>) => {
+        rows.set(String(row.id), row);
+        return row;
+      }),
+      remove: vi.fn(async (_table: string, query: Record<string, unknown>) => {
+        for (const [id, row] of rows) if (Object.entries(query).every(([key, value]) => row[key] === value)) rows.delete(id);
+      }),
+    };
+    const logger = { level: 2, debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const channels = new Channels({ database: {}, model, logger: () => logger } as never, {
+      basePath: root,
+      compactConfig: { minMessages: 1, maxFailures: 3, inlineFragments: 1 },
+    });
+
+    await channels.reset(context);
+
+    expect(model.create).toHaveBeenCalledOnce();
+    expect(model.remove).toHaveBeenCalledWith(COMPACT_FRAGMENT_TABLE, { channelKey: "guild:test:room" });
+    expect(rows.size).toBe(0);
+    await expect(readFile(sessionFile, "utf8")).rejects.toThrow();
+  });
+
+  it("does not clear session data when deleting the channel fragment index fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-channels-reset-fragments-"));
+    roots.push(root);
+    const remove = vi.fn(async () => {
+      throw new Error("database offline");
+    });
+    const model = {
+      extend: vi.fn(),
+      get: vi.fn(async () => []),
+      set: vi.fn(),
+      create: vi.fn(),
+      remove,
+    };
+    const logger = { level: 2, debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const channels = new Channels({ database: {}, model, logger: () => logger } as never, { basePath: root });
+    const context = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as const;
+    const channel = await channels.resolve(context);
+    await channel.conversation.storage.append(createEntry("message", { role: "user", content: "keep this history" }));
+
+    await expect(channels.reset(context)).rejects.toThrow("database offline");
+
+    expect(remove).toHaveBeenCalledWith(COMPACT_FRAGMENT_TABLE, { channelKey: "guild:test:room" });
+    await expect(channel.conversation.storage.read()).resolves.toHaveLength(1);
+    await expect(channels.resolve(context)).resolves.toBe(channel);
   });
 
   it("migrates a legacy direct directory with different channelId and userId", async () => {

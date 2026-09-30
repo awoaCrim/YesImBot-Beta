@@ -1,13 +1,15 @@
 import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 
-import { createEntry, createJsonlStorage, type AgentEntry, type AgentStorage } from "@yesimbot/agent-runtime";
+import { createEntry, createJsonlStorage, createRandomId, type AgentEntry, type AgentStorage } from "@yesimbot/agent-runtime";
 import type { LanguageModel } from "ai";
 
 import type { MessageRecord } from "../messages/index.js";
-import { executeCompact, filterEntriesForCompression } from "./compact.js";
+import { resolveLatestCompactBoundary } from "./boundary.js";
+import { compactSourceTimestamp, executeCompact, filterEntriesForCompression } from "./compact.js";
+import type { CompactFragmentInput, CompactFragmentWriter } from "./fragment-store.js";
 
-export type CompactReason = "auto" | "idle" | "manual";
+export type CompactReason = "auto" | "idle" | "periodic" | "turn-limit" | "prompt-limit" | "manual";
 
 export type CompactResult = { readonly compacted: boolean; readonly reason?: string };
 
@@ -17,16 +19,27 @@ export type ConversationStatus = { active: ConversationInfo | null };
 
 export interface CompactInput {
   model: LanguageModel;
-  personaName: string;
-  persona: string;
   signal?: AbortSignal;
+  force?: boolean;
+  excludeMessageIds?: readonly string[];
 }
 
 export interface ConversationCompactConfig {
   minMessages: number;
   maxFailures: number;
+  /** Resident fragments projected into the model context; older fragments overflow to the store. */
+  inlineFragments?: number;
   threshold?: number;
   charTokenRatio?: number;
+}
+
+export interface ConversationOptions {
+  /** Channel scope key used to isolate persisted fragments. */
+  readonly channelKey?: string;
+  /** Persistent overflow index; absent disables persistence and leaves JSONL as the only source. */
+  readonly fragments?: CompactFragmentWriter;
+  /** Reports a best-effort fragment failure without failing the turn that triggered it. */
+  readonly onFragmentError?: (operation: string, cause: unknown) => void;
 }
 
 export interface ConversationReadOptions {
@@ -52,30 +65,39 @@ interface ReadSession {
 
 export class Conversation {
   private readonly root: string;
-  private readonly compactConfig;
+  private readonly compactConfig: ConversationCompactConfig;
+  private readonly options: ConversationOptions;
+  private readonly inlineFragments: number;
   private storagePathValue: string | undefined;
   private fileStorageValue: AgentStorage<AgentEntry> | undefined;
+  private storageTail: Promise<void> = Promise.resolve();
   private failures = 0;
-  private memory = "";
 
-  public constructor(root: string, compactConfig: ConversationCompactConfig = { minMessages: 20, maxFailures: 3 }) {
+  public constructor(root: string, compactConfig: ConversationCompactConfig = { minMessages: 15, maxFailures: 3 }, options: ConversationOptions = {}) {
     this.root = root;
     this.compactConfig = compactConfig;
+    this.options = options;
+    this.inlineFragments = Math.max(1, Math.floor(compactConfig.inlineFragments ?? 3));
   }
 
   public get storage(): AgentStorage<AgentEntry> {
     if (!this.storagePathValue) throw new Error("Conversation has not been initialized");
     return {
-      append: (...entries) => this.currentStorage().append(...entries),
-      read: () => this.currentStorage().read(),
-      clear: () => this.currentStorage().clear(),
+      append: (...entries) => this.mutateStorage(() => Promise.resolve(this.currentStorage().append(...entries))),
+      read: () => this.readStorage(),
+      clear: () => this.mutateStorage(() => Promise.resolve(this.currentStorage().clear())),
     };
   }
 
   public async init(): Promise<void> {
     if (this.storagePathValue) return;
     this.setStorage(await this.createOrResolve());
-    await this.restoreMemory();
+    await this.rebuildCompactFragments();
+  }
+
+  public currentSessionId(): string {
+    if (!this.storagePathValue) throw new Error("Conversation has not been initialized");
+    return basename(this.storagePathValue, ".jsonl");
   }
 
   public async list(): Promise<ConversationInfo[]> {
@@ -98,28 +120,48 @@ export class Conversation {
     return this.failures;
   }
 
+  public async messagesSinceLastCompact(): Promise<number> {
+    await this.init();
+    const entries = await this.readStorage();
+    const boundary = resolveLatestCompactBoundary(entries);
+    const tailStartIndex = boundary?.tailStartIndex ?? 0;
+    return entries.slice(tailStartIndex).filter((entry) => entry.type === "message").length;
+  }
+
+  public async userTurnsSinceLastCompact(): Promise<number> {
+    await this.init();
+    const entries = await this.readStorage();
+    const boundary = resolveLatestCompactBoundary(entries);
+    const tailStartIndex = boundary?.tailStartIndex ?? 0;
+    return entries.slice(tailStartIndex).filter((entry) => entry.type === "message" && isUserTurnMessage(entry.data)).length;
+  }
+
   public async switch(id: string): Promise<void> {
     await this.init();
+    await this.storageTail;
     const filename = id.endsWith(".jsonl") ? id : `${id}.jsonl`;
     if (!/^[0-9A-Za-zTZ_-]+\.jsonl$/.test(filename)) throw new Error("Invalid session id");
     const path = join(this.sessionsPath(), filename);
     await stat(path);
     this.setStorage(path);
-    await this.restoreMemory();
+    await this.rebuildCompactFragments();
   }
 
   public async archive(noSummary = false, input?: CompactInput): Promise<void> {
     await this.init();
-    if ((await this.storage.read()).length === 0) throw new Error("Cannot archive an empty session");
+    if ((await this.readStorage()).length === 0) throw new Error("Cannot archive an empty session");
     if (!noSummary && input) {
       const result = await this.compact("manual", input);
-      if (result.compacted) {
-        const compact = [...(await this.storage.read())].reverse().find((entry) => entry.type === "compact");
-        this.setStorage(await this.createSession(compact ? [compact] : []));
+      const entries = await this.readStorage();
+      const resident = this.archiveSeed(entries);
+      if (result.compacted || resident.some((entry) => entry.type === "compact")) {
+        this.setStorage(await this.createSession(resident));
+        await this.rebuildCompactFragments();
         return;
       }
     }
     this.setStorage(await this.createSession());
+    await this.rebuildCompactFragments();
   }
 
   public async archiveIfOversize(maxBytes: number, input?: CompactInput): Promise<boolean> {
@@ -127,53 +169,14 @@ export class Conversation {
     if (maxBytes <= 0) return false;
     const active = (await this.status()).active;
     if (!active || active.size <= maxBytes) return false;
-    const compact = [...(await this.storage.read())].reverse().find((entry) => entry.type === "compact");
-    if (compact?.type === "compact") {
-      this.setStorage(await this.createSession([compact]));
+    const resident = this.archiveSeed(await this.readStorage());
+    if (resident.some((entry) => entry.type === "compact")) {
+      this.setStorage(await this.createSession(resident));
+      await this.rebuildCompactFragments();
     } else {
       await this.archive(!input, input);
     }
     return true;
-  }
-
-  public async compact(reason: CompactReason, input: CompactInput): Promise<CompactResult> {
-    await this.init();
-    if (this.failures >= this.compactConfig.maxFailures) return { compacted: false, reason: "failure_limit" };
-    const entries = await this.storage.read();
-    const lastCompactIndex = entries.reduce((last, entry, index) => (entry.type === "compact" ? index : last), -1);
-    const sourceEntries = lastCompactIndex === -1 ? entries : entries.slice(lastCompactIndex + 1);
-    const messages = sourceEntries.filter((entry) => entry.type === "message");
-    if (messages.length < this.compactConfig.minMessages) return { compacted: false, reason: "minimum_messages" };
-    const content = filterEntriesForCompression(sourceEntries);
-    if (!content) return { compacted: false, reason: "empty_input" };
-    try {
-      const summary = (
-        await executeCompact({
-          model: input.model,
-          personaName: input.personaName,
-          persona: input.persona,
-          previousMemory: this.memory,
-          conversation: content,
-          signal: input.signal,
-        })
-      ).slice(0, 30_000);
-      if (!summary) {
-        this.failures += 1;
-        return { compacted: false, reason: "empty_summary" };
-      }
-      const compact = createEntry("compact", { summary, lastEntryId: messages.at(-1)!.id, sourceSession: basename(this.storagePathValue!, ".jsonl") });
-      await this.storage.append(compact);
-      this.memory = summary;
-      this.failures = 0;
-      return { compacted: true };
-    } catch (cause) {
-      this.failures += 1;
-      if (input.signal?.aborted) throw cause;
-      return {
-        compacted: false,
-        reason: cause instanceof Error && cause.message === "Compaction produced an empty summary." ? "empty_summary" : "model_failure",
-      };
-    }
   }
 
   public async read(options: ConversationReadOptions = {}): Promise<MessageRecord[]> {
@@ -209,6 +212,65 @@ export class Conversation {
     return limited.sort((left, right) => left.record.timestamp - right.record.timestamp).map(({ record }) => record);
   }
 
+  public async compact(reason: CompactReason, input: CompactInput): Promise<CompactResult> {
+    await this.init();
+    if (this.failures >= this.compactConfig.maxFailures) return { compacted: false, reason: "failure_limit" };
+    const entries = await this.readStorage();
+    const boundary = resolveLatestCompactBoundary(entries);
+    const sourceEntries = entries.slice(boundary?.tailStartIndex ?? 0);
+    const excluded = new Set(input.excludeMessageIds ?? []);
+    const sourceForCompaction = sourceEntries.filter((entry) => entry.type !== "message" || !excluded.has(entry.id));
+    const messages = sourceForCompaction.filter((entry) => entry.type === "message");
+    if (!input.force && messages.length < this.compactConfig.minMessages) return { compacted: false, reason: "minimum_messages" };
+    if (messages.length === 0) return { compacted: false, reason: "empty_input" };
+    const content = filterEntriesForCompression(sourceForCompaction);
+    if (!content) return { compacted: false, reason: "empty_input" };
+    try {
+      // Only raw entries after the latest boundary are summarized. The previous summary is never
+      // fed back in, so each fragment stays independent instead of shrinking into a recursive
+      // digest of a digest.
+      const summary = (
+        await executeCompact({
+          model: input.model,
+          conversation: content,
+          signal: input.signal,
+        })
+      ).slice(0, 30_000);
+      if (!summary) {
+        this.failures += 1;
+        return { compacted: false, reason: "empty_summary" };
+      }
+      const compactId = createRandomId();
+      const timestamps = messages.map(compactSourceTimestamp);
+      const parentCompactId = boundary?.compact.id;
+      const compact = createEntry(
+        "compact",
+        {
+          summary,
+          lastEntryId: messages.at(-1)!.id,
+          firstEntryId: messages[0]!.id,
+          sourceSession: this.currentSessionId(),
+          lineageId: boundary?.compact.data.lineageId ?? parentCompactId ?? compactId,
+          startAt: Math.min(...timestamps),
+          endAt: Math.max(...timestamps),
+          ...(parentCompactId ? { parentCompactId } : {}),
+        },
+        { id: compactId },
+      );
+      await this.storage.append(compact);
+      this.failures = 0;
+      await this.syncCompactFragments();
+      return { compacted: true };
+    } catch (cause) {
+      this.failures += 1;
+      if (input.signal?.aborted) throw cause;
+      return {
+        compacted: false,
+        reason: cause instanceof Error && cause.message === "Compaction produced an empty summary." ? "empty_summary" : "model_failure",
+      };
+    }
+  }
+
   private setStorage(path: string): void {
     this.storagePathValue = path;
     this.fileStorageValue = createJsonlStorage(path);
@@ -219,9 +281,85 @@ export class Conversation {
     return this.fileStorageValue;
   }
 
-  private async restoreMemory(): Promise<void> {
-    const compact = [...(await this.storage.read())].reverse().find((entry) => entry.type === "compact");
-    this.memory = compact?.type === "compact" ? compact.data.summary : "";
+  private mutateStorage<T>(operation: () => Promise<T>): Promise<T> {
+    const next = this.storageTail.then(operation, operation);
+    this.storageTail = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
+  private readStorage(): Promise<Readonly<AgentEntry[]>> {
+    return this.storageTail.then(() => this.currentStorage().read());
+  }
+
+  /** The newest `inlineFragments` compact entries stay resident and are projected into context. */
+  private residentCompacts(entries: readonly AgentEntry[]): Extract<AgentEntry, { type: "compact" }>[] {
+    return entries.filter((entry): entry is Extract<AgentEntry, { type: "compact" }> => entry.type === "compact").slice(-this.inlineFragments);
+  }
+
+  /** Carries resident summaries and any raw tail not covered by the newest compact boundary. */
+  private archiveSeed(entries: readonly AgentEntry[]): AgentEntry[] {
+    const boundary = resolveLatestCompactBoundary(entries);
+    const resident = this.residentCompacts(entries);
+    const tail = boundary ? entries.slice(boundary.tailStartIndex).filter((entry) => entry.type !== "compact") : [];
+    return [...resident, ...tail];
+  }
+
+  /**
+   * JSONL stays the source of truth; the database is a rebuildable overflow index. Every compact
+   * entry outside the active session's resident window is upserted so restart, archive and switch
+   * can repair an interrupted index write. A store failure never fails the current turn.
+   */
+  private async rebuildCompactFragments(): Promise<void> {
+    const store = this.options.fragments;
+    const channelKey = this.options.channelKey;
+    if (!store || !channelKey) return;
+    try {
+      const residentIds = new Set(
+        (await this.readStorage())
+          .filter((entry): entry is Extract<AgentEntry, { type: "compact" }> => entry.type === "compact")
+          .slice(-this.inlineFragments)
+          .map((entry) => entry.id),
+      );
+      const fragments = new Map<string, CompactFragmentInput>();
+      for (const filename of await this.files()) {
+        const entries = await createJsonlStorage(join(this.sessionsPath(), filename)).read();
+        for (const entry of entries) {
+          if (entry.type !== "compact" || residentIds.has(entry.id)) continue;
+          fragments.set(entry.id, toCompactFragment(entry, channelKey));
+        }
+      }
+      const overflow = [...fragments.values()];
+      if (overflow.length === 0) return;
+      await store.upsert(overflow);
+    } catch (cause) {
+      this.reportFragmentError("rebuild", cause);
+    }
+  }
+
+  /** Indexes newly overflowed entries in the active session after compaction. */
+  private async syncCompactFragments(): Promise<void> {
+    const store = this.options.fragments;
+    const channelKey = this.options.channelKey;
+    if (!store || !channelKey) return;
+    try {
+      const compacts = (await this.readStorage()).filter((entry): entry is Extract<AgentEntry, { type: "compact" }> => entry.type === "compact");
+      const overflow = compacts.slice(0, Math.max(0, compacts.length - this.inlineFragments));
+      if (overflow.length === 0) return;
+      await store.upsert(overflow.map((entry) => toCompactFragment(entry, channelKey)));
+    } catch (cause) {
+      this.reportFragmentError("sync", cause);
+    }
+  }
+
+  private reportFragmentError(operation: string, cause: unknown): void {
+    try {
+      this.options.onFragmentError?.(operation, cause);
+    } catch {
+      // Diagnostics are best-effort too; storage failure must not break the regular conversation.
+    }
   }
 
   private async createOrResolve(): Promise<string> {
@@ -320,6 +458,33 @@ function limitNewestMessages(messages: readonly ReadMessage[], limit: number | u
 function readMessageKey(message: ReadMessage): string {
   const { platform, selfId, channel, messageId } = message.record;
   return `${platform}\u0000${selfId}\u0000${channel.id}\u0000${messageId}`;
+}
+
+function isUserTurnMessage(value: AgentEntry["data"]): boolean {
+  if (typeof value !== "object" || value === null || !("role" in value)) return false;
+  return value.role === "user" || isPlatformMessage(value);
+}
+
+/**
+ * Legacy compact entries predate the per-fragment metadata and only carry a summary. They stay
+ * readable, and recall uses their entry timestamp as a conservative bound without persisting it as
+ * a source-message time; no event time is invented inside the summary text itself.
+ */
+function toCompactFragment(entry: Extract<AgentEntry, { type: "compact" }>, channelKey: string): CompactFragmentInput {
+  const { data } = entry;
+  return {
+    id: entry.id,
+    channelKey,
+    lineageId: data.lineageId ?? entry.id,
+    lastEntryId: data.lastEntryId,
+    summary: data.summary,
+    createdAt: entry.timestamp,
+    ...(data.endAt === undefined ? {} : { endAt: data.endAt }),
+    ...(data.parentCompactId ? { parentCompactId: data.parentCompactId } : {}),
+    ...(data.sourceSession ? { sourceSession: data.sourceSession } : {}),
+    ...(data.firstEntryId ? { firstEntryId: data.firstEntryId } : {}),
+    ...(data.startAt === undefined ? {} : { startAt: data.startAt }),
+  };
 }
 
 function isPlatformMessage(value: AgentEntry["data"]): value is {

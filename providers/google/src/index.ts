@@ -7,6 +7,8 @@ export const usage = "Google 提供商插件";
 
 export const inject = ["yesimbot"];
 
+export const imageToolResultSupport = "native" as const;
+
 export const Config: Schema<Config> = Schema.object({
   id: Schema.string().default("google").description("提供商标识"),
   apiKey: Schema.string().role("secret").required().description("API Key"),
@@ -43,6 +45,7 @@ export function apply(ctx: Context, config: Config) {
       chatModels: () => config.chatModels,
       embeddingModels: () => config.embeddingModels ?? [],
       chat: (modelId: string) => client.chat(modelId),
+      chatCapabilities: () => ({ imageToolResult: imageToolResultSupport }),
       embedding: (modelId: string) => client.embedding(modelId),
     });
     ctx.on("dispose", dispose);

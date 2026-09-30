@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("koishi", async () => import("@koishijs/core"));
 
-import { Context, h } from "koishi";
+import { Bot, Context, h, Universal, type Session } from "koishi";
 
 import type { Config } from "../src/config.js";
 import type { EventRecord } from "../src/messages/index.js";
@@ -15,10 +15,22 @@ const config: Config = {
   logLevel: 2,
   allowedChannels: [],
   imageInput: false,
+  modelRetries: 0,
   resourceReadTimeout: 30,
   pacing: { charactersPerSecond: 100_000, maxTotalDelayMs: 60_000 },
   customInnerThought: true,
-  session: { compact: { responseIdleMinutes: 0, minMessages: 20, maxFailures: 3, model: undefined }, archive: { maxKB: 0 } },
+  session: {
+    compact: {
+      responseIdleMinutes: 0,
+      checkIntervalMinutes: 30,
+      turnThreshold: 50,
+      minMessages: 15,
+      maxFailures: 3,
+      inlineFragments: 3,
+      model: undefined,
+    },
+    archive: { maxKB: 0 },
+  },
 };
 
 const event: EventRecord<"delivery.failed"> = {
@@ -30,6 +42,25 @@ const event: EventRecord<"delivery.failed"> = {
   text: "delivery failed",
   delivery: { turnId: "turn-1", messageId: "message-1", segmentIndex: 0, segmentTotal: 1, error: { name: "Error", message: "offline" } },
 };
+
+class TestBot extends Bot<Context, { selfId: string }> {
+  public constructor(ctx: Context, selfId = "bot-1") {
+    super(ctx, { selfId }, "test");
+    this.selfId = selfId;
+  }
+}
+
+function parsedSession(ctx: Context, bot: TestBot, content: string, messageId: string): Session {
+  const session = bot.session({
+    type: "message-created",
+    timestamp: 1,
+    message: { id: messageId, content, elements: [h.text(content)] },
+    channel: { id: "user-1", type: Universal.Channel.Type.DIRECT },
+    user: { id: "user-1", name: "User" },
+  });
+  ctx.emit(session, "before-attach", session);
+  return session;
+}
 
 describe("Messenger", () => {
   it("routes an active post through its matching Bot and awaits the producing Runtime turn", async () => {
@@ -130,6 +161,103 @@ describe("Messenger", () => {
     expect(resources.persistElements).toHaveBeenCalledOnce();
     expect(runtime.handle).toHaveBeenCalledWith(expect.objectContaining({ elements: [h("img", { id: "0123456789abcdef0123456789abcdef" })] }));
     expect(runtimes.get).toHaveBeenCalledWith(channel, bot, session);
+  });
+
+  it("bypasses recognized configurable-prefix commands and lets Commander execute immediately", async () => {
+    const ctx = new Context({ prefix: ["!"] });
+    const middlewareSpy = vi.spyOn(ctx, "middleware");
+    const action = vi.fn(() => "pong");
+    ctx.command("ping").action(action);
+    const bot = new TestBot(ctx);
+    const channels = { start: vi.fn(), resolve: vi.fn() };
+    const runtimes = { get: vi.fn() };
+    new Messenger(ctx, { ...config, allowedChannels: [{ platform: "test", channelId: "user-1", isDirect: true }] }, channels as never, runtimes as never);
+    const middleware = middlewareSpy.mock.calls[0]?.[0];
+    const session = parsedSession(ctx, bot, "!ping", "command-1");
+    const next = vi.fn(async () => {
+      const command = ctx.$commander.resolveCommand(session.argv!);
+      await command.execute(session.argv!);
+    });
+
+    await middleware?.(session, next);
+
+    expect(next).toHaveBeenCalledOnce();
+    expect(action).toHaveBeenCalledOnce();
+    expect(channels.start).not.toHaveBeenCalled();
+    expect(channels.resolve).not.toHaveBeenCalled();
+    expect(runtimes.get).not.toHaveBeenCalled();
+  });
+
+  it("bypasses side-effect commands in the actual Koishi middleware order", async () => {
+    const ctx = new Context({ prefix: ["!"] });
+    const action = vi.fn(() => undefined);
+    ctx.command("ping").action(action);
+    const bot = new TestBot(ctx);
+    ctx.bots.push(bot);
+    const channels = { start: vi.fn(), resolve: vi.fn() };
+    const runtimes = { get: vi.fn() };
+    new Messenger(ctx, { ...config, allowedChannels: [{ platform: "test", channelId: "user-1", isDirect: true }] }, channels as never, runtimes as never);
+    const session = bot.session({
+      type: "message-created",
+      timestamp: 1,
+      message: { id: "command-side-effect", content: "!ping", elements: [h.text("!ping")] },
+      channel: { id: "user-1", type: Universal.Channel.Type.DIRECT },
+      user: { id: "user-1", name: "User" },
+    });
+    Object.assign(session, { send: vi.fn(async () => []) });
+
+    await (ctx as unknown as { $processor: { _handleMessage(session: Session): Promise<void> } }).$processor._handleMessage(session);
+
+    expect(action).toHaveBeenCalledOnce();
+    expect(channels.start).not.toHaveBeenCalled();
+    expect(channels.resolve).not.toHaveBeenCalled();
+    expect(runtimes.get).not.toHaveBeenCalled();
+  });
+
+  it("resolves commands against the current registry even when registration happens after parsing", async () => {
+    const ctx = new Context({ prefix: ["!"] });
+    const middlewareSpy = vi.spyOn(ctx, "middleware");
+    const bot = new TestBot(ctx);
+    const channels = { start: vi.fn(), resolve: vi.fn() };
+    const runtimes = { get: vi.fn() };
+    new Messenger(ctx, { ...config, allowedChannels: [{ platform: "test", channelId: "user-1", isDirect: true }] }, channels as never, runtimes as never);
+    const middleware = middlewareSpy.mock.calls[0]?.[0];
+    const session = parsedSession(ctx, bot, "!late", "command-late");
+    const action = vi.fn(() => "registered later");
+    ctx.command("late").action(action);
+    const next = vi.fn(async () => {
+      const command = ctx.$commander.resolveCommand(session.argv!);
+      await command.execute(session.argv!);
+    });
+
+    await middleware?.(session, next);
+
+    expect(next).toHaveBeenCalledOnce();
+    expect(action).toHaveBeenCalledOnce();
+    expect(channels.start).not.toHaveBeenCalled();
+    expect(runtimes.get).not.toHaveBeenCalled();
+  });
+
+  it("keeps unknown command-like text on the ordinary message route", async () => {
+    const ctx = new Context({ prefix: ["!"] });
+    ctx.command("ping").action(() => "pong");
+    const middlewareSpy = vi.spyOn(ctx, "middleware");
+    const bot = new TestBot(ctx);
+    const resources = { persistElements: vi.fn(async (_ctx: unknown, elements: readonly unknown[]) => elements) };
+    const channel = { context: { type: "direct", platform: "test", channelId: "user-1", selfId: "bot-1", userId: "user-1" }, resources };
+    const runtime = { handle: vi.fn(async () => ({ kind: "wait" as const, eventId: "event-1" })) };
+    const channels = { start: vi.fn(async () => undefined), resolve: vi.fn(async () => channel) };
+    const runtimes = { get: vi.fn(async () => runtime) };
+    new Messenger(ctx, { ...config, allowedChannels: [{ platform: "test", channelId: "user-1", isDirect: true }] }, channels as never, runtimes as never);
+    const middleware = middlewareSpy.mock.calls[0]?.[0];
+    const session = parsedSession(ctx, bot, "!unknown", "message-unknown");
+    const next = vi.fn(async () => undefined);
+
+    await middleware?.(session, next);
+
+    expect(next).toHaveBeenCalledOnce();
+    expect(resources.persistElements).toHaveBeenCalledOnce();
+    expect(runtime.handle).toHaveBeenCalledWith(expect.objectContaining({ messageId: "message-unknown" }));
   });
 
   it("rejects an active post without a matching Bot before Runtime creation", async () => {

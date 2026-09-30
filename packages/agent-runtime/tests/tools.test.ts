@@ -462,7 +462,7 @@ describe("tools", () => {
     );
   });
 
-  it("reports cumulative usage for a multi-step tool turn", async () => {
+  it("reports cumulative usage and the latest provider-step usage separately", async () => {
     const onTurnFinish = vi.fn();
     const agent = createAgent({
       model: createSingleToolCallModel(),
@@ -473,7 +473,10 @@ describe("tools", () => {
     await agent.wait();
 
     expect(onTurnFinish).toHaveBeenCalledWith(
-      expect.objectContaining({ usage: expect.objectContaining({ inputTokens: 2, outputTokens: 2, totalTokens: 4 }) }),
+      expect.objectContaining({
+        usage: expect.objectContaining({ inputTokens: 2, outputTokens: 2, totalTokens: 4 }),
+        latestStepUsage: expect.objectContaining({ inputTokens: 1, outputTokens: 1, totalTokens: 2 }),
+      }),
       expect.any(Object),
     );
   });

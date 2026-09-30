@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const generateText = vi.hoisted(() => vi.fn());
 vi.mock("koishi", async () => import("@koishijs/core"));
 vi.mock("ai", async (original) => ({ ...(await original<typeof import("ai")>()), generateText }));
+import type { CompactFragmentInput, CompactFragmentWriter } from "../src/conversations/fragment-store.js";
 import { Conversation } from "../src/conversations/index.js";
 import { createMessage, type MessageRecord } from "../src/messages/index.js";
 
@@ -69,7 +70,7 @@ describe("Conversation.archive", () => {
       }),
       createEntry("message", { id: "m2", timestamp: 2, role: "assistant", content: "hi" }),
     );
-    await conversation.archive(false, { model: {} as never, personaName: "Athena", persona: "persona" });
+    await conversation.archive(false, { model: {} as never });
     expect(generateText).toHaveBeenCalled();
     const entries = await conversation.storage.read();
     expect(entries).toHaveLength(1);
@@ -86,7 +87,7 @@ describe("Conversation.archive", () => {
       createEntry("message", { id: "m1", timestamp: 1, role: "user", content: "first" }),
       createEntry("message", { id: "m2", timestamp: 2, role: "assistant", content: "second" }),
     );
-    await conversation.archive(false, { model: {} as never, personaName: "Athena", persona: "persona" });
+    await conversation.archive(false, { model: {} as never });
     expect(await conversation.storage.read()).toEqual([]);
     expect(await conversation.list()).toHaveLength(2);
   });
@@ -97,7 +98,7 @@ describe("Conversation.archive", () => {
 // ---------------------------------------------------------------------------
 
 describe("Conversation.compact", () => {
-  it("uses the supplied immutable LLM/persona snapshot and appends a compact boundary", async () => {
+  it("uses the supplied LLM snapshot and appends a compact boundary", async () => {
     generateText.mockResolvedValue({ text: "LLM memory" });
     const root = await mkdtemp(join(tmpdir(), "yesimbot-conversation-"));
     roots.push(root);
@@ -108,10 +109,16 @@ describe("Conversation.compact", () => {
       createEntry("message", { id: "m2", timestamp: 2, role: "assistant", content: "second" }),
     );
 
-    await expect(conversation.compact("manual", { model: {} as never, personaName: "Athena", persona: "persona" })).resolves.toEqual({ compacted: true });
+    await expect(conversation.compact("manual", { model: {} as never })).resolves.toEqual({ compacted: true });
     expect(generateText).toHaveBeenCalledWith(
-      expect.objectContaining({ model: expect.anything(), system: expect.stringContaining("Athena"), prompt: expect.stringContaining("persona") }),
+      expect.objectContaining({
+        model: expect.anything(),
+        system: expect.stringContaining("压缩长期对话记忆"),
+        prompt: expect.stringContaining("<conversation>"),
+      }),
     );
+    const request = generateText.mock.calls[0]?.[0] as { prompt?: string };
+    expect(request.prompt).not.toContain("<previous_memory>");
     expect((await conversation.list()).filter((item) => item.isActive)).toHaveLength(1);
     expect(await conversation.storage.read()).toHaveLength(3);
   });
@@ -127,7 +134,7 @@ describe("Conversation.compact", () => {
       createEntry("message", { id: "m2", timestamp: 2, role: "assistant", content: "second" }),
     );
     const before = await conversation.list();
-    await expect(conversation.compact("manual", { model: {} as never, personaName: "Athena", persona: "persona" })).resolves.toMatchObject({
+    await expect(conversation.compact("manual", { model: {} as never })).resolves.toMatchObject({
       compacted: false,
       reason: "empty_summary",
     });
@@ -143,7 +150,7 @@ describe("Conversation.compact", () => {
       createEntry("message", { id: "m1", timestamp: 1, role: "user", content: "first" }),
       createEntry("message", { id: "m2", timestamp: 2, role: "assistant", content: "second" }),
     );
-    await expect(conversation.compact("auto", { model: {} as never, personaName: "Athena", persona: "persona" })).resolves.toEqual({
+    await expect(conversation.compact("auto", { model: {} as never })).resolves.toEqual({
       compacted: false,
       reason: "minimum_messages",
     });
@@ -161,7 +168,7 @@ describe("Conversation.compact", () => {
       createEntry("message", { id: "m2", timestamp: 2, role: "assistant", content: "second" }),
     );
     const before = await conversation.status();
-    await expect(conversation.compact("manual", { model: {} as never, personaName: "Athena", persona: "persona" })).resolves.toEqual({
+    await expect(conversation.compact("manual", { model: {} as never })).resolves.toEqual({
       compacted: false,
       reason: "model_failure",
     });
@@ -179,8 +186,8 @@ describe("Conversation.compact", () => {
       createEntry("message", { id: "m1", timestamp: 1, role: "user", content: "first" }),
       createEntry("message", { id: "m2", timestamp: 2, role: "assistant", content: "second" }),
     );
-    await conversation.compact("manual", { model: {} as never, personaName: "Athena", persona: "persona" });
-    await expect(conversation.compact("manual", { model: {} as never, personaName: "Athena", persona: "persona" })).resolves.toEqual({ compacted: true });
+    await conversation.compact("manual", { model: {} as never });
+    await expect(conversation.compact("manual", { model: {} as never })).resolves.toEqual({ compacted: true });
     const entries = await conversation.storage.read();
     expect(entries).toHaveLength(3);
     expect(entries.at(-1)).toMatchObject({ type: "compact", data: expect.objectContaining({ sourceSession, summary: "stable memory" }) });
@@ -196,14 +203,326 @@ describe("Conversation.compact", () => {
       createEntry("message", { id: "m1", timestamp: 1, role: "user", content: "first" }),
       createEntry("message", { id: "m2", timestamp: 2, role: "assistant", content: "second" }),
     );
-    await conversation.compact("manual", { model: {} as never, personaName: "Athena", persona: "persona" });
-    await expect(conversation.compact("manual", { model: {} as never, personaName: "Athena", persona: "persona" })).resolves.toEqual({
+    await conversation.compact("manual", { model: {} as never });
+    await expect(conversation.compact("manual", { model: {} as never })).resolves.toEqual({
       compacted: false,
       reason: "failure_limit",
     });
     expect(generateText).toHaveBeenCalledOnce();
   });
+
+  it("counts only messages after the latest compact boundary", async () => {
+    generateText.mockReset().mockResolvedValue({ text: "memory" });
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-conversation-count-"));
+    roots.push(root);
+    const conversation = new Conversation(root, { minMessages: 1, maxFailures: 3 });
+    await conversation.init();
+    await conversation.storage.append(createEntry("message", { id: "m1", timestamp: 1, role: "assistant", content: "first" }));
+    expect(await conversation.messagesSinceLastCompact()).toBe(1);
+    await conversation.compact("manual", { model: {} as never });
+    await conversation.storage.append(
+      createEntry("event", { type: "diagnostic", timestamp: 3 }),
+      createEntry("message", { id: "m2", timestamp: 4, role: "assistant", content: "second" }),
+    );
+    expect(await conversation.messagesSinceLastCompact()).toBe(1);
+  });
+
+  it("counts platform user messages as turns and resets at the latest compact boundary", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-conversation-turns-"));
+    roots.push(root);
+    const conversation = new Conversation(root, { minMessages: 1, maxFailures: 3 });
+    await conversation.init();
+    const first = createEntry("message", createMessage(record("m1", 1)), { id: "user-1" });
+    await conversation.storage.append(
+      first,
+      createEntry("message", { id: "assistant-1", timestamp: 2, role: "assistant", content: "answer" }),
+      createEntry("message", { id: "tool-1", timestamp: 3, role: "tool", content: [] }),
+      createEntry("event", { type: "diagnostic", timestamp: 4 }),
+      createEntry("message", { id: "user-2", timestamp: 5, role: "user", content: "second" }),
+    );
+
+    expect(await conversation.userTurnsSinceLastCompact()).toBe(2);
+
+    await conversation.storage.append(createEntry("compact", { summary: "memory", lastEntryId: first.id }, { id: "compact-1" }));
+    expect(await conversation.userTurnsSinceLastCompact()).toBe(1);
+  });
+
+  it("can compact historical messages without including excluded current-turn entries", async () => {
+    generateText.mockReset().mockResolvedValue({ text: "historical memory" });
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-conversation-exclude-"));
+    roots.push(root);
+    const conversation = new Conversation(root, { minMessages: 20, maxFailures: 3 });
+    await conversation.init();
+    await conversation.storage.append(
+      createEntry(
+        "message",
+        {
+          id: "history",
+          timestamp: 1,
+          role: "custom",
+          content: "",
+          type: "yesimbot.message",
+          data: { user: { id: "history", name: "History" }, elements: [{ type: "text", attrs: { content: "historical text" }, children: [] }] },
+        },
+        { id: "history" },
+      ),
+      createEntry(
+        "message",
+        {
+          id: "current",
+          timestamp: 2,
+          role: "custom",
+          content: "",
+          type: "yesimbot.message",
+          data: { user: { id: "current", name: "Current" }, elements: [{ type: "text", attrs: { content: "current text" }, children: [] }] },
+        },
+        { id: "current" },
+      ),
+    );
+
+    await expect(conversation.compact("turn-limit", { model: {} as never, force: true, excludeMessageIds: ["current"] })).resolves.toEqual({
+      compacted: true,
+    });
+
+    const request = generateText.mock.calls.at(-1)?.[0] as { prompt?: string };
+    expect(request.prompt).toContain("historical text");
+    expect(request.prompt).not.toContain("current text");
+    expect((await conversation.storage.read()).at(-1)).toMatchObject({ type: "compact", data: { lastEntryId: "history" } });
+    expect((await conversation.storage.read()).filter((entry) => entry.type === "message")).toHaveLength(2);
+  });
+
+  it("keeps excluded current messages in the logical tail for later compaction", async () => {
+    generateText.mockReset().mockResolvedValueOnce({ text: "historical memory" }).mockResolvedValueOnce({ text: "complete memory" });
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-conversation-tail-"));
+    roots.push(root);
+    const conversation = new Conversation(root, { minMessages: 1, maxFailures: 3 });
+    await conversation.init();
+    await conversation.storage.append(
+      createEntry(
+        "message",
+        {
+          id: "history",
+          timestamp: 1,
+          role: "custom",
+          content: "",
+          type: "yesimbot.message",
+          data: { user: { id: "history", name: "History" }, elements: [{ type: "text", attrs: { content: "historical text" }, children: [] }] },
+        },
+        { id: "history" },
+      ),
+      createEntry(
+        "message",
+        {
+          id: "current",
+          timestamp: 2,
+          role: "custom",
+          content: "",
+          type: "yesimbot.message",
+          data: { user: { id: "current", name: "Current" }, elements: [{ type: "text", attrs: { content: "current text" }, children: [] }] },
+        },
+        { id: "current" },
+      ),
+    );
+
+    await expect(conversation.compact("turn-limit", { model: {} as never, force: true, excludeMessageIds: ["current"] })).resolves.toEqual({
+      compacted: true,
+    });
+    expect(await conversation.messagesSinceLastCompact()).toBe(1);
+
+    await expect(conversation.compact("periodic", { model: {} as never })).resolves.toEqual({ compacted: true });
+    const request = generateText.mock.calls.at(-1)?.[0] as { prompt?: string };
+    expect(request.prompt).toContain("current text");
+    expect((await conversation.storage.read()).filter((entry) => entry.type === "message")).toHaveLength(2);
+  });
+
+  it("records independent source metadata and never feeds an older summary back into compaction", async () => {
+    generateText.mockReset().mockResolvedValueOnce({ text: "第一段记忆" }).mockResolvedValueOnce({ text: "第二段记忆" });
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-conversation-source-"));
+    roots.push(root);
+    const conversation = new Conversation(root, { minMessages: 1, maxFailures: 3 });
+    await conversation.init();
+    await conversation.storage.append(
+      createEntry("message", { id: "m1", timestamp: 1_000, role: "user", content: "first" }, { id: "m1", timestamp: 60_000 }),
+      createEntry("message", { id: "m2", timestamp: 2_000, role: "assistant", content: "second" }, { id: "m2", timestamp: 120_000 }),
+    );
+    await expect(conversation.compact("manual", { model: {} as never })).resolves.toEqual({ compacted: true });
+
+    const first = (await conversation.storage.read()).find((entry) => entry.type === "compact")!;
+    expect(first.data).toMatchObject({ firstEntryId: "m1", lastEntryId: "m2", startAt: 1_000, endAt: 2_000 });
+    const firstRequest = generateText.mock.calls.at(-1)?.[0] as { prompt?: string };
+    expect(firstRequest.prompt).toContain("1970-01-01 08:00");
+    expect(firstRequest.prompt).not.toContain("1970-01-01 08:01");
+    expect(first.data.lineageId).toBe(first.id);
+    expect(first.data.parentCompactId).toBeUndefined();
+
+    await conversation.storage.append(spokenEntry("m3", 3_000, "third"), spokenEntry("m4", 4_000, "fourth"));
+    await expect(conversation.compact("manual", { model: {} as never })).resolves.toEqual({ compacted: true });
+
+    const entries = await conversation.storage.read();
+    const second = entries.find((entry) => entry.type === "compact" && entry.id !== first.id)!;
+    expect(second.data).toMatchObject({
+      firstEntryId: "m3",
+      lastEntryId: "m4",
+      startAt: 3_000,
+      endAt: 4_000,
+      lineageId: first.data.lineageId,
+      parentCompactId: first.id,
+    });
+
+    const secondRequest = generateText.mock.calls.at(-1)?.[0] as { prompt?: string };
+    expect(secondRequest.prompt).toContain("third");
+    expect(secondRequest.prompt).not.toContain("第一段记忆");
+    expect(secondRequest.prompt).not.toContain("<previous_memory>");
+  });
+
+  it("writes only fragments older than the resident window to the overflow store", async () => {
+    generateText.mockReset().mockResolvedValue({ text: "memory" });
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-conversation-overflow-"));
+    roots.push(root);
+    const upsert = vi.fn(async (_fragments: readonly CompactFragmentInput[]) => undefined);
+    const writer: CompactFragmentWriter = { upsert };
+    const conversation = new Conversation(root, { minMessages: 1, maxFailures: 3, inlineFragments: 1 }, { channelKey: "guild:test:room", fragments: writer });
+    await conversation.init();
+
+    await conversation.storage.append(spokenEntry("m1", 1, "a"), spokenEntry("m2", 2, "b"));
+    await conversation.compact("manual", { model: {} as never });
+    expect(upsert).not.toHaveBeenCalled();
+
+    await conversation.storage.append(spokenEntry("m3", 3, "c"));
+    await conversation.compact("manual", { model: {} as never });
+    const compacts = (await conversation.storage.read()).filter((entry) => entry.type === "compact");
+    expect(upsert).toHaveBeenCalledOnce();
+    expect(upsert.mock.calls[0]?.[0].map((fragment) => fragment.id)).toEqual([compacts[0]!.id]);
+    expect(upsert.mock.calls[0]?.[0][0]).toMatchObject({ channelKey: "guild:test:room", lineageId: compacts[0]!.id });
+
+    await conversation.storage.append(spokenEntry("m4", 4, "d"));
+    await conversation.compact("manual", { model: {} as never });
+    expect(upsert.mock.calls.at(-1)?.[0].map((fragment) => fragment.id)).toEqual([compacts[0]!.id, compacts[1]!.id]);
+  });
+
+  it("rebuilds the overflow index from archived JSONL after a restart", async () => {
+    generateText.mockReset().mockResolvedValue({ text: "memory" });
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-conversation-rebuild-"));
+    roots.push(root);
+    const failingWriter: CompactFragmentWriter = { upsert: vi.fn(async () => Promise.reject(new Error("database offline"))) };
+    const conversation = new Conversation(
+      root,
+      { minMessages: 1, maxFailures: 3, inlineFragments: 1 },
+      { channelKey: "guild:test:room", fragments: failingWriter },
+    );
+    await conversation.init();
+    await conversation.storage.append(spokenEntry("m1", 1_000, "project alpha one"));
+    await conversation.compact("manual", { model: {} as never });
+    await conversation.storage.append(spokenEntry("m2", 2_000, "project alpha two"));
+    await conversation.compact("manual", { model: {} as never });
+    const originalCompacts = (await conversation.storage.read()).filter((entry) => entry.type === "compact");
+    await conversation.archive(true);
+
+    const repairedUpsert = vi.fn(async (_fragments: readonly CompactFragmentInput[]) => undefined);
+    const restarted = new Conversation(
+      root,
+      { minMessages: 1, maxFailures: 3, inlineFragments: 1 },
+      { channelKey: "guild:test:room", fragments: { upsert: repairedUpsert } },
+    );
+    await restarted.init();
+
+    expect(repairedUpsert).toHaveBeenCalledOnce();
+    expect(repairedUpsert.mock.calls[0]?.[0].map((fragment) => fragment.id)).toEqual(originalCompacts.map((entry) => entry.id));
+  });
+
+  it("keeps the durable compact entry when the overflow store fails", async () => {
+    generateText.mockReset().mockResolvedValue({ text: "memory" });
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-conversation-store-failure-"));
+    roots.push(root);
+    const onFragmentError = vi.fn();
+    const writer: CompactFragmentWriter = { upsert: vi.fn(async () => Promise.reject(new Error("database offline"))) };
+    const conversation = new Conversation(
+      root,
+      { minMessages: 1, maxFailures: 1, inlineFragments: 1 },
+      { channelKey: "guild:test:room", fragments: writer, onFragmentError },
+    );
+    await conversation.init();
+    await conversation.storage.append(spokenEntry("m1", 1, "a"), spokenEntry("m2", 2, "b"));
+    await expect(conversation.compact("manual", { model: {} as never })).resolves.toEqual({ compacted: true });
+
+    await conversation.storage.append(spokenEntry("m3", 3, "c"));
+    await expect(conversation.compact("manual", { model: {} as never })).resolves.toEqual({ compacted: true });
+    expect(onFragmentError).toHaveBeenCalledWith("sync", expect.any(Error));
+    expect((await conversation.storage.read()).filter((entry) => entry.type === "compact")).toHaveLength(2);
+    expect(conversation.failuresCount()).toBe(0);
+  });
+
+  it("starts a new lineage when archiving without summaries", async () => {
+    generateText.mockReset().mockResolvedValueOnce({ text: "old lineage" }).mockResolvedValueOnce({ text: "new lineage" });
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-conversation-archive-reset-lineage-"));
+    roots.push(root);
+    const conversation = new Conversation(root, { minMessages: 1, maxFailures: 3 });
+    await conversation.init();
+    await conversation.storage.append(spokenEntry("old-message", 1, "old"));
+    await conversation.compact("manual", { model: {} as never });
+    const oldCompact = (await conversation.storage.read()).find((entry) => entry.type === "compact")!;
+
+    await conversation.archive(true);
+    await conversation.storage.append(spokenEntry("new-message", 2, "new"));
+    await conversation.compact("manual", { model: {} as never });
+    const newCompact = (await conversation.storage.read()).find((entry) => entry.type === "compact")!;
+
+    expect(newCompact.id).not.toBe(oldCompact.id);
+    expect(newCompact.data.lineageId).toBe(newCompact.id);
+    expect(newCompact.data.parentCompactId).toBeUndefined();
+  });
+
+  it("keeps an uncovered raw tail when archiving an oversized session", async () => {
+    generateText.mockReset().mockResolvedValue({ text: "first compact" });
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-conversation-archive-tail-"));
+    roots.push(root);
+    const conversation = new Conversation(root, { minMessages: 1, maxFailures: 3, inlineFragments: 1 });
+    await conversation.init();
+    await conversation.storage.append(spokenEntry("m1", 1_000, "covered source"));
+    await conversation.compact("manual", { model: {} as never });
+    await conversation.storage.append(spokenEntry("m2", 2_000, "uncovered tail"));
+
+    await expect(conversation.archiveIfOversize(1)).resolves.toBe(true);
+
+    const seeded = await conversation.storage.read();
+    expect(seeded.map((entry) => entry.type)).toEqual(["compact", "message"]);
+    expect(seeded[0]).toMatchObject({ type: "compact", data: { summary: "first compact" } });
+    expect(seeded[1]).toMatchObject({ id: "m2", type: "message" });
+  });
+
+  it("archives the resident fragments and continues their lineage", async () => {
+    generateText
+      .mockReset()
+      .mockResolvedValueOnce({ text: "one" })
+      .mockResolvedValueOnce({ text: "two" })
+      .mockResolvedValueOnce({ text: "three" })
+      .mockResolvedValueOnce({ text: "four" });
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-conversation-archive-lineage-"));
+    roots.push(root);
+    const conversation = new Conversation(root, { minMessages: 1, maxFailures: 3, inlineFragments: 2 });
+    await conversation.init();
+    for (const [index, text] of ["a", "b", "c"].entries()) {
+      await conversation.storage.append(spokenEntry(`m${index}`, index + 1, text));
+      await conversation.compact("manual", { model: {} as never });
+    }
+    const before = (await conversation.storage.read()).filter((entry) => entry.type === "compact");
+
+    await conversation.archive(false, { model: {} as never });
+    const seeded = await conversation.storage.read();
+    expect(seeded).toHaveLength(2);
+    expect(seeded.map((entry) => entry.id)).toEqual([before[1]!.id, before[2]!.id]);
+
+    await conversation.storage.append(spokenEntry("m4", 10, "d"));
+    await conversation.compact("manual", { model: {} as never });
+    const continued = (await conversation.storage.read()).filter((entry) => entry.type === "compact").at(-1)!;
+    expect(continued.data.lineageId).toBe(before[0]!.data.lineageId);
+    expect(continued.data.parentCompactId).toBe(before[2]!.id);
+  });
 });
+
+function spokenEntry(id: string, timestamp: number, content: string) {
+  return createEntry("message", { id, timestamp, role: "assistant", content }, { id, timestamp });
+}
 describe("Conversation archiving policies", () => {
   it("keeps the storage facade on the new active file after archiving", async () => {
     const root = await mkdtemp(join(tmpdir(), "yesimbot-storage-facade-"));

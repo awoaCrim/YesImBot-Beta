@@ -4,6 +4,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { Context, Logger } from "koishi";
 
+import { CompactFragmentStore, type CompactFragmentWriter } from "../conversations/fragment-store.js";
 import { Conversation, type ConversationCompactConfig, type ConversationReadOptions } from "../conversations/index.js";
 import type { MessageRecord } from "../messages/index.js";
 import { ChannelResources, type Disposer, type ResourceReader, type Resources } from "../resources/index.js";
@@ -21,6 +22,12 @@ export interface ChannelsOptions {
   readonly compactConfig?: ConversationCompactConfig;
 }
 
+/** Fragment persistence wiring handed to each channel's conversation. */
+export interface ChannelFragmentOptions {
+  readonly store?: CompactFragmentWriter;
+  readonly onError?: (operation: string, cause: unknown) => void;
+}
+
 // ─── Channel ───────────────────────────────────────────────────────────────
 
 export class Channel {
@@ -32,10 +39,15 @@ export class Channel {
     public readonly root: string,
     imageInput = false,
     readTimeoutMs = 10_000,
-    compactConfig: ConversationCompactConfig = { minMessages: 20, maxFailures: 3 },
+    compactConfig: ConversationCompactConfig = { minMessages: 15, maxFailures: 3 },
+    fragments: ChannelFragmentOptions = {},
   ) {
     this.resources = new ChannelResources(root, imageInput, readTimeoutMs);
-    this.conversation = new Conversation(root, compactConfig);
+    this.conversation = new Conversation(root, compactConfig, {
+      channelKey: deriveChannelKey(context),
+      ...(fragments.store ? { fragments: fragments.store } : {}),
+      ...(fragments.onError ? { onFragmentError: fragments.onError } : {}),
+    });
   }
 }
 
@@ -51,6 +63,7 @@ export class Channels implements Resources {
   private readonly imageInput: boolean;
   private readonly readTimeoutMs: number;
   private readonly compactConfig: ConversationCompactConfig;
+  private readonly fragmentStore: CompactFragmentStore | undefined;
   private readonly logger: Logger;
   private readonly started: Promise<void>;
 
@@ -58,10 +71,18 @@ export class Channels implements Resources {
     this.channelsPath = resolve(options.basePath, "channels");
     this.imageInput = options.imageInput ?? false;
     this.readTimeoutMs = options.readTimeoutMs ?? 10_000;
-    this.compactConfig = options.compactConfig ?? { minMessages: 20, maxFailures: 3 };
+    this.compactConfig = options.compactConfig ?? { minMessages: 15, maxFailures: 3 };
+    // The database is a required service in production, but tests and minimal contexts may omit
+    // it. Without it there is no overflow index; JSONL history alone stays fully functional.
+    this.fragmentStore = (ctx as { database?: unknown }).database ? new CompactFragmentStore(ctx) : undefined;
     this.logger = ctx.logger("channels");
     this.logger.level = options.logLevel ?? 2;
     this.started = this.scan();
+  }
+
+  /** Persistent compact-fragment overflow index shared by every channel of this Core instance. */
+  public get compactFragments(): CompactFragmentStore | undefined {
+    return this.fragmentStore;
   }
 
   public start(): Promise<void> {
@@ -110,19 +131,29 @@ export class Channels implements Resources {
   }
 
   public async reset(ctx: ChannelContext): Promise<void> {
-    const channel = await this.resolve(ctx);
-    this.logger.debug("channels.reset", { key: deriveChannelKey(ctx), root: channel.root });
+    const normalized = normalizeLegacyScope(ctx);
+    const key = deriveChannelKey(normalized);
+    // Resolve first because initialization may rebuild the overflow index from JSONL. Remove the
+    // exact channel only after that repair has completed, but before its source files disappear.
+    const channel = await this.resolve(normalized);
+    await this.fragmentStore?.removeChannel(key);
+    this.logger.debug("channels.reset", { key, root: channel.root });
     await Promise.all([
       fs.rm(join(channel.root, "sessions"), { recursive: true, force: true }),
       channel.resources.assets.clear(),
       channel.resources.artifacts.clear(),
     ]);
-    this.channels.delete(deriveChannelKey(ctx));
+    this.channels.delete(key);
   }
 
   private async create(ctx: ChannelContext, key: ChannelKey): Promise<Channel> {
     const root = await this.ensureRoot(ctx);
-    const channel = new Channel(ctx, root, this.imageInput, this.readTimeoutMs, this.compactConfig);
+    const fragments: ChannelFragmentOptions = {
+      ...(this.fragmentStore ? { store: this.fragmentStore } : {}),
+      onError: (operation, cause) =>
+        this.logger.warn("channels.compact_fragment_failed", { key, operation, errorName: cause instanceof Error ? cause.name : typeof cause }),
+    };
+    const channel = new Channel(ctx, root, this.imageInput, this.readTimeoutMs, this.compactConfig, fragments);
     for (const reader of this.readers.values()) {
       this.readerDisposers.get(reader)!.set(channel, channel.resources.use(reader));
     }

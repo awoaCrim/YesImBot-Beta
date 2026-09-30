@@ -94,8 +94,12 @@ export class Messenger {
   }
 
   private async route(session: Session): Promise<void> {
-    const ctx = contextFromSession(session);
     const routeId = session.messageId ?? String(session.id);
+    if (this.isResolvedCommand(session)) {
+      this.logger.debug("messenger.route.command_bypass", { routeId, platform: session.platform });
+      return;
+    }
+    const ctx = contextFromSession(session);
     if (!ctx || !matchesAllowedChannel(ctx, this.config.allowedChannels)) return;
     try {
       await this.channels.start();
@@ -120,6 +124,10 @@ export class Messenger {
     } catch (cause) {
       this.warn("messenger.route_failed", cause, session.platform);
     }
+  }
+
+  private isResolvedCommand(session: Session): boolean {
+    return session.argv !== undefined && this.ctx.$commander.resolveCommand(session.argv) !== undefined;
   }
 
   private async track(task: Promise<void>): Promise<void> {

@@ -1,7 +1,9 @@
 import { createOpenAI } from "@ai-sdk/openai";
 import type { ToolSet } from "ai";
 import { Context, Schema } from "koishi";
-import { type BaseProviderConfig } from "koishi-plugin-yesimbot";
+import { type BaseProviderConfig, type ImageToolResultSupport } from "koishi-plugin-yesimbot";
+
+import { withUserMessageImageToolResults } from "./image-tool-result.js";
 export const name = "yesimbot-provider-openai";
 
 export const usage = "OpenAI 提供商插件";
@@ -18,6 +20,17 @@ export const Config: Schema<Config> = Schema.intersect([
     format: Schema.union([Schema.const("chat"), Schema.const("responses")])
       .default("chat")
       .description("API 格式"),
+    imageToolResultSupport: Schema.union([
+      Schema.const("native").description("原生结构化图片工具结果"),
+      Schema.const("unsupported").description("不支持图片工具结果，改用视觉模型回退"),
+      Schema.const("unknown").description("能力未知，按不支持处理"),
+    ]).description("图片工具结果能力覆盖；留空时按 API 格式推导"),
+    imageToolResultPlacement: Schema.union([
+      Schema.const("tool-output").description("图片保留在工具结果中"),
+      Schema.const("user-message").description("图片提升为当前请求的临时用户消息"),
+    ])
+      .default("tool-output")
+      .description("原生图片工具结果的请求位置"),
     chatModels: Schema.array(
       Schema.object({
         id: Schema.string().required().description("模型 ID"),
@@ -46,21 +59,39 @@ export const Config: Schema<Config> = Schema.intersect([
 
 interface Config extends BaseProviderConfig {
   format: "chat" | "responses";
+  imageToolResultSupport?: ImageToolResultSupport;
+  imageToolResultPlacement?: "tool-output" | "user-message";
   webSearch?: boolean;
 }
 
+export function imageToolResultSupportForFormat(format: Config["format"], override?: ImageToolResultSupport): ImageToolResultSupport {
+  return override ?? (format === "responses" ? "native" : "unsupported");
+}
+
 export function apply(ctx: Context, config: Config) {
+  const client = createOpenAI({ apiKey: config.apiKey, baseURL: config.baseURL });
+  let disposeProvider: (() => void) | undefined;
+
   ctx.on("ready", () => {
-    const client = createOpenAI({ apiKey: config.apiKey, baseURL: config.baseURL });
-    const dispose = ctx.yesimbot.model.register({
+    const imageToolResultSupport = imageToolResultSupportForFormat(config.format, config.imageToolResultSupport);
+    const imageToolResultPlacement = config.imageToolResultPlacement ?? "tool-output";
+    disposeProvider = ctx.yesimbot.model.register({
       id: config.id,
       capabilities: { chat: true, embedding: true },
       chatModels: () => config.chatModels,
       embeddingModels: () => config.embeddingModels ?? [],
-      chat: (modelId: string) => (config.format === "responses" ? client.responses(modelId) : client.chat(modelId)),
+      chat: (modelId: string) => {
+        const model = config.format === "responses" ? client.responses(modelId) : client.chat(modelId);
+        return imageToolResultSupport === "native" && imageToolResultPlacement === "user-message" ? withUserMessageImageToolResults(model) : model;
+      },
       embedding: (modelId: string) => client.embedding(modelId),
-      tools: (): ToolSet => (config.format === "responses" && config.webSearch ? { web_search: client.tools.webSearch() } : {}),
+      chatCapabilities: () => ({ imageToolResult: imageToolResultSupport }),
+      tools: (): ToolSet => (config.format === "responses" && config.webSearch ? { web_search: client.tools.webSearch({}) } : {}),
     });
-    ctx.on("dispose", dispose);
+  });
+
+  ctx.on("dispose", () => {
+    disposeProvider?.();
+    disposeProvider = undefined;
   });
 }

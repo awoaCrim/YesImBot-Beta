@@ -7,7 +7,7 @@ import { ChannelArtifactStore, type ArtifactStore } from "./artifact.js";
 import { ChannelAssetStore, type AssetStore } from "./asset.js";
 import { persistElements as persistInboundElements } from "./input.js";
 
-const READ_MAX_BYTES = 5 * 1024 * 1024;
+export const RESOURCE_MAX_BYTES = 5 * 1024 * 1024;
 const COMPLETE_ASSET_ID = /^[a-f0-9]{32}$/;
 const URI_SHAPE = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#]*)(?:\/([^?#]*))?$/;
 const RESOURCE_SOURCE = /^(asset|artifact|workspace):\/\//;
@@ -54,6 +54,7 @@ export class ResourceReadError extends Error {
 export class ChannelResources {
   public readonly assets: AssetStore;
   public readonly artifacts: ArtifactStore;
+  public readonly maxBytes = RESOURCE_MAX_BYTES;
 
   private readonly readers = new Map<string, ResourceReader>();
 
@@ -113,6 +114,10 @@ export class ChannelResources {
     return [...this.readers.values()];
   }
 
+  public detectImageMediaType(bytes: Uint8Array): string | undefined {
+    return detectImageMediaType(bytes);
+  }
+
   public use(reader: ResourceReader): Disposer {
     if (reader.scheme === "asset" || reader.scheme === "artifact") throw new Error(`Scheme "${reader.scheme}" is reserved`);
     if (this.readers.has(reader.scheme)) throw new Error(`Resource reader for scheme "${reader.scheme}" is already registered`);
@@ -142,7 +147,7 @@ export class ChannelResources {
     };
     signal?.addEventListener("abort", onAbort, { once: true });
     try {
-      const result = await Promise.race([reader.setup(this, uri, { signal: controller.signal, maxBytes: READ_MAX_BYTES }), timed, cancelled]);
+      const result = await Promise.race([reader.setup(this, uri, { signal: controller.signal, maxBytes: RESOURCE_MAX_BYTES }), timed, cancelled]);
       if (signal?.aborted) throw new ResourceReadError("resource_read_aborted");
       return normalize(result);
     } catch (cause) {
@@ -175,29 +180,7 @@ export async function prepareOutputSegments(
   return prepared;
 }
 
-async function prepareElement(element: Element, resources: ChannelResources, signal?: AbortSignal): Promise<Element | undefined> {
-  if (element.children.length)
-    return h(
-      element.type,
-      element.attrs,
-      (await Promise.all(element.children.map((child) => prepareElement(child, resources, signal)))).filter((child): child is Element => child !== undefined),
-    );
-  const src = element.attrs.src;
-  if (typeof src !== "string" || !RESOURCE_SOURCE.test(src) || (element.type !== "img" && element.type !== "file")) return element;
-  if (element.type === "img" && !/^asset:\/\/[a-f0-9]{32}$/.test(src)) {
-    // ponytail: full 32-hex ID required for output resolution; prefix/short IDs are not resolvable
-    const scheme = src.slice(0, src.indexOf(":"));
-    if (scheme === "asset") return undefined;
-  }
-  const opened = await resources.open(src, signal);
-  if (!opened) return undefined;
-  const detected = detectMediaType(opened.bytes);
-  if (element.type === "img" && !detected) return undefined;
-  const mediaType = detected ?? opened.mediaType ?? "application/octet-stream";
-  return h(element.type, { ...element.attrs, src: `data:${mediaType};base64,${Buffer.from(opened.bytes).toString("base64")}` });
-}
-
-function detectMediaType(bytes: Uint8Array): string | undefined {
+export function detectImageMediaType(bytes: Uint8Array): string | undefined {
   if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
   if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
   if (
@@ -222,6 +205,28 @@ function detectMediaType(bytes: Uint8Array): string | undefined {
   )
     return "image/webp";
   return undefined;
+}
+
+async function prepareElement(element: Element, resources: ChannelResources, signal?: AbortSignal): Promise<Element | undefined> {
+  if (element.children.length)
+    return h(
+      element.type,
+      element.attrs,
+      (await Promise.all(element.children.map((child) => prepareElement(child, resources, signal)))).filter((child): child is Element => child !== undefined),
+    );
+  const src = element.attrs.src;
+  if (typeof src !== "string" || !RESOURCE_SOURCE.test(src) || (element.type !== "img" && element.type !== "file")) return element;
+  if (element.type === "img" && !/^asset:\/\/[a-f0-9]{32}$/.test(src)) {
+    // ponytail: full 32-hex ID required for output resolution; prefix/short IDs are not resolvable
+    const scheme = src.slice(0, src.indexOf(":"));
+    if (scheme === "asset") return undefined;
+  }
+  const opened = await resources.open(src, signal);
+  if (!opened) return undefined;
+  const detected = detectImageMediaType(opened.bytes);
+  if (element.type === "img" && !detected) return undefined;
+  const mediaType = detected ?? opened.mediaType ?? "application/octet-stream";
+  return h(element.type, { ...element.attrs, src: `data:${mediaType};base64,${Buffer.from(opened.bytes).toString("base64")}` });
 }
 
 function parseUri(value: string): URL | undefined {
@@ -250,7 +255,7 @@ function normalize(value: unknown): ResourceOpenResult {
   if (!value || typeof value !== "object" || !("bytes" in value)) throw new Error("Invalid resource result");
   const result = value as Partial<ResourceOpenResult>;
   if (!(result.bytes instanceof Uint8Array)) throw new Error("Invalid resource bytes");
-  if (result.bytes.byteLength > READ_MAX_BYTES) throw new ResourceReadError("resource_too_large");
+  if (result.bytes.byteLength > RESOURCE_MAX_BYTES) throw new ResourceReadError("resource_too_large");
   if (result.mediaType !== undefined && !/^[a-zA-Z0-9!#$&^_.+-]+\/[a-zA-Z0-9!#$&^_.+-]+$/.test(result.mediaType))
     throw new Error("Invalid resource media type");
   if (result.filename !== undefined && (result.filename.length === 0 || /[\\/\0]/.test(result.filename))) throw new Error("Invalid resource filename");

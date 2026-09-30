@@ -8,6 +8,8 @@ export const usage = "Anthropic 提供商插件";
 
 export const inject = ["yesimbot"];
 
+export const imageToolResultSupport = "native" as const;
+
 export const Config: Schema<Config> = Schema.object({
   id: Schema.string().default("anthropic").description("提供商标识"),
   apiKey: Schema.string().role("secret").required().description("API Key"),
@@ -42,6 +44,7 @@ export function apply(ctx: Context, config: Config) {
       chatModels: () => config.chatModels,
       embeddingModels: () => [],
       chat: (modelId: string) => client.chat(modelId),
+      chatCapabilities: () => ({ imageToolResult: imageToolResultSupport }),
       embedding: () => {
         throw new Error(`Provider "${config.id}" does not support embedding`);
       },
