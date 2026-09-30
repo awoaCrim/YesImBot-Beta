@@ -18,8 +18,11 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../src/transports", () => ({ connectMcpServer: mocks.connectMcpServer }));
 
 vi.mock("koishi-plugin-yesimbot", () => ({
+  DEFAULT_MANAGEMENT_TOOL_SCOPES: [{ platform: "onebot", channelId: "*", userId: "1049700117" }],
   formatElements: (elements: Array<{ attrs?: { content?: unknown }; type?: unknown }>) =>
     elements.map((element) => (element.type === "text" ? String(element.attrs?.content ?? "") : "")).join(""),
+  isToolAccessAllowed: (scope: { platform: string; channelId: string }, rules: Array<{ platform: string; channelId: string }> | undefined) =>
+    rules?.some((rule) => rule.platform === scope.platform && (rule.channelId === "*" || rule.channelId === scope.channelId)) ?? false,
 }));
 
 vi.mock("koishi", () => {
@@ -108,7 +111,10 @@ async function buildPlugin(tools = DEFAULT_TOOLS) {
   const { ctx, artifactWriter, scopedLogger } = createContext();
   const client = createClient(tools);
   mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn(async () => undefined) } });
-  const plugin = new McpClientPlugin(ctx as never, { mcpServers: { luckin: { type: "http", url: "https://example.test/mcp" } } });
+  const plugin = new McpClientPlugin(ctx as never, {
+    allowedScopes: [{ platform: "qq", channelId: "*" }],
+    mcpServers: { luckin: { type: "http", url: "https://example.test/mcp" } },
+  });
   await plugin.start();
   return { plugin, client, artifactWriter, scopedLogger };
 }

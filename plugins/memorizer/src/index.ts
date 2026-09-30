@@ -36,40 +36,15 @@ export const Config: Schema<MemorizerConfig> = Schema.object({
   ),
 });
 
-const CHANNEL_MEMORY_PROMPT = `## 长期记忆工具
+const CHANNEL_MEMORY_PROMPT = `## 长期记忆
 
-你有三个记忆工具可用：
+你可以使用 recall、remember、search 三个记忆工具。记忆不是聊天记录：只保留有长期价值、可由当前证据支持且不涉及敏感凭据的内容。
 
-### recall — 快速检索（零/低成本）
-从记忆库中按关键词、标签、类型检索已存储的记忆。适用于：
-- 回复前快速获取相关背景（某人的偏好、身份、历史）
-- 确认某个事实是否已知
-- 参数建议：query 用关键名词，types 缩小范围，limit 控制数量
-- 换了说法、同义词或存在错别字时关键词会漏，此时加 semantic: true 做语义召回（会消耗一次 embedding 调用）
+- **recall**：低成本获取当前回应需要的背景或确认已知事实；普通事实先用它，必要时再启用语义召回。
+- **remember**：遇到持久事实、明确偏好、关系变化、重要事件或群体共识时提交整理请求，并提供相关消息作为证据。不要记录临时请求、纯情绪/玩笑、重复记忆、密码或 token。
+- **search**：需要交叉验证多条记忆或回答复杂关系问题时使用；简单事实优先 recall。
 
-### remember — 提交记忆整理请求
-当对话中出现值得长期记住的信息时调用。后台 Maintainer 会批量处理。
-- content：对记忆主题的简洁描述（如"用户表达了对 X 的偏好"）
-- sources：相关消息的 messageId 列表（作为证据）
-
-**何时 remember**：
-- 新的持久事实（某人的职业、技能、物品）
-- 明确表达的偏好或习惯
-- 关系变化（新认识的人、角色变动）
-- 重要事件（项目决策、里程碑）
-- 群组共识形成
-
-**不要 remember**：
-- 临时性请求（"帮我查个东西"）
-- 纯情绪/玩笑/无信息量的聊天
-- 已经记忆过的相同信息
-- 敏感凭据（密码、token）
-
-### search — 深度搜索（启动 Agent，有成本）
-当需要交叉验证多条记忆、推理复杂问题时使用。返回结构化报告。
-- 适用于："某人和某人上次合作结果如何"、"群里对这个话题的共识是什么"
-- 不适用于简单事实查询（用 recall）
-`;
+记忆内容和回复都要区分证据、推测与不确定性；具体字段、范围和限制以工具 schema 为准。`;
 
 export default class MemoryAgentPlugin {
   public static readonly name = "yesimbot-memorizer";

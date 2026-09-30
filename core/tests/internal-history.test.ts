@@ -451,6 +451,30 @@ describe("internal model-history projection", () => {
     expect(stripInternalAssistantInputs(projected, "gemini-native")).toEqual(projected);
   });
 
+  it("keeps a paragraph-split send paired by source-item count rather than platform message IDs", () => {
+    const assistant = createAssistantMessage([
+      { type: "tool-call", toolCallId: "send-1", toolName: "send_message", input: { messages: ["第一段\n\n第二段"] } },
+    ]);
+    const tool = createToolMessage([
+      {
+        type: "tool-result",
+        toolCallId: "send-1",
+        toolName: "send_message",
+        output: { type: "json", value: { ok: true, count: 1, messageIds: ["m1", "m2"] } },
+      },
+    ]);
+    const entries = [createEntry("message", assistant, { id: "assistant-1", timestamp: 1 }), createEntry("message", tool, { id: "tool-1", timestamp: 2 })];
+
+    const projected = stripInternalAssistantInputs(entries, "gemini-native");
+
+    expect(projected).toHaveLength(2);
+    expect(projected[0]).toMatchObject({ data: { content: [{ type: "tool-call", toolCallId: "send-1", input: { messages: ["第一段\n\n第二段"] } }] } });
+    expect(projected[1]).toMatchObject({ data: { content: [{ type: "tool-result", toolCallId: "send-1" }] } });
+    expect(stripInternalAssistantInputs(entries)[0]).toMatchObject({
+      data: { type: "yesimbot.delivered-transcript", data: { messages: ["第一段\n\n第二段"], deliveredCount: 1 } },
+    });
+  });
+
   it.each([
     ["partial delivery", { ok: false, sent: ["m1"], failedAt: 1 }],
     ["zero delivery", { ok: false, sent: [], failedAt: 0 }],

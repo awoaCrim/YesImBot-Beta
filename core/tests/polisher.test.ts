@@ -269,6 +269,33 @@ describe("createSendMessageTool polisher integration", () => {
     expect(sentPayload(sendMessage)).not.toContain("原稿");
   });
 
+  it("keeps blank lines inside the accepted polish while preserving the draft shape and receipt count", async () => {
+    const polish = vi.fn(async () => ["润色一\n\n润色二"]);
+    const { tool, sendMessage } = createTool({ polish: createPolishHook(polish) });
+    const input = { facts: ["f"], messages: ["草稿一\n\n草稿二"], mode: "raw" as const };
+
+    await expect(tool.execute(input, execution())).resolves.toMatchObject({ ok: true, count: 1, messageIds: ["m1"] });
+    expect(polish).toHaveBeenCalledOnce();
+    expect(polish).toHaveBeenCalledWith(expect.objectContaining({ messages: ["草稿一\n\n草稿二"] }), context, undefined);
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sentPayload(sendMessage)).toContain("润色一");
+    expect(sentPayload(sendMessage)).toContain("润色二");
+    expect(input.messages).toEqual(["草稿一\n\n草稿二"]);
+  });
+
+  it("keeps the original draft as one delivery when polishing fails", async () => {
+    const polish = vi.fn(async () => {
+      throw new Error("unavailable");
+    });
+    const { tool, sendMessage } = createTool({ polish });
+
+    await expect(tool.execute({ facts: ["f"], messages: ["草稿一\n\n草稿二"], mode: "raw" }, execution())).resolves.toMatchObject({ ok: true, count: 1 });
+    expect(polish).toHaveBeenCalledOnce();
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sentPayload(sendMessage)).toContain("草稿一");
+    expect(sentPayload(sendMessage)).toContain("草稿二");
+  });
+
   it("forwards the bounded current-turn context immediately before polishing", async () => {
     const polish = vi.fn(async () => ["润色后的稿子"]);
     const { tool, sendMessage } = createTool({ polish: createPolishHook(polish) });

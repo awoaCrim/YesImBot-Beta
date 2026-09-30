@@ -1,5 +1,7 @@
 /* eslint-disable vitest/require-mock-type-parameters */
-import type { AgentPlugin } from "@yesimbot/agent-runtime";
+import { createAgent, createUserMessage, jsonSchema, type AgentPlugin } from "@yesimbot/agent-runtime";
+import type { ModelMessage } from "ai";
+import { convertArrayToReadableStream, MockLanguageModelV3 } from "ai/test";
 import type { ChannelContext } from "koishi-plugin-yesimbot";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -79,9 +81,10 @@ describe("StickerManagerPlugin", () => {
     const model = createMemoryModel<StickerRow>();
     const { commands, command } = createCommandMock();
     const agentDispose = { current: undefined as (() => void) | undefined };
+    const logger = { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
     const ctx = {
       baseDir: process.cwd(),
-      logger: () => ({ info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }),
+      logger: () => logger,
       on: vi.fn((event: string, callback: () => Promise<void> | void) => {
         if (event === "ready") ready.push(callback);
         if (event === "dispose") dispose.push(callback);
@@ -113,10 +116,11 @@ describe("StickerManagerPlugin", () => {
       model,
       commands,
       agentDispose,
-      async start(bot: unknown = { selfId: "bot" }): Promise<AgentPlugin | null> {
+      logger,
+      async start(bot: unknown = { selfId: "bot" }, channelScope: ChannelContext = scope): Promise<AgentPlugin | null> {
         await ready[0]?.();
         if (!registeredPlugin) throw new Error("sticker plugin was not registered");
-        return registeredPlugin.setup(scope, bot as never);
+        return registeredPlugin.setup(channelScope, bot as never);
       },
       async stop(): Promise<void> {
         await dispose[0]?.();
@@ -180,8 +184,14 @@ describe("StickerManagerPlugin", () => {
     expect(prompt).toContain("发送表情包必须调用 sticker_send");
     expect(prompt).not.toContain("当前角色本身喜欢用表情包");
     expect(prompt).not.toContain("千早爱音");
-    expect(prompt).toContain("同一轮最多实际发送一张表情包");
-    expect(prompt).toContain("先调用 send_message 并设置 continue=true，再调用 sticker_send");
+    expect(prompt).toContain("同一轮最多实际发送一张");
+    expect(prompt).toContain("开心、得意、吐槽、害羞");
+    expect(prompt).toContain("不必等对方要求");
+    expect(prompt).toContain("发送文字前先决定");
+    expect(prompt).toContain("不合适时可省略");
+    expect(prompt).toContain("不要为完成规则强行发送");
+    expect(prompt.length).toBeLessThan(700);
+    expect(prompt).toContain("先调用 send_message 并设置 continue=true，再调用 terminal 的 sticker_send");
     expect(prompt).not.toContain("也可以直接输出 <sticker");
     expect(prompt).not.toContain("需要发图时可直接输出");
     expect(prompt).not.toContain("不需要调用 sticker_send");
@@ -190,6 +200,209 @@ describe("StickerManagerPlugin", () => {
     const sendTool = tools.find((tool) => tool.name === "sticker_send");
     expect(sendTool?.description).toContain("不传 sticker_id、category、index、tags 时会随机选择一张");
     expect(sendTool?.description).toContain("先让 send_message 使用 continue=true，再调用本工具");
+  });
+
+  function preparation(turnId: string, stepNumber = 0) {
+    return { turnId, stepNumber } as never;
+  }
+
+  function catalogFrom(messages: readonly ModelMessage[]) {
+    const catalog = messages.find((message) => message.role === "user" && typeof message.content === "string" && message.content.startsWith("[表情包库概览"));
+    if (!catalog || typeof catalog.content !== "string") throw new Error("missing sticker catalog");
+    return catalog.content;
+  }
+
+  it("provides a scoped catalog as request-only data without changing the stable prompt or input", async () => {
+    const harness = createHarness({ enableSteal: false });
+    const plugin = await harness.start();
+    if (!registeredPlugin || !plugin) throw new Error("missing plugin");
+    const list = vi.spyOn(registeredPlugin.store, "listCategories").mockResolvedValue([
+      { category: "开心", count: 3 },
+      { category: "害羞", count: 1 },
+    ]);
+    const messages: ModelMessage[] = [{ role: "user", content: "hello" }];
+    const prepared = (await plugin.prepareStep?.(messages, preparation("turn-1"))) ?? messages;
+    const catalog = catalogFrom(prepared);
+
+    expect(list).toHaveBeenCalledWith("global");
+    expect(JSON.parse(catalog.split("\n")[1])).toEqual({
+      total: 4,
+      categories: [
+        { category: "开心", count: 3 },
+        { category: "害羞", count: 1 },
+      ],
+      omittedCategories: 0,
+    });
+    expect(messages).toEqual([{ role: "user", content: "hello" }]);
+    expect(await pluginPrompt(plugin)).not.toContain("表情包库概览");
+    expect(catalog).not.toMatch(/asset:\/\/|artifact:\/\/|workspace:\/\//);
+    expect(harness.model.create).not.toHaveBeenCalled();
+    expect(harness.model.set).not.toHaveBeenCalled();
+  });
+
+  it("reads only the current channel's categories when the library is channel-scoped", async () => {
+    const harness = createHarness({ scope: "channel" });
+    const plugin = await harness.start();
+    if (!plugin) throw new Error("missing plugin");
+    const row = (scopeKey: string, category: string): StickerRow => ({
+      id: `${scopeKey}:id`,
+      contentId: "a".repeat(64),
+      scopeKey,
+      category,
+      tags: [],
+      mime: "image/png",
+      size: 1,
+      source: { kind: "import" },
+      usageCount: 0,
+      lastUsedAt: null,
+      createdAt: "2026-01-01",
+      updatedAt: "2026-01-01",
+    });
+    harness.model.tables.set("yesimbot_sticker", [row("group:test:room", "本频道"), row("group:test:other", "其他频道")]);
+    const prepared = (await plugin.prepareStep?.([], preparation("turn-1"))) ?? [];
+
+    expect(harness.model.get).toHaveBeenCalledWith("yesimbot_sticker", { scopeKey: "group:test:room" });
+    expect(catalogFrom(prepared)).toContain("本频道");
+    expect(catalogFrom(prepared)).not.toContain("其他频道");
+  });
+
+  it("keeps one snapshot across steps and rebuilds, then refreshes for a new turn", async () => {
+    const harness = createHarness();
+    const plugin = await harness.start();
+    if (!registeredPlugin || !plugin) throw new Error("missing plugin");
+    const list = vi
+      .spyOn(registeredPlugin.store, "listCategories")
+      .mockResolvedValueOnce([{ category: "旧分类", count: 1 }])
+      .mockResolvedValue([{ category: "新分类", count: 2 }]);
+    const first = (await plugin.prepareStep?.([], preparation("turn-1"))) ?? [];
+    const nextStep = (await plugin.prepareStep?.([], preparation("turn-1", 1))) ?? [];
+    const rebuild = (await plugin.prepareStep?.(first, preparation("turn-1"))) ?? [];
+
+    expect(catalogFrom(nextStep)).toBe(catalogFrom(first));
+    expect(rebuild).toBe(first);
+    expect(list).toHaveBeenCalledOnce();
+    const nextTurn = (await plugin.prepareStep?.([], preparation("turn-2"))) ?? [];
+    expect(catalogFrom(nextTurn)).toContain("新分类");
+    expect(catalogFrom(nextTurn)).not.toContain("旧分类");
+    expect(list).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears the catalog snapshot when the turn finishes", async () => {
+    const harness = createHarness();
+    const plugin = await harness.start();
+    if (!registeredPlugin || !plugin) throw new Error("missing plugin");
+    const list = vi.spyOn(registeredPlugin.store, "listCategories").mockResolvedValue([]);
+    await plugin.prepareStep?.([], preparation("turn-1"));
+    await plugin.onTurnFinish?.({ turnId: "turn-1", status: "done", messages: [] }, { turnId: "turn-1" } as never);
+    await plugin.prepareStep?.([], preparation("turn-1"));
+    expect(list).toHaveBeenCalledTimes(2);
+  });
+
+  it("limits catalog entries without enumerating every sticker", async () => {
+    const harness = createHarness();
+    const plugin = await harness.start();
+    if (!registeredPlugin || !plugin) throw new Error("missing plugin");
+    const categories = Array.from({ length: 50 }, (_, index) => ({ category: `分类-${index}`, count: 50 - index }));
+    vi.spyOn(registeredPlugin.store, "listCategories").mockResolvedValue(categories);
+    const text = catalogFrom((await plugin.prepareStep?.([], preparation("turn-1"))) ?? []);
+    const data = JSON.parse(text.split("\n")[1]);
+
+    expect(text.length).toBeLessThanOrEqual(2000);
+    expect(data.categories).toHaveLength(20);
+    expect(data.omittedCategories).toBe(30);
+    expect(data.total).toBe(1275);
+    expect(data.categories[0]).toEqual({ category: "分类-0", count: 50 });
+  });
+
+  it("caps serialized characters and preserves complete JSON-quoted category names", async () => {
+    const harness = createHarness();
+    const plugin = await harness.start();
+    if (!registeredPlugin || !plugin) throw new Error("missing plugin");
+    const names = Array.from({ length: 20 }, (_, index) => `${"\\".repeat(60)}${index}`);
+    const categories = [{ category: "x".repeat(3000), count: 99 }, ...names.map((category) => ({ category, count: 1 }))];
+    vi.spyOn(registeredPlugin.store, "listCategories").mockResolvedValue(categories);
+    const text = catalogFrom((await plugin.prepareStep?.([], preparation("turn-1"))) ?? []);
+    const data = JSON.parse(text.split("\n")[1]);
+
+    expect(text.length).toBeLessThanOrEqual(2000);
+    expect(data.categories.length).toBeGreaterThan(0);
+    expect(data.categories.length).toBeLessThan(20);
+    expect(data.categories.every((item: { category: string }) => names.includes(item.category))).toBe(true);
+    expect(data.omittedCategories).toBe(categories.length - data.categories.length);
+  });
+
+  it("announces an empty visible library without attempting delivery", async () => {
+    const harness = createHarness({ enableSteal: false });
+    const sendMessage = vi.fn();
+    const plugin = await harness.start({ selfId: "bot", sendMessage });
+    const text = catalogFrom((await plugin?.prepareStep?.([], preparation("turn-1"))) ?? []);
+
+    expect(text).toContain("回合开始时可见库为空");
+    expect(text).toContain("未获得新库存结果前");
+    expect(text).toContain("不要随机调用 sticker_send");
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("fails open for a catalog read error and retries on the next turn", async () => {
+    const harness = createHarness();
+    const plugin = await harness.start();
+    if (!registeredPlugin || !plugin) throw new Error("missing plugin");
+    const list = vi
+      .spyOn(registeredPlugin.store, "listCategories")
+      .mockRejectedValueOnce(new Error("database_unavailable"))
+      .mockResolvedValue([{ category: "恢复", count: 1 }]);
+    const messages: ModelMessage[] = [{ role: "user", content: "hello" }];
+
+    expect(await plugin.prepareStep?.(messages, preparation("turn-1"))).toBe(messages);
+    expect(await plugin.prepareStep?.(messages, preparation("turn-1", 1))).toBe(messages);
+    expect(list).toHaveBeenCalledOnce();
+    expect(harness.logger.warn).toHaveBeenCalledOnce();
+    expect(catalogFrom((await plugin.prepareStep?.(messages, preparation("turn-2"))) ?? messages)).toContain("恢复");
+  });
+
+  it("includes the catalog in the real model request but never persists it in Agent storage", async () => {
+    const harness = createHarness();
+    const plugin = await harness.start();
+    if (!registeredPlugin || !plugin) throw new Error("missing plugin");
+    const list = vi.spyOn(registeredPlugin.store, "listCategories").mockResolvedValue([{ category: "CATALOG_SENTINEL", count: 1 }]);
+    let step = 0;
+    const model = new MockLanguageModelV3({
+      doStream: async () => {
+        const index = step++;
+        return {
+          stream: convertArrayToReadableStream([
+            { type: "stream-start", warnings: [] },
+            { type: "tool-call", toolCallId: `call-${index}`, toolName: index === 0 ? "inspect" : "finish", input: "{}" },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              usage: { inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 1, text: 1, reasoning: 0 } },
+            },
+          ]),
+        };
+      },
+    });
+    const schema = jsonSchema<Record<string, never>>({ type: "object", additionalProperties: false });
+    const agent = createAgent({
+      model,
+      plugins: [plugin],
+      requireTerminalTool: true,
+      tools: [
+        { name: "inspect", inputSchema: schema, execute: async () => ({ ok: true }) },
+        { name: "finish", terminal: true, inputSchema: schema, execute: async () => ({ ok: true }) },
+      ],
+    });
+    try {
+      agent.send(createUserMessage("hello"));
+      await agent.wait();
+      expect(model.doStreamCalls).toHaveLength(2);
+      expect(model.doStreamCalls.every((call) => JSON.stringify(call.prompt).includes("CATALOG_SENTINEL"))).toBe(true);
+      expect(list).toHaveBeenCalledOnce();
+      expect(JSON.stringify(await agent.storage.read())).not.toContain("CATALOG_SENTINEL");
+      expect(harness.model.create).not.toHaveBeenCalled();
+    } finally {
+      await agent.stop();
+    }
   });
 
   it("keeps sticker_steal in tools and prompt while stealing is enabled", async () => {

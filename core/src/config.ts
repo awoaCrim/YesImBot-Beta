@@ -50,6 +50,14 @@ export const Config: Schema<Config> = Schema.intersect([
         minMessages: finiteNumber(1).default(15).description("手动/兼容压缩所需的最少消息数"),
         maxFailures: finiteNumber(1).default(3).description("自动压缩连续失败上限"),
         inlineFragments: finiteInteger(1).default(3).description("请求上下文中常驻的最近压缩片段数量；更旧的片段写入持久存储并按需召回"),
+        mode: Schema.union(["summary", "compartment"])
+          .default("summary")
+          .description("压缩模式；summary 保持兼容，compartment 按时间块增量压缩并支持 ctx_expand"),
+        chunkMessages: finiteInteger(1).default(20).description("compartment 模式每个时间块最多包含的消息数"),
+        chunkChars: finiteInteger(1).default(12_000).description("compartment 模式每个时间块的最大输入字符数"),
+        assistantAsFacts: Schema.boolean()
+          .default(false)
+          .description("compartment 模式是否把历史 assistant 输出转成客观动作/事实供压缩；默认不注入 assistant 原话"),
         model: Schema.dynamic("registry.chatModels").description("压缩模型；留空则使用默认对话模型"),
       }).description("自动压缩"),
       archive: Schema.object({
@@ -80,6 +88,10 @@ export interface SessionCompactConfig {
   minMessages: number;
   maxFailures: number;
   inlineFragments: number;
+  mode: "summary" | "compartment";
+  chunkMessages: number;
+  chunkChars: number;
+  assistantAsFacts: boolean;
   model: string | undefined;
 }
 

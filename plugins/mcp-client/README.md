@@ -2,6 +2,25 @@
 
 Expose tools from configured MCP servers to Athena channel runtimes.
 
+## Scope Allowlist
+
+MCP tools use an explicit allowlist. By default, the OneBot direct-message user `1049700117` is authorized; an empty `allowedScopes` list denies all MCP tool definitions, including read-only tools. Confirmation is an additional execution safeguard, not a replacement for this allowlist.
+
+```yaml
+allowedScopes:
+  # Direct messages: authorize a QQ user across its private channel IDs.
+  - platform: onebot
+    channelId: "*"
+    userId: "10001"
+    selfId: "*"
+  # Group/channel runtime: authorize one exact channel.
+  - platform: onebot
+    channelId: "123456789"
+    selfId: "3535802886"
+```
+
+A concrete `userId` matches direct messages only. Omit `userId` for a group/channel rule. Unlisted scopes receive no MCP tool definitions or MCP system guidance.
+
 ## Tool Registry
 
 On startup, the plugin connects to each configured MCP server, calls `listTools()`, converts the returned MCP tools to `AgentTool` definitions, and publishes them through `AgentPlugin.tools`.
@@ -53,7 +72,7 @@ Servers that keep using explicit `headers` without `bearerTokenFile` behave exac
 
 ## Side-Effect Confirmation
 
-Every tool returned by `listTools()` is registered; the catalog is never reduced by a static allowlist. Each tool is classified from its upstream name and description.
+For an authorized scope, every tool returned by `listTools()` is registered; the catalog is never reduced by a static tool-name allowlist. Each tool is classified from its upstream name and description.
 
 - explicit read-only action vocabulary (`list`, `search`, `query`, `get`, `detail`, `查询`, `列表`, ...) is forwarded immediately;
 - side-effect vocabulary (`create`, `cancel`, `pay`, `submit`, `delete`, `下单`, `支付`, `取消`, ...) requires confirmation;

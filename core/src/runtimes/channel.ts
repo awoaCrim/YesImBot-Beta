@@ -20,6 +20,7 @@ import { Universal, type Bot, type Context, type Logger } from "koishi";
 import type { MessagePolisherCapability } from "../agents/polisher.js";
 import {
   createDescribeImageTool,
+  createExpandCompartmentTool,
   createFinishTool,
   createReadTool,
   createSendMessageTool,
@@ -167,6 +168,7 @@ export class ChannelRuntime {
         onFailed: (notice) => this.announceSendFailed(notice),
       }),
       createReadTool(options.channel.resources, options.readImagePolicy, this.imageProjection),
+      createExpandCompartmentTool(options.channel.conversation),
       createFinishTool(),
     ];
     if (options.visionModel && options.readImagePolicy.mode !== "native") {
@@ -1075,10 +1077,22 @@ function createSummaryHistoryPlugin(inlineFragments: number): AgentPlugin {
       const summaries = resident.map((compact) =>
         createEntry(
           "message",
-          createSystemMessage(formatResidentCompactFragment(compact.data.summary), {
-            id: compact.id,
-            timestamp: compact.timestamp,
-          }),
+          createSystemMessage(
+            formatResidentCompactFragment(
+              compact.data.summary,
+              compact.data.mode === "compartment"
+                ? {
+                    id: compact.data.compartmentId ?? compact.id,
+                    mode: "compartment",
+                    ...(compact.data.compartmentLabel ? { label: compact.data.compartmentLabel } : {}),
+                  }
+                : {},
+            ),
+            {
+              id: compact.id,
+              timestamp: compact.timestamp,
+            },
+          ),
           { id: compact.id, timestamp: compact.timestamp },
         ),
       );

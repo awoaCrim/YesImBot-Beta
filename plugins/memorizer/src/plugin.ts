@@ -79,7 +79,9 @@ export function createChannelTools(
 ): AgentTool[] {
   const recall: AgentTool<RecallInput, { memories: MemoryRecall[]; semanticUsed: boolean }> = {
     name: "recall",
-    description: "检索当前频道、当前轮参与者和全局可见的长期记忆。",
+    description:
+      "检索当前频道、当前轮参与者和全局可见的长期记忆。可按 query、tags、types、scope、limit 过滤；关键词不足时可将 semantic 设为 true，返回结果包含证据数量和相对时间。",
+
     inputSchema: RECALL_SCHEMA,
     execute: async (input, execution) => {
       const current = execution as unknown as AgentToolExecuteContext;
@@ -101,7 +103,9 @@ export function createChannelTools(
   };
   const remember: AgentTool<RememberInput, { queued: true; pendingId: string; sourceCount: number }> = {
     name: "remember",
-    description: "将当前频道的指定消息上下文加入长期记忆整理队列。",
+    description:
+      "将当前频道的指定消息上下文加入后台长期记忆整理队列。content 写要保留的事实或偏好，sources 必须是相关 messageId；可选 scope 控制记忆可见范围。",
+
     inputSchema: REMEMBER_SCHEMA,
     execute: async (input, execution) => {
       const sources = [...new Set(input.sources)];
@@ -126,7 +130,8 @@ export function createChannelTools(
   };
   const search: AgentTool<SearchInput, MemorySearchReport> = {
     name: "search",
-    description: "让记忆代理基于已授权的记忆和证据生成结构化报告。",
+    description: "让记忆代理基于已授权的记忆和证据生成结构化报告。query 必填；需要复杂交叉验证时使用，简单事实优先使用 recall。",
+
     inputSchema: SEARCH_SCHEMA,
     execute: (input, execution) => options.search(input, execution as unknown as AgentToolExecuteContext),
   };

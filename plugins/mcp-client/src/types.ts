@@ -1,6 +1,7 @@
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { ToolAccessRule } from "koishi-plugin-yesimbot";
 
 export type McpServer = McpStdioServer | McpHttpServer | McpSseServer;
 
@@ -34,4 +35,6 @@ export interface McpSseServer {
 
 export interface McpClientConfig {
   mcpServers: Record<string, McpServer>;
+  /** Sensitive MCP tools are exposed only to explicitly authorized scopes. */
+  allowedScopes?: ToolAccessRule[];
 }

@@ -29,6 +29,10 @@ export { createSendMessagePolisher, extractProtectedTokens, PolisherRegistry, va
 
 export type { ChannelContext, ChannelKey } from "./channels/index.js";
 
+export { DEFAULT_MANAGEMENT_TOOL_SCOPES, isToolAccessAllowed } from "./tool-access.js";
+
+export type { ToolAccessRule } from "./tool-access.js";
+
 export type { ConversationReadOptions } from "./conversations/index.js";
 
 export type { MessageBatchController, MessageBatchInput, MessageBatchPlugin, MessageBatchSetupExtensions } from "./message-batches/index.js";

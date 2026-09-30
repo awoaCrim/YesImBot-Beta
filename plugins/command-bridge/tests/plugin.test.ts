@@ -11,6 +11,7 @@ import type { CommandBridgeConfig } from "../src/types.js";
 
 function createConfig(overrides: Partial<CommandBridgeConfig> = {}): CommandBridgeConfig {
   return {
+    allowedScopes: [{ platform: "test", channelId: "room" }],
     trustMode: "locked",
     allowCommands: ["weather"],
     hardDeny: ["yesimbot", "koishi_execute", "koishi_execute_abort", "koishi_prompt_answer"],
@@ -49,6 +50,30 @@ describe("CommandBridgePlugin", () => {
     ]);
 
     await plugin.stop();
+  });
+
+  it("hides bridge tools from scopes outside the allowlist", async () => {
+    const plugin = new CommandBridgePlugin(
+      {
+        logger: vi.fn(() => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn() })),
+        on: vi.fn(),
+        yesimbot: { resource: { get: vi.fn(async () => ({})) } },
+      } as never,
+      createConfig({ allowedScopes: [{ platform: "test", channelId: "*", userId: "100" }] }) as never,
+    );
+
+    const denied = await plugin.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" }, {} as never);
+    expect(typeof denied.tools === "function" ? await denied.tools({} as never) : denied.tools).toEqual([]);
+
+    const allowed = await plugin.setup({ type: "direct", platform: "test", channelId: "private:100", userId: "100", selfId: "bot" }, {} as never);
+    const tools = typeof allowed.tools === "function" ? await allowed.tools({} as never) : allowed.tools;
+    expect(tools?.map((tool) => tool.name)).toEqual([
+      "koishi_execute_list",
+      "koishi_execute_help",
+      "koishi_execute",
+      "koishi_prompt_answer",
+      "koishi_execute_abort",
+    ]);
   });
 
   it("lists only commands allowed by the locked policy", async () => {

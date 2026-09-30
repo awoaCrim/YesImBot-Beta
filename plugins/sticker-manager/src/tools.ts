@@ -108,11 +108,11 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
     name: "sticker_send",
     terminal: true,
     description: [
-      "发送一个已收藏的表情包。",
-      "是否调用本工具由当前回复决定；不需要发送表情包时可以不调用。",
+      "发送一个已收藏的表情包，可作为轻松互动中的回应或文字后的情绪反应；在发送文字前决定是否使用。",
       "同一轮最多实际发送一张；本轮成功发送后再次调用会返回 sticker_send_limit_reached。",
-      "不传 sticker_id、category、index、tags 时会随机选择一张；也可以选择不调用本工具。",
-      "可用 sticker_categories 和 sticker_search 查询；sticker_id 优先，也可按 category 随机或按 index 指定。",
+      "不传 sticker_id、category、index、tags 时会随机选择一张；不合适时可以省略表情包，不要为了发送而随机选无关内容。",
+      "sticker_id 优先；category 必须与已有分类名精确一致，单传 category 会从该分类随机选一张，已知分类时无需先搜索；也可按 index 指定。",
+      "sticker_categories 和当前库概览提供分类，sticker_search 用于查找具体 id；查询结果不代表你已看过图片。",
       "如果本轮还要发送文字，必须先让 send_message 使用 continue=true，再调用本工具；本工具调用后会结束本轮。",
       ...(config.sendStaticAsGif ? ["静态图片会自动转成单帧 GIF 后发送。"] : []),
       ...(config.tagMode ? [`也可仅传 tags 选择多个标签，并从匹配分范围内的表情包中随机发送。${config.fuzzyTagMatch ? "tag 默认支持模糊匹配。" : ""}`] : []),
@@ -121,7 +121,7 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
       type: "object",
       properties: {
         sticker_id: { type: "string", description: "sticker_search 返回的 id" },
-        category: { type: "string", description: "分类名" },
+        category: { type: "string", description: "已有分类的完整名称，精确匹配；单传时从该分类随机选择" },
         index: { type: "integer", minimum: 1, description: "分类内 1-based 序号" },
         ...(config.tagMode
           ? {
@@ -208,6 +208,8 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
     name: "sticker_search",
     description: [
       "搜索当前可见的表情包，返回紧凑 id 列表，供 sticker_send 使用。",
+      "category 按完整分类名精确匹配；keyword 只是分类名、id 或标签的单个子串，不支持 OR/AND 运算，也不按图片画面或人物进行语义搜索。",
+      "已知合适分类时，可直接用 sticker_send 按分类发送，无需先搜索。",
       "sticker_search 只用于查询；确定目标后必须调用 sticker_send。",
       "绝不能把返回的 id 拼成 artifact:// 等资源 URI。",
       ...(config.tagMode ? ["实验性 tag 模式开启时，可按 tags 过滤。"] : []),
@@ -215,8 +217,8 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
     inputSchema: jsonSchema<SearchStickerInput>({
       type: "object",
       properties: {
-        category: { type: "string", description: "按分类过滤" },
-        keyword: { type: "string", description: "按分类名或 id 关键词过滤" },
+        category: { type: "string", description: "已有分类的完整名称，精确匹配" },
+        keyword: { type: "string", description: "分类名、id 或标签的单个子串（忽略大小写）；不支持 OR/AND 或画面语义搜索" },
         ...(config.tagMode ? { tags: { type: "array", items: { type: "string" }, maxItems: 5, description: "实验性标签列表，匹配任一标签即可" } } : {}),
         limit: { type: "integer", minimum: 1, maximum: 50, description: "返回数量上限" },
       },

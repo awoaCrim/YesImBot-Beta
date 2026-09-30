@@ -90,6 +90,30 @@ describe("sticker agent tools", () => {
     expect(toolByName(tools, "sticker_send").terminal).toBe(true);
   });
 
+  it("documents direct category sends and literal keyword searches without inventing semantic matching", () => {
+    const { tools } = createDeps({ enableSteal: false });
+    const send = toolByName(tools, "sticker_send");
+    const search = toolByName(tools, "sticker_search");
+
+    expect(send.description).toContain("在发送文字前决定是否使用");
+    expect(send.description).toContain("已知分类时无需先搜索");
+    expect(send.description).toContain("不合适时可以省略");
+    expect(search.description).toContain("完整分类名精确匹配");
+    expect(search.description).toContain("分类名、id 或标签的单个子串");
+    expect(search.description).toContain("不支持 OR/AND 运算");
+    expect(search.description).toContain("不按图片画面或人物进行语义搜索");
+  });
+
+  it("sends directly from a known category without requiring a search", async () => {
+    const deps = createDeps({ enableSteal: false });
+    const result = await execute(toolByName(deps.tools, "sticker_send"), { category: "meme" });
+
+    expect(deps.store.random).toHaveBeenCalledWith("global", "meme");
+    expect(deps.store.search).not.toHaveBeenCalled();
+    expect(deps.sender.send).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ ok: true });
+  });
+
   it("hides sticker_steal but keeps sending, categories and search when stealing is disabled", async () => {
     const deps = createDeps({ enableSteal: false });
     expect(toolNames(deps.tools)).toEqual(new Set(["sticker_send", "sticker_categories", "sticker_search"]));

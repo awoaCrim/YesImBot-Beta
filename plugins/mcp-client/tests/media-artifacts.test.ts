@@ -35,8 +35,6 @@ import McpClientPlugin from "../src/index";
 
 const PNG_BASE64 = "iVBORw0KGgo="; // decodes to a tiny PNG header
 
-type ArtifactWriter = { readonly put: ReturnType<typeof vi.fn> };
-
 function createContext() {
   const scopedLogger = { debug: vi.fn(), error: vi.fn(), info: vi.fn(), success: vi.fn(), warn: vi.fn() };
   const rootLogger = Object.assign(
@@ -82,7 +80,10 @@ async function buildPlugin(serverName = "tools", toolNames: string[] = ["listSna
   const { ctx, plugins, artifactForTool, artifactPut } = createContext();
   const client = createClient(toolNames);
   mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn(async () => undefined) } });
-  const plugin = new McpClientPlugin(ctx as never, { mcpServers: { [serverName]: { type: "http", url: "https://example.test/mcp" } } });
+  const plugin = new McpClientPlugin(ctx as never, {
+    allowedScopes: [{ platform: "test", channelId: "room" }],
+    mcpServers: { [serverName]: { type: "http", url: "https://example.test/mcp" } },
+  });
   await plugin.start();
   const agentPlugin = await plugins[0]!.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" } as never, {} as never);
   if (!agentPlugin) throw new Error("MCP runtime plugin was not created");

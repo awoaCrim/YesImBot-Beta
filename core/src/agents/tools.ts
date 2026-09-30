@@ -3,6 +3,7 @@ import { generateText, type LanguageModel } from "ai";
 import { h, type Bot, type Element } from "koishi";
 
 import type { PacingConfig } from "../config.js";
+import type { CompartmentExpansionRecord, Conversation } from "../conversations/index.js";
 import { parseReply } from "../messages/index.js";
 import { detectImageMediaType, prepareOutputSegments, ResourceReadError, type ChannelResources } from "../resources/index.js";
 import { buildPolisherTurnContext, validatePolishedMessages, type PolisherTurnContext } from "./polisher.js";
@@ -86,8 +87,8 @@ export interface SendMessageToolOptions {
 }
 
 /**
- * The only path from the model to a platform. Plain text output is never delivered, so a turn stays
- * silent until this tool runs. Ends the turn unless the model asks to `continue`.
+ * Sends the supplied messages to a platform. Plain model text is never delivered; plugin-owned
+ * delivery tools can send their own content. Ends the turn unless the model asks to `continue`.
  */
 export function createSendMessageTool(options: SendMessageToolOptions): AgentTool<SendMessageInput, SendMessageOutput> {
   const { bot, channelId: defaultChannelId, resources, pacing, innerThought, factsRequired, polish, onDelivered, onFailed } = options;
@@ -122,7 +123,10 @@ export function createSendMessageTool(options: SendMessageToolOptions): AgentToo
           description: "目标频道 ID；留空则发往当前频道。OneBot 群频道直接填写裸群号，不要使用 group: 前缀",
         },
         mode: { type: "string", enum: ["element", "raw"], description: "element（默认）解析消息元素；raw 原样发送纯文本" },
-        continue: { type: "boolean", description: "true 时发送后继续生成下一步，可以再调用工具或再次发送消息" },
+        continue: {
+          type: "boolean",
+          description: "默认 false，发送后结束本轮；true 时继续下一步。本轮还要调用其他工具或发送更多内容时，必须在这次发送前设为 true",
+        },
         ...(innerThought ? { inner_thought: { type: "string", description: "本次发送前的内心独白；只保留在你自己的历史里，不会发送给任何人" } } : {}),
       },
       required: factsRequired ? ["facts", "messages"] : ["messages"],
@@ -336,6 +340,51 @@ async function describeImageBytes(options: {
   return result.text;
 }
 
+export type ExpandCompartmentInput = { compartmentId: string; offset?: number; limit?: number };
+
+export type ExpandCompartmentOutput =
+  | {
+      ok: true;
+      compartmentId: string;
+      label?: string;
+      offset: number;
+      limit: number;
+      total: number;
+      entries: readonly CompartmentExpansionRecord[];
+      nextOffset?: number;
+    }
+  | { ok: false; error: { name: string; message: string } };
+
+/** Read-only access to the current channel's raw source records behind one compartment summary. */
+export function createExpandCompartmentTool(conversation: Conversation): AgentTool<ExpandCompartmentInput, ExpandCompartmentOutput> {
+  return {
+    name: "ctx_expand",
+    description:
+      "只读展开当前频道会话中的一个历史 compartment。只能使用压缩历史中明确给出的 compartmentId；按 offset/limit 分页读取原始对话，不调用模型、不修改会话。未知 ID、跨频道 ID 或没有原始边界时返回错误。",
+    inputSchema: jsonSchema<ExpandCompartmentInput>({
+      type: "object",
+      properties: {
+        compartmentId: { type: "string", minLength: 1, description: "压缩历史中显示的 compartmentId" },
+        offset: { type: "integer", minimum: 0, description: "分页偏移，默认 0" },
+        limit: { type: "integer", minimum: 1, maximum: 50, description: "每页最多 50 条原始记录，默认 50" },
+      },
+      required: ["compartmentId"],
+      additionalProperties: false,
+    }),
+    execute: async (input) => {
+      try {
+        const result = await conversation.expandCompartment(input.compartmentId, { offset: input.offset, limit: input.limit });
+        return { ok: true as const, ...result };
+      } catch (cause) {
+        return {
+          ok: false as const,
+          error: { name: "CompartmentExpansionError", message: cause instanceof Error ? cause.message : String(cause) },
+        };
+      }
+    },
+  };
+}
+
 export function createDescribeImageTool(model: LanguageModel, resources: ChannelResources): AgentTool<DescribeImageInput, DescribeImageOutput> {
   return {
     name: "describe_image",
@@ -372,9 +421,9 @@ export function createDescribeImageTool(model: LanguageModel, resources: Channel
 }
 
 function sendMessageDescription(innerThought: boolean, factsRequired: boolean): string {
-  return `向频道发送消息。这是消息到达平台的唯一途径——你的文本输出不会被发送，只有本工具发出的内容会被别人看到。
+  return `向频道发送文字或消息元素。你的普通文本输出不会被发送；调用本工具才能发送 messages 中的内容。其他实际提供的发送工具可以发送它们各自支持的内容。
 
-调用后生成一条真正展示给用户的回复。你可以针对某个用户或所有用户回复。发言必须通过 send_message 工具，否则用户无法看见。
+调用后生成真正展示给用户的消息，可以针对某个用户或所有用户回复；只写在普通文本输出里的内容不会被送达。
 
 # 参数
 
@@ -383,11 +432,10 @@ function sendMessageDescription(innerThought: boolean, factsRequired: boolean): 
 ${
   factsRequired
     ? "只写清楚本轮要表达的事实、判断和交流动作，不自行添加事实或承诺；措辞风格由发送前的润色阶段处理，每条草稿独立改写，条数与顺序保持不变。"
-    : `同一次 send_message 调用里的 messages 属于同一个回应单元。除非内容本身要求改变叙述距离，否则让它们保持一致的说话身份、语域和情绪力度；普通消息和事实材料不需要先提高情绪力度，工具、搜索或图片结果只当作材料，用当前 persona 和这段对话的自然口吻重新表达，不要一条写成脱离角色的资讯/报告，下一条又突然切回角色化聊天。需要精确或结构化时可以清楚正式，但整批仍应像同一个人在连续说话。让分条跟随对话节奏：快速反应和深思熟虑的解释各有恰当的时刻，不要固守习惯性的条数或长度。读者逐条看到消息，每次分条都会让半截回复单独停留片刻，只在不伤害这种「半截状态」的地方分条。事实、指令、代码、链接、结构化内容、修正，以及任何后果重大的内容，都应保持在同一条消息内。`
+    : `同一次调用中的 messages 属于同一个回应单元，保持一致的说话身份、语域和情绪力度。工具、搜索和图片结果只是材料；用当前 persona 自然表达。需要分条时按对话节奏处理，事实、指令、代码、链接和其他后果重大的内容保持在同一条消息内。`
 }
-不要用空行分段。平台不会把空行渲染成视觉分隔，它只是一个被吞掉的空白，让消息看起来格式奇怪。需要分开就分成多条。
 
-${factsRequired ? "" : "尽量避免使用 emoji 或其他 Unicode 表情符号；优先用文字和标点表达情绪，只有在确实有助于语气时才偶尔使用。"}
+${factsRequired ? "" : "尽量用文字和标点表达情绪；只有确实有助于语气时才使用 emoji。"}
 
 ## channel
 目标频道 ID。留空发往当前频道；填写其他频道 ID 可以向该频道发送。OneBot 群频道直接填写裸群号，不要使用 group: 前缀；私聊频道仍使用 private:<账号>。
@@ -397,13 +445,13 @@ ${factsRequired ? "" : "尽量避免使用 emoji 或其他 Unicode 表情符号�
 - raw：内容作为字面量原样发送，不解析任何元素。尖括号、& 和引号都不需要转义，你写下的每个字符原样到达接收方。发送代码、日志、命令行输出、含大量特殊字符的文本，或需要精确控制每个字符时用它。
 
 ## continue
-默认 false。设为 true 时，发送后继续生成下一步，可以再调用工具或再次发送消息。需要「先回应再去做事」或「分几次发送并在中间查资料」时用它。
+默认 false，发送后结束本轮。设为 true 时，发送后继续生成下一步，可以再调用工具或再次发送消息。若本轮还要调用其他发送工具，必须在这次发送前设为 true；需要「先回应再去做事」或「分几次发送并在中间查资料」时也用它。
 ${
   factsRequired
     ? `
 ## facts
 
-本次回复依据的明示事实列表。逐条写清哪一条来自可见消息、哪一条来自工具结果、哪一条只是你的推断。它只用于发送前的校验与改写，不会发送给任何人，也不是对外文本。
+逐条列出本次草稿依据的可见消息、工具结果或推断；只用于发送前校验与改写，不会发送给任何人。
 `
     : ""
 }${
@@ -413,8 +461,8 @@ ${
 
 ${
   factsRequired
-    ? "本次发送前的行为判断：说明谁在互动、哪些是可见事实或推测、是否需要回应及准备采取的行动。使用简洁内部记录，不要提前写对外文本。\n\n它不会到达平台，也不是对外消息；系统会保留它作为运行记录。不要把其中的话当作已经说出口，也不要把过去的 inner_thought 或 finish.reason 当作当前事实。需要让对方知道某个判断，必须另外写进 messages。没有固定长度或频率要求，不需要每次都写。"
-    : "本次发送前的内部判断——记录谁在互动、可见事实与推测、当前回应的语域、叙述距离和情绪力度、是否需要回应和行动计划。使用简洁、直接的内部工作记录，只写到足以支持本次选择；不模仿角色台词，不把回应提前写成剧情旁白，也不把角色化措辞、戏剧动作或对抗性旁白写进 inner_thought。\n\n它不会到达平台，也不是对外消息；系统会保留它作为运行记录。不要把其中的话当作已经说出口，也不要把过去的 inner_thought 或 finish.reason 当作当前事实或必须延续的语气。需要让对方知道某个判断，必须另外写进 messages。没有固定长度或频率要求，不需要每次都写。"
+    ? "记录互动对象、可见事实与推测、是否回应和行动计划。使用简洁内部记录，不要提前写对外文本。它不会到达平台；需要让对方知道的内容必须写进 messages。不要把过去的 inner_thought 或 finish.reason 当作当前事实。"
+    : "记录互动对象、可见事实与推测、回应语域、是否回应和行动计划。使用简洁内部记录，不模仿角色台词或提前写对外文本。它不会到达平台；需要让对方知道的内容必须写进 messages。不要把过去的 inner_thought 或 finish.reason 当作当前事实。"
 }
 `
       : ""
@@ -448,30 +496,13 @@ ${
 | & | &amp; | 文本中的 &（否则会被当作转义序列开头） |
 | " | &quot; | 元素属性值内的引号 |
 
-## 示例
-普通对话，不需要特殊处理：
-messages: ["今天天气不错"]
+## 简短示例
+- 普通文本：messages: ["今天天气不错"]
+- 需要精确保留尖括号、代码或日志时使用 mode: "raw"。
+- 引用和提及使用 <quote id="消息ID"/>、<at id="用户ID"/>；非元素用途的 <、>、&、" 必须转义。
 
-分多条发送：
-messages: ["先说结论", "具体原因是这样的……"]
-
-提及某人并引用消息：
-messages: ["<quote id=\\"msg_12345\\"/><at id=\\"114514\\"/> 你说的这个我有不同看法"]
-
-文本中包含尖括号：
-messages: ["泛型写法是 Array&lt;string&gt;，不是 Array(string)"]
-→ 接收方看到：泛型写法是 Array<string>，不是 Array(string)
-
-发送代码——用 mode=raw 最直接：
-mode: "raw", messages: ["function compare<T>(a: T, b: T) {\\n  return a < b;\\n}"]
-
-错误示范——忘记转义：
-messages: ["当 x<10 且 y>5 时执行"]
-❌ 系统尝试解析 <10 且 y>，内容丢失。改用转义或 mode=raw。
-
-## 资源与不支持的格式
-只有 <img> 和 <file> 的 src 支持频道资源 URI（可用方案见 read 工具说明），发送前会被解析成真实内容；<audio> 和 <video> 的 src 不会被解析。资源解析失败时该元素会被整条丢掉，消息其余部分照常发出——引用资源前先确认它存在。
-平台不支持的修饰元素（加粗、斜体、Markdown 格式等）会被去掉标签、保留其中的文字。不要依赖排版来表达结构或强调。`;
+## 资源与格式
+只有 <img> 和 <file> 的 src 支持频道资源 URI；<audio>、<video> 只能使用平台可直接访问的地址。资源引用前先确认 URI 存在，解析失败的资源元素会被丢弃，其余消息仍继续发送；平台不支持的修饰元素不要作为结构依赖。`;
 }
 
 /** A polish failure or rejection never blocks delivery: the original draft is sent once. */
