@@ -15,14 +15,27 @@ import YesImBotService from "../src/index.js";
 const config: Config = {
   basePath: "data/yesimbot",
   chatModel: "test:model",
+  auxiliaryModel: undefined,
   visionModel: undefined,
   logLevel: 2,
   allowedChannels: [],
   imageInput: false,
+  modelRetries: 0,
   resourceReadTimeout: 30,
   pacing: { charactersPerSecond: 8, maxTotalDelayMs: 60_000 },
   customInnerThought: true,
-  session: { compact: { responseIdleMinutes: 0, minMessages: 20, maxFailures: 3, model: undefined }, archive: { maxKB: 0 } },
+  session: {
+    compact: {
+      responseIdleMinutes: 0,
+      checkIntervalMinutes: 30,
+      turnThreshold: 50,
+      minMessages: 15,
+      maxFailures: 3,
+      inlineFragments: 3,
+      model: undefined,
+    },
+    archive: { maxKB: 0 },
+  },
 };
 
 describe("YesImBotService facade", () => {
@@ -44,6 +57,7 @@ describe("YesImBotService facade", () => {
 
     expect(service.model).toBeDefined();
     expect(service.messenger).toMatchObject({ use: expect.any(Function), post: expect.any(Function) });
+    expect(service.message).toMatchObject({ use: expect.any(Function) });
     expect(service.agent).toMatchObject({ use: expect.any(Function), will: expect.any(Function) });
     expect(service.resource).toMatchObject({ get: expect.any(Function), use: expect.any(Function) });
     expect(service.conversation).toMatchObject({ read: expect.any(Function) });

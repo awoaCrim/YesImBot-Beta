@@ -110,6 +110,18 @@ describe("interrupt", () => {
     expect(types.at(-1)).toBe("turn.aborted");
   });
 
+  it("preserves the interrupt reason in turn.aborted", async () => {
+    const agent = createAgent({ model: createInterruptibleModel() });
+    const events = Array.fromAsync(agent.run(createUserMessage("hello")));
+
+    await agent.interrupt("runtime-recreate");
+
+    expect((await events).at(-1)).toMatchObject({
+      type: "turn.aborted",
+      reason: "AbortError: Aborted (signal: runtime-recreate)",
+    });
+  });
+
   it("settles an active turn as aborted", async () => {
     const agent = createAgent({ model: createInterruptibleModel() });
     const events: string[] = [];

@@ -2,7 +2,7 @@ import { readFile, stat } from "node:fs/promises";
 import type { ReadableStream } from "node:stream/web";
 import { fileURLToPath } from "node:url";
 
-import { h, type Context, type Element, type Logger } from "koishi";
+import { h, type Context, type Element } from "koishi";
 
 import type { AssetStore } from "./asset.js";
 import type { ChannelResources } from "./index.js";
@@ -93,7 +93,7 @@ async function storeTextFile(ctx: Context, element: Element, store: AssetStore, 
 }
 
 function fileName(element: Element): string | undefined {
-  for (const key of ["title", "file"] as const) {
+  for (const key of ["title", "name", "file"] as const) {
     const value = element.attrs[key];
     if (typeof value === "string" && value.length > 0) return value;
   }

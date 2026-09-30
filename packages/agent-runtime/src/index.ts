@@ -12,7 +12,11 @@ export * from "./event.js";
 
 export * from "./id.js";
 
+export * from "./image-projection.js";
+
 export * from "./message.js";
+
+export * from "./media.js";
 
 export * from "./plugin.js";
 
