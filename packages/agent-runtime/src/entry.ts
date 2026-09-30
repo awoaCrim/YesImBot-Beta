@@ -26,6 +26,14 @@ export interface CompactEntryData {
   startAt?: number;
   /** Latest source message timestamp (epoch ms) covered by this fragment. */
   endAt?: number;
+  /** Compaction path used to create this entry; absent on legacy JSONL records. */
+  mode?: "summary" | "compartment";
+  /** Stable ID shown to the model for read-only raw-history expansion. */
+  compartmentId?: string;
+  /** Human-readable label for a compartment chunk. */
+  compartmentLabel?: string;
+  /** Zero-based chunk ordinal within one incremental compaction pass. */
+  chunkIndex?: number;
 }
 
 export interface AgentCustomEntries {

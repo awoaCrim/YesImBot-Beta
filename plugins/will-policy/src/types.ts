@@ -12,6 +12,9 @@ export interface PolicyRoutingConfig {
 }
 
 export interface PolicyWillingnessConfig {
+  readonly batchDecision: "per-input" | "highest-candidate";
+  readonly decayMode: "weighted" | "half-life";
+  readonly persistState: boolean;
   readonly maxScore: number;
   readonly initialScore: number;
   readonly decayHalfLifeSeconds: number;
@@ -49,6 +52,9 @@ export function defaultRoutingConfig(): PolicyRoutingConfig {
 
 export function defaultWillingnessConfig(): PolicyWillingnessConfig {
   return {
+    batchDecision: "per-input",
+    decayMode: "weighted",
+    persistState: false,
     maxScore: 100,
     initialScore: 0,
     decayHalfLifeSeconds: 600,

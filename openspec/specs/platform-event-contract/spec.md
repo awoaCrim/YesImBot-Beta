@@ -32,6 +32,16 @@ Core MUST keep using current Satori-shaped resources where they are explicitly p
 - **THEN** it MUST preserve the closed host event base and the declaration-merged variant fields for that event type
 - **AND** it MUST NOT persist unrelated `Universal.Event` resources unless the event contract explicitly includes them
 
+### Requirement: Typed Poke Identity
+
+The `notice.poke` variant MUST expose optional `actorId` and required `targetId`. OneBot MUST populate `actorId` from `user_id` and `targetId` from `target_id`. Consumers MUST NOT infer actor or target identity from rendered `text`. Missing actor identity MUST remain representable for compatibility and MUST fail closed for willingness batch admission.
+
+#### Scenario: OneBot targeted poke
+
+- **WHEN** OneBot translates a poke notice with `user_id` and `target_id`
+- **THEN** the persisted Event MUST contain their string forms as `actorId` and `targetId`
+- **AND** it MUST not retain raw `_data`
+
 ### Requirement: Committed Input Observation
 Core MUST emit `yesimbot/event` after durable append and before Will evaluation for either input variant.
 

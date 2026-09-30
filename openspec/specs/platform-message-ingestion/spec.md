@@ -61,8 +61,23 @@ Messenger MUST call the selected Translator with `(session, resources)` while th
 - **WHEN** one OneBot image load or Store write fails
 - **THEN** the OneBot Resolver MUST preserve that original image element
 - **AND** it MUST continue processing sibling elements
+
+### Requirement: Optional Quote Author Metadata
+
+`MessageQuote` MUST remain compatible with old records while optionally carrying `{ id, isBot? }` for the quoted author. OneBot MUST copy this metadata only when `Session.quote.user.id` is available. It MUST persist quoted elements as before and MUST NOT infer author identity from quote text, message ID, current sender, or Bot flags.
+
+#### Scenario: Quoted author is available
+
+- **WHEN** OneBot receives `Session.quote.user.id`
+- **THEN** the persisted quote MUST include `author.id`
+- **AND** older quote records without `author` MUST remain readable
+
 ### Requirement: Authoritative Translation Failure
 A Translator failure MUST be recorded diagnostically and MUST skip the Session without generic Satori fallback. A platform without a Translator MUST return without persisting or routing unless the built-in ordinary message pass-through applies.
+
+#### Scenario: Selected Translator throws
+- **WHEN** the authoritative platform Translator rejects a Session
+- **THEN** Messenger MUST record a diagnostic and skip that Session without fallback persistence
 
 ### Requirement: Strict Channel Allowlist
 Core MUST expose `allowedChannels` as a deny-by-default external Messenger allowlist. Rules MUST use OR semantics; specified fields within one rule MUST use AND semantics; `platform` and `channelId` accept exact strings or `*`; omitted directness matches both kinds. A non-matching Session MUST be rejected before resource readiness, assignee lookup, Translator work, persistence, Will evaluation, or runtime creation.
@@ -77,3 +92,7 @@ Core MUST expose `allowedChannels` as a deny-by-default external Messenger allow
 
 ### Requirement: Runtime Replacement For Shared Bot
 Core MUST replace a cached shared runtime when an admitted event's current Bot selfId differs from that runtime's selfId. It MUST stop the old runtime first and preserve channel data.
+
+#### Scenario: Shared assignee Bot changes
+- **WHEN** an admitted shared-channel Session uses a different current Bot than the cached Runtime
+- **THEN** Core MUST stop and replace that Runtime without deleting channel data

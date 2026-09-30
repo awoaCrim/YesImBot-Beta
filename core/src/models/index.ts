@@ -37,8 +37,11 @@ export type AuxiliaryModelErrorCode = "missing-config" | "invalid-config" | "unr
 
 export type ImageToolResultSupport = "native" | "unsupported" | "unknown";
 
+export type HistoryProjectionMode = "default" | "gemini-native";
+
 export interface ChatModelCapabilities {
   readonly imageToolResult: ImageToolResultSupport;
+  readonly historyProjection?: HistoryProjectionMode;
 }
 
 export interface ChatModelRef {
@@ -62,7 +65,7 @@ interface Provider {
   readonly capabilities: { chat: boolean; embedding: boolean };
   chatModels(): ChatModelConfig[];
   embeddingModels(): EmbeddingModelConfig[];
-  chat?(modelId: string): LanguageModel;
+  chat?(modelId: string, config?: ChatModelConfig): LanguageModel;
   embedding?(modelId: string): EmbeddingModel;
   chatCapabilities?(modelId: string): Partial<ChatModelCapabilities> | undefined;
   tools?(modelId: string): ToolSet;
@@ -172,7 +175,7 @@ export class ModelService {
       model: record.modelId,
       modalities: record.config.modalities,
     });
-    const source = provider.chat!(record.modelId);
+    const source = provider.chat!(record.modelId, cloneChatModelConfig(record.config));
     const model = isModelObject(source)
       ? [...this.middlewares].reduce(
           (current, middleware) => wrapLanguageModel({ model: current, middleware, providerId: record.providerId, modelId: record.modelId }),
@@ -201,6 +204,7 @@ export class ModelService {
         declaredCapabilities?.imageToolResult === "native" || declaredCapabilities?.imageToolResult === "unsupported"
           ? declaredCapabilities.imageToolResult
           : "unknown",
+      historyProjection: declaredCapabilities?.historyProjection === "gemini-native" ? "gemini-native" : "default",
     };
     return {
       fullId: record.fullId,
@@ -399,6 +403,10 @@ export class ModelService {
         name: override.name ?? record.config.name,
         toolCall: override.toolCall ?? record.config.toolCall,
         reasoning: override.reasoning ?? record.config.reasoning,
+        thinkingLevel: override.thinkingLevel ?? record.config.thinkingLevel,
+        thinkingLevelMap: override.thinkingLevelMap
+          ? { ...(record.config.thinkingLevelMap ?? {}), ...override.thinkingLevelMap }
+          : record.config.thinkingLevelMap,
         hidden: override.hidden ?? record.config.hidden,
         modalities: override.modalities
           ? {
@@ -562,6 +570,7 @@ function isModelObject(value: unknown): value is Record<string, unknown> {
 function cloneChatModelConfig(config: ChatModelConfig): ChatModelConfig {
   return {
     ...config,
+    thinkingLevelMap: config.thinkingLevelMap ? { ...config.thinkingLevelMap } : undefined,
     modalities: config.modalities
       ? {
           ...(config.modalities.input ? { input: [...config.modalities.input] } : {}),
@@ -578,3 +587,7 @@ function cloneEmbeddingModelConfig(config: EmbeddingModelConfig): EmbeddingModel
 export type { BaseProviderConfig, CHAT_MODEL_MODALITIES, ChatModelConfig, ChatModelModality, EmbeddingModelConfig, ModelServiceConfig } from "./config.js";
 
 export { createEmptyModelsConfig, isChatModelModality, loadModelsConfig, mutateModelsConfig } from "./config.js";
+
+export type { ResolvedThinkingLevel, ThinkingLevel, ThinkingLevelMap, ThinkingLevelSupport } from "./thinking.js";
+
+export { createThinkingLevelMapSchema, getSupportedThinkingLevels, resolveThinkingLevel, THINKING_LEVELS } from "./thinking.js";

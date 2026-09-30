@@ -1,5 +1,6 @@
 import { createMessageEntry, type AgentAssistantMessage, type AgentEntry, type AgentPlugin, type AgentToolMessage } from "@yesimbot/agent-runtime";
 
+import type { HistoryProjectionMode } from "../models/index.js";
 import { createDeliveredTranscriptMessage, isDeliveredTranscript, type DeliveredTranscriptData } from "./delivered-transcript.js";
 
 /**
@@ -7,11 +8,7 @@ import { createDeliveredTranscriptMessage, isDeliveredTranscript, type Delivered
  * dialogue. Keep tool calls and private control fields out of later model context while retaining a
  * typed, non-actionable transcript of successfully delivered speech.
  */
-export const INTERNAL_HISTORY_PROJECTION_PLUGIN: AgentPlugin = {
-  name: "core.internal-history-projection",
-  enforce: "pre",
-  transformEntries: stripInternalAssistantInputs,
-};
+export const INTERNAL_HISTORY_PROJECTION_PLUGIN: AgentPlugin = createInternalHistoryProjectionPlugin("default");
 
 /** The send_message tool is the only Core path that delivers model-authored text to a platform. */
 const HISTORICAL_OUTPUT_TOOL_NAME = "send_message";
@@ -32,10 +29,21 @@ interface LegacyMarkerProjection {
   readonly transcripts: readonly DeliveredTranscriptData[];
 }
 
-export function stripInternalAssistantInputs(entries: readonly AgentEntry[]): AgentEntry[] {
+export function createInternalHistoryProjectionPlugin(mode: HistoryProjectionMode = "default"): AgentPlugin {
+  return {
+    name: "core.internal-history-projection",
+    enforce: "pre",
+    transformEntries: (entries) => stripInternalAssistantInputs(entries, mode),
+  };
+}
+
+export function stripInternalAssistantInputs(entries: readonly AgentEntry[], mode: HistoryProjectionMode = "default"): AgentEntry[] {
   const sendResults = collectHistoricalSendResults(entries);
+  const geminiSendCalls = mode === "gemini-native" ? collectSafeGeminiSendCalls(entries, sendResults) : new Map<string, readonly string[]>();
   const removedToolCallIds = new Set(
-    entries.flatMap((entry) => (entry.type === "message" && entry.data.role === "assistant" ? removedToolCallIdsFor(entry.data.content) : [])),
+    entries.flatMap((entry) =>
+      entry.type === "message" && entry.data.role === "assistant" ? removedToolCallIdsFor(entry.data.content, mode, geminiSendCalls) : [],
+    ),
   );
   const projected: AgentEntry[] = [];
   const transcripts: AgentEntry[] = [];
@@ -50,18 +58,23 @@ export function stripInternalAssistantInputs(entries: readonly AgentEntry[]): Ag
       // but never offer their untrusted payload as a later model-history message.
       continue;
     }
+    if (mode === "gemini-native" && isDeliveredTranscript(entry.data)) {
+      // Gemini mode reconstructs safe delivered output from paired send_message history only. A
+      // legacy/custom transcript has no call/result identity and must not become a duplicate turn.
+      continue;
+    }
 
     if (entry.data.role === "assistant") {
       appendProjectedEntries(
         projected,
         transcripts,
-        stripAssistantEntry(entry as Extract<AgentEntry, { type: "message" }> & { data: AgentAssistantMessage }, sendResults),
+        stripAssistantEntry(entry as Extract<AgentEntry, { type: "message" }> & { data: AgentAssistantMessage }, sendResults, mode, geminiSendCalls),
       );
       continue;
     }
 
     if (entry.data.role === "tool") {
-      const data = stripToolContent(entry.data, removedToolCallIds);
+      const data = stripToolContent(entry.data, removedToolCallIds, mode, geminiSendCalls);
       if (data) projected.push(data === entry.data ? entry : { ...entry, data });
       continue;
     }
@@ -90,9 +103,11 @@ function appendProjectedEntries(target: AgentEntry[], transcripts: AgentEntry[],
 function stripAssistantEntry(
   entry: Extract<AgentEntry, { type: "message" }> & { data: AgentAssistantMessage },
   sendResults: ReadonlyMap<string, HistoricalSendResult>,
+  mode: HistoryProjectionMode,
+  geminiSendCalls: ReadonlyMap<string, readonly string[]>,
 ): AgentEntry[] {
   const transcripts: DeliveredTranscriptData[] = [];
-  const data = stripAssistantContent(entry.data, sendResults, transcripts);
+  const data = stripAssistantContent(entry.data, sendResults, transcripts, mode, geminiSendCalls);
   const projected: AgentEntry[] = transcripts.map((transcript, index) => createTranscriptEntry(entry, transcript, index));
   if (data) projected.push(data === entry.data ? entry : { ...entry, data });
   return projected;
@@ -115,11 +130,13 @@ function stripAssistantContent(
   message: AgentAssistantMessage,
   sendResults: ReadonlyMap<string, HistoricalSendResult>,
   transcripts: DeliveredTranscriptData[],
+  mode: HistoryProjectionMode,
+  geminiSendCalls: ReadonlyMap<string, readonly string[]>,
 ): AgentAssistantMessage | null {
   if (typeof message.content === "string") {
     const legacy = extractLegacyDeliveredMarkers(message.content);
-    if (!legacy) return message;
-    transcripts.push(...legacy.transcripts);
+    if (!legacy) return mode === "gemini-native" && hasLegacyDeliveredMarker(message.content) ? null : message;
+    if (mode === "default") transcripts.push(...legacy.transcripts);
     const text = legacy.text.trim();
     return text.length === 0 ? null : { ...message, content: text };
   }
@@ -133,8 +150,20 @@ function stripAssistantContent(
     }
     if (sourcePart.type === "tool-call" && sourcePart.toolName === HISTORICAL_OUTPUT_TOOL_NAME) {
       changed = true;
-      const delivered = projectDeliveredMessages(sourcePart, sendResults);
-      if (delivered) transcripts.push(delivered);
+      if (mode === "default") {
+        const delivered = projectDeliveredMessages(sourcePart, sendResults);
+        if (delivered) transcripts.push(delivered);
+        continue;
+      }
+      const toolCallId = typeof sourcePart.toolCallId === "string" ? sourcePart.toolCallId : undefined;
+      const messages = toolCallId ? geminiSendCalls.get(toolCallId) : undefined;
+      if (!messages) continue;
+      const part = structuredClone(sourcePart) as Record<string, unknown>;
+      if (!isRecord(part.input)) continue;
+      const input = { ...part.input, messages: [...messages] };
+      removePrivateToolFields(input);
+      part.input = input;
+      content.push(part);
       continue;
     }
     if (sourcePart.type === "tool-call" && isHistoricalToolCall(sourcePart)) {
@@ -144,28 +173,29 @@ function stripAssistantContent(
     const part = structuredClone(sourcePart) as Record<string, unknown>;
     if (part.type === "text" && typeof part.text === "string") {
       const legacy = extractLegacyDeliveredMarkers(part.text);
-      if (legacy) {
+      if (!legacy) {
+        if (mode === "gemini-native" && hasLegacyDeliveredMarker(part.text)) return null;
+      } else {
         changed = true;
-        transcripts.push(...legacy.transcripts);
+        if (mode === "default") transcripts.push(...legacy.transcripts);
         const text = legacy.text.trim();
         if (text.length === 0) continue;
         part.text = text;
       }
     }
-    if (part.type === "tool-call" && isRecord(part.input)) {
-      for (const key of ["inner_thought", "reason"] as const) {
-        if (!(key in part.input)) continue;
-        delete part.input[key];
-        changed = true;
-      }
-    }
+    if (part.type === "tool-call" && isRecord(part.input) && removePrivateToolFields(part.input)) changed = true;
     content.push(part);
   }
   if (!changed) return message;
   return content.length === 0 ? null : { ...message, content: content as AgentAssistantMessage["content"] };
 }
 
-function stripToolContent(message: AgentToolMessage, removedToolCallIds: ReadonlySet<string>): AgentToolMessage | null {
+function stripToolContent(
+  message: AgentToolMessage,
+  removedToolCallIds: ReadonlySet<string>,
+  mode: HistoryProjectionMode,
+  geminiSendCalls: ReadonlyMap<string, readonly string[]>,
+): AgentToolMessage | null {
   if (!Array.isArray(message.content)) return message;
   let changed = false;
   const content: unknown[] = [];
@@ -174,12 +204,18 @@ function stripToolContent(message: AgentToolMessage, removedToolCallIds: Readonl
       content.push(sourcePart);
       continue;
     }
-    if (
+    const toolCallId = typeof sourcePart.toolCallId === "string" ? sourcePart.toolCallId : undefined;
+    const isSafeGeminiSendResult = mode === "gemini-native" && toolCallId !== undefined && geminiSendCalls.has(toolCallId);
+    const removeResult =
       sourcePart.type === "tool-result" &&
-      (sourcePart.toolName === HISTORICAL_OUTPUT_TOOL_NAME ||
-        (typeof sourcePart.toolName === "string" && HISTORICAL_EPHEMERAL_TOOL_NAMES.has(sourcePart.toolName)) ||
-        (typeof sourcePart.toolCallId === "string" && removedToolCallIds.has(sourcePart.toolCallId)))
-    ) {
+      (sourcePart.toolName === HISTORICAL_OUTPUT_TOOL_NAME
+        ? !isSafeGeminiSendResult
+        : typeof sourcePart.toolName === "string" && HISTORICAL_EPHEMERAL_TOOL_NAMES.has(sourcePart.toolName)
+          ? true
+          : toolCallId !== undefined && removedToolCallIds.has(toolCallId)
+            ? true
+            : isSafeGeminiSendResult);
+    if (removeResult) {
       changed = true;
       continue;
     }
@@ -243,12 +279,64 @@ function sanitizeDeliveredMessage(value: string): string {
     .trim();
 }
 
-function removedToolCallIdsFor(content: AgentAssistantMessage["content"]): string[] {
+function collectSafeGeminiSendCalls(entries: readonly AgentEntry[], sendResults: ReadonlyMap<string, HistoricalSendResult>): Map<string, readonly string[]> {
+  const calls = new Map<string, readonly string[]>();
+  const duplicates = new Set<string>();
+  for (const entry of entries) {
+    if (entry.type !== "message" || entry.data.role !== "assistant" || !Array.isArray(entry.data.content)) continue;
+    for (const sourcePart of entry.data.content as readonly unknown[]) {
+      if (!isRecord(sourcePart) || sourcePart.type !== "tool-call" || sourcePart.toolName !== HISTORICAL_OUTPUT_TOOL_NAME) continue;
+      if (typeof sourcePart.toolCallId !== "string" || duplicates.has(sourcePart.toolCallId)) continue;
+      if (calls.has(sourcePart.toolCallId)) {
+        calls.delete(sourcePart.toolCallId);
+        duplicates.add(sourcePart.toolCallId);
+        continue;
+      }
+      const result = sendResults.get(sourcePart.toolCallId);
+      const messages = readHistoricalSendMessages(sourcePart.input);
+      if (!result?.ok || !messages || result.sentCount !== messages.length) continue;
+      const sanitized = messages.map(sanitizeDeliveredMessage);
+      if (sanitized.some((message) => message.length === 0)) continue;
+      calls.set(sourcePart.toolCallId, sanitized);
+    }
+  }
+  return calls;
+}
+
+function readHistoricalSendMessages(input: unknown): readonly string[] | undefined {
+  if (!isRecord(input) || !Array.isArray(input.messages)) return undefined;
+  if (!input.messages.every((message): message is string => typeof message === "string" && message.length > 0)) return undefined;
+  return input.messages;
+}
+
+function removedToolCallIdsFor(
+  content: AgentAssistantMessage["content"],
+  mode: HistoryProjectionMode,
+  geminiSendCalls: ReadonlyMap<string, readonly string[]>,
+): string[] {
   if (!Array.isArray(content)) return [];
   return (content as readonly unknown[]).flatMap((part) => {
     if (!isRecord(part) || part.type !== "tool-call" || !isHistoricalToolCall(part)) return [];
+    if (
+      mode === "gemini-native" &&
+      part.toolName === HISTORICAL_OUTPUT_TOOL_NAME &&
+      typeof part.toolCallId === "string" &&
+      geminiSendCalls.has(part.toolCallId)
+    ) {
+      return [];
+    }
     return typeof part.toolCallId === "string" ? [part.toolCallId] : [];
   });
+}
+
+function removePrivateToolFields(input: Record<string, unknown>): boolean {
+  let changed = false;
+  for (const key of ["inner_thought", "reason"] as const) {
+    if (!(key in input)) continue;
+    delete input[key];
+    changed = true;
+  }
+  return changed;
 }
 
 function isHistoricalToolCall(part: Record<string, unknown>): boolean {
@@ -256,6 +344,10 @@ function isHistoricalToolCall(part: Record<string, unknown>): boolean {
   if (typeof part.toolName === "string" && HISTORICAL_EPHEMERAL_TOOL_NAMES.has(part.toolName)) return true;
   if (part.toolName !== "read" || !isRecord(part.input)) return false;
   return typeof part.input.uri === "string" && part.input.uri.startsWith("artifact://");
+}
+
+function hasLegacyDeliveredMarker(text: string): boolean {
+  return text.includes(LEGACY_DELIVERED_OPEN) || text.includes(LEGACY_DELIVERED_CLOSE);
 }
 
 function parseJsonValue(value: unknown): unknown {
@@ -276,7 +368,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * persisted text. Any lone, nested, or otherwise ambiguous marker fails closed and stays unchanged.
  */
 function extractLegacyDeliveredMarkers(text: string): LegacyMarkerProjection | undefined {
-  if (!text.includes(LEGACY_DELIVERED_OPEN) && !text.includes(LEGACY_DELIVERED_CLOSE)) return undefined;
+  if (!hasLegacyDeliveredMarker(text)) return undefined;
 
   let result = "";
   let cursor = 0;

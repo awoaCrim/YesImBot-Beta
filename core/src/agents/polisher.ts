@@ -7,7 +7,12 @@ import type { ChannelContext } from "../channels/index.js";
 const PROTECTED_TOKEN_PATTERN =
   /<\/?[a-z][a-z0-9-]*\b[^<>]*>|[a-z][a-z0-9+.-]*:\/\/[^\s<>"'()[\]{}，。！？；：、]+|@[\p{L}\p{N}\p{M}_.-]+|[+\-−]?\d+(?:[.,，．/／]\d+)*(?:[%％])?/giu;
 
+/** The complete bounded current-turn reference passed to the independent polisher. */
+export type PolisherTurnContext = readonly PolisherTurnEntry[];
+
 type Disposer = () => void;
+
+type RevisionListener = (revision: number) => void;
 
 /**
  * Role/expression material handed to an active send-message polisher. It is the same live
@@ -23,11 +28,19 @@ export interface PolisherPromptProfile {
   readonly characterDefinition?: string;
 }
 
-/** Explicit facts plus the main Agent's draft. Never carries inner_thought or full history. */
+/** A bounded, read-only reference entry from the current turn. It is never historical context. */
+export interface PolisherTurnEntry {
+  readonly kind: "user" | "tool-result";
+  readonly content: string;
+  readonly toolName?: string;
+}
+
+/** Explicit facts, current-turn reference data, and the main Agent's draft. */
 export interface PolisherRequest {
   readonly facts: readonly string[];
   readonly messages: readonly string[];
   readonly profile: PolisherPromptProfile;
+  readonly turnContext: PolisherTurnContext;
 }
 
 /**
@@ -56,6 +69,7 @@ export interface PolisherRegistryOptions {
 export class PolisherRegistry {
   private readonly capabilities = new Set<MessagePolisherCapability>();
   private readonly providers = new Set<RolePromptProfileProvider>();
+  private readonly revisionListeners = new Set<RevisionListener>();
   private readonly logger: Logger | undefined;
   private revisionValue = 0;
 
@@ -70,20 +84,27 @@ export class PolisherRegistry {
   public use(capability: MessagePolisherCapability): Disposer {
     if (!this.capabilities.has(capability)) {
       this.capabilities.add(capability);
-      this.revisionValue += 1;
+      this.bumpRevision();
     }
     return () => {
-      if (this.capabilities.delete(capability)) this.revisionValue += 1;
+      if (this.capabilities.delete(capability)) this.bumpRevision();
     };
   }
 
   public profile(provider: RolePromptProfileProvider): Disposer {
     if (!this.providers.has(provider)) {
       this.providers.add(provider);
-      this.revisionValue += 1;
+      this.bumpRevision();
     }
     return () => {
-      if (this.providers.delete(provider)) this.revisionValue += 1;
+      if (this.providers.delete(provider)) this.bumpRevision();
+    };
+  }
+
+  public onRevision(listener: RevisionListener): Disposer {
+    this.revisionListeners.add(listener);
+    return () => {
+      this.revisionListeners.delete(listener);
     };
   }
 
@@ -102,6 +123,15 @@ export class PolisherRegistry {
       }
     }
     return undefined;
+  }
+
+  private bumpRevision(): void {
+    this.revisionValue += 1;
+    for (const listener of this.revisionListeners) {
+      try {
+        listener(this.revisionValue);
+      } catch {}
+    }
   }
 }
 
@@ -134,9 +164,10 @@ export function createSendMessagePolisher(input: {
 }): (request: {
   readonly facts: readonly string[];
   readonly messages: readonly string[];
+  readonly turnContext: PolisherTurnContext;
   readonly signal?: AbortSignal;
 }) => Promise<readonly string[] | undefined> {
-  return async ({ facts, messages, signal }) => {
+  return async ({ facts, messages, turnContext, signal }) => {
     const revision = input.registry.revision;
     const polisher = input.registry.resolve();
     if (!polisher) return undefined;
@@ -144,7 +175,7 @@ export function createSendMessagePolisher(input: {
     const profile = await input.resolveProfile();
     if (input.registry.revision !== revision || input.registry.resolve() !== polisher) return undefined;
 
-    const result = await polisher.polish({ facts, messages, profile }, input.context, signal);
+    const result = await polisher.polish({ facts, messages, profile, turnContext }, input.context, signal);
     return input.registry.revision === revision && input.registry.resolve() === polisher ? result : undefined;
   };
 }
@@ -155,3 +186,5 @@ function hasSameProtectedTokens(original: string, candidate: string): boolean {
   if (before.length !== after.length) return false;
   return before.every((token, index) => token === after[index]);
 }
+
+export { buildPolisherTurnContext } from "./polisher-context.js";

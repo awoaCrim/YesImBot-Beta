@@ -7,7 +7,10 @@ vi.mock("koishi", async () => import("@koishijs/core"));
 import { apply } from "../src/index.js";
 
 type RegisteredProvider = {
-  chatCapabilities?(modelId: string): { readonly imageToolResult?: "native" | "unsupported" | "unknown" };
+  chatCapabilities?(modelId: string): {
+    readonly imageToolResult?: "native" | "unsupported" | "unknown";
+    readonly historyProjection?: "default" | "gemini-native";
+  };
 };
 
 const fixtureBase64 = Buffer.from([0, 1, 2, 3]).toString("base64");
@@ -63,7 +66,7 @@ function createImageToolResultPrompt(): LanguageModelV3Prompt {
 describe("Google provider capabilities", () => {
   it("declares native image tool-result support", () => {
     const provider = registerProvider();
-    expect(provider.chatCapabilities?.("gemini-3.7-flash-high")).toEqual({ imageToolResult: "native" });
+    expect(provider.chatCapabilities?.("gemini-3.7-flash-high")).toEqual({ imageToolResult: "native", historyProjection: "gemini-native" });
   });
 
   it("serializes a Gemini 3 tool-result image inside functionResponse.parts", async () => {
@@ -86,6 +89,70 @@ describe("Google provider capabilities", () => {
         },
       },
     ]);
+  });
+
+  it("serializes a paired historical send trace without a delivered transcript block", async () => {
+    let body: unknown;
+    const fetch: typeof globalThis.fetch = async (_input, init) => {
+      body = JSON.parse(await new Response(init?.body ?? null).text());
+      throw new Error("captured request");
+    };
+    const model = createGoogleGenerativeAI({ apiKey: "test", baseURL: "https://fixture.invalid/v1beta", fetch }).chat("gemini-3.7-flash-high");
+
+    await expect(
+      model.doGenerate({
+        prompt: [
+          { role: "system", content: "系统规则" },
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool-call",
+                toolCallId: "send-1",
+                toolName: "send_message",
+                input: { messages: ["已经发送"] },
+                providerOptions: { google: { thoughtSignature: "signature-history" } },
+              },
+            ],
+          },
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: "send-1",
+                toolName: "send_message",
+                output: { type: "json", value: { ok: true, count: 1 } },
+              },
+            ],
+          },
+          { role: "user", content: [{ type: "text", text: "新的问题" }] },
+        ],
+      }),
+    ).rejects.toThrow("captured request");
+
+    const request = body as {
+      systemInstruction?: unknown;
+      contents: Array<{ role: string; parts: Array<Record<string, unknown>> }>;
+    };
+    expect(request.systemInstruction).toEqual({ parts: [{ text: "系统规则" }] });
+    expect(request.contents[0]).toMatchObject({
+      role: "model",
+      parts: [{ functionCall: { id: "send-1", name: "send_message", args: { messages: ["已经发送"] } }, thoughtSignature: "signature-history" }],
+    });
+    expect(request.contents[1]).toMatchObject({
+      role: "user",
+      parts: [
+        {
+          functionResponse: {
+            id: "send-1",
+            name: "send_message",
+            response: { name: "send_message", content: { ok: true, count: 1 } },
+          },
+        },
+      ],
+    });
+    expect(JSON.stringify(request)).not.toContain("delivered_transcript_history");
   });
 
   it("serializes required tool choice as Gemini ANY and parses a function call", async () => {

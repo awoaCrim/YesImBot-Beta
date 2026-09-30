@@ -11,6 +11,23 @@ afterEach(() => {
 });
 
 describe("conversation compaction prompt", () => {
+  it("uses an objective third-person prompt for compartment history", async () => {
+    mocks.generateText.mockResolvedValue({ text: "用户在 2026-09-24 认识了项目 alpha。" });
+
+    const rendered = filterEntriesForCompression(conversationForStrictMode(), { mode: "compartment" });
+    expect(rendered).toContain("[user message from Alice]: 用户说要记录项目 alpha");
+    expect(rendered).not.toContain("assistant action");
+
+    await executeCompact({ model: {} as never, conversation: rendered, mode: "compartment" });
+    const request = mocks.generateText.mock.calls[0]?.[0] as { system?: string };
+    expect(request.system).toContain("客观、可验证的第三人称事实");
+    expect(request.system).toContain("禁止第一人称");
+    expect(request.system).not.toContain("这个角色本人说过的话");
+
+    const withAssistantFacts = filterEntriesForCompression(conversationForStrictMode(), { mode: "compartment", assistantAsFacts: true });
+    expect(withAssistantFacts).toContain("[assistant action]: assistant 曾输出原文：“已发送确认”");
+  });
+
   it("summarizes conversation memory without injecting the persona prompt or a previous summary", async () => {
     mocks.generateText.mockResolvedValue({ text: "用户喜欢简洁回答。" });
 
@@ -83,6 +100,32 @@ const conversation = [
     data: { role: "assistant", timestamp: 4, content: [{ type: "tool-call", toolCallId: "c2", toolName: "finish", input: { reason: "没什么想说的" } }] },
   },
 ] as never;
+
+function conversationForStrictMode() {
+  return [
+    {
+      type: "message",
+      id: "strict-user",
+      timestamp: 1,
+      data: {
+        role: "custom",
+        type: "yesimbot.message",
+        timestamp: 1,
+        data: { user: { id: "u1", name: "Alice" }, elements: [{ type: "text", attrs: { content: "用户说要记录项目 alpha" } }] },
+      },
+    },
+    {
+      type: "message",
+      id: "strict-assistant",
+      timestamp: 2,
+      data: {
+        role: "assistant",
+        timestamp: 2,
+        content: [{ type: "tool-call", toolCallId: "send", toolName: "send_message", input: { messages: ["已发送确认"] } }],
+      },
+    },
+  ] as never;
+}
 
 describe("compaction input rendering", () => {
   it("keeps the character's own outgoing messages so commitments survive compaction", () => {

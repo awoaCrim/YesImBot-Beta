@@ -103,5 +103,7 @@ export {
   type MessagePolisherCapability,
   type PolisherPromptProfile,
   type PolisherRequest,
+  type PolisherTurnContext,
+  type PolisherTurnEntry,
   type RolePromptProfileProvider,
 } from "./polisher.js";

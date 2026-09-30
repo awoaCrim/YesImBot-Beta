@@ -81,13 +81,14 @@ resolved `basePath` with the inline default content only when the file is absent
 user-authored and empty files are never touched. No package prompt resources are
 published or loaded, and there is no constitution version constant.
 
-`customInnerThought` (default `true`) controls whether the Core-owned inner
-monologue section is included in the constitution. When enabled, `send_message`
-gains an optional `inner_thought` field; the monologue is a tool argument rather
-than an output format, so the model never has to emit a bare `<inner_thought>`
-block to record a judgement. Provider-native reasoning parts are preserved by
-`@yesimbot/agent-runtime` either way. Message element syntax documentation lives
-in the `send_message` tool description, not in a separate system message.
+`customInnerThought` (default `false`) controls whether the Core-owned inner
+monologue section is included in the constitution. When explicitly enabled,
+`send_message` gains an optional `inner_thought` field; the monologue is a tool
+argument rather than an output format, so the model never has to emit a bare
+`<inner_thought>` block to record a judgement. Provider-native reasoning parts
+are preserved by `@yesimbot/agent-runtime` either way. Existing history is not
+rewritten. Message element syntax documentation lives in the `send_message`
+tool description, not in a separate system message.
 
 ## Output and delivery
 

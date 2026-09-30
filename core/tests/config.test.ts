@@ -23,6 +23,11 @@ describe("Config schema", () => {
     expect(Object.keys(sessionGroup?.dict ?? {})).toEqual(["compact", "archive"]);
   });
 
+  it("defaults custom inner thought to disabled", () => {
+    const resolved = Config({ chatModel: "test:model" } as never) as { customInnerThought?: boolean };
+    expect(resolved.customInnerThought).toBe(false);
+  });
+
   it("defaults main-channel model retries to three and bounds them to zero through five", () => {
     type SchemaNode = {
       type?: string;
@@ -47,6 +52,10 @@ describe("Config schema", () => {
           minMessages: number;
           maxFailures: number;
           inlineFragments: number;
+          mode: "summary" | "compartment";
+          chunkMessages: number;
+          chunkChars: number;
+          assistantAsFacts: boolean;
         };
       };
     };
@@ -58,6 +67,10 @@ describe("Config schema", () => {
       minMessages: 15,
       maxFailures: 3,
       inlineFragments: 3,
+      mode: "summary",
+      chunkMessages: 20,
+      chunkChars: 12_000,
+      assistantAsFacts: false,
     });
   });
 

@@ -6,8 +6,12 @@ import type { LanguageModel } from "ai";
 
 import type { MessageRecord } from "../messages/index.js";
 import { resolveLatestCompactBoundary } from "./boundary.js";
-import { compactSourceTimestamp, executeCompact, filterEntriesForCompression } from "./compact.js";
+import { compactSourceTimestamp, executeCompact, filterEntriesForCompression, renderCompressionRecords, type CompressionRecord } from "./compact.js";
 import type { CompactFragmentInput, CompactFragmentWriter } from "./fragment-store.js";
+
+const DEFAULT_COMPARTMENT_MESSAGES = 20;
+const DEFAULT_COMPARTMENT_CHARS = 12_000;
+const MAX_EXPANSION_PAGE_SIZE = 50;
 
 export type CompactReason = "auto" | "idle" | "periodic" | "turn-limit" | "prompt-limit" | "manual";
 
@@ -16,6 +20,8 @@ export type CompactResult = { readonly compacted: boolean; readonly reason?: str
 export type ConversationInfo = { filename: string; isActive: boolean; size: number; createdAt: string };
 
 export type ConversationStatus = { active: ConversationInfo | null };
+
+export type CompartmentExpansionRecord = CompressionRecord;
 
 export interface CompactInput {
   model: LanguageModel;
@@ -29,8 +35,31 @@ export interface ConversationCompactConfig {
   maxFailures: number;
   /** Resident fragments projected into the model context; older fragments overflow to the store. */
   inlineFragments?: number;
+  /** Legacy-compatible one-shot summary or incremental raw-history compartments. */
+  mode?: "summary" | "compartment";
+  /** Maximum source messages per compartment. */
+  chunkMessages?: number;
+  /** Maximum rendered source characters per compartment. */
+  chunkChars?: number;
+  /** Include assistant output as objective facts in compartment input. */
+  assistantAsFacts?: boolean;
   threshold?: number;
   charTokenRatio?: number;
+}
+
+export interface CompartmentExpansionOptions {
+  readonly offset?: number;
+  readonly limit?: number;
+}
+
+export interface CompartmentExpansionResult {
+  readonly compartmentId: string;
+  readonly label?: string;
+  readonly offset: number;
+  readonly limit: number;
+  readonly total: number;
+  readonly entries: readonly CompartmentExpansionRecord[];
+  readonly nextOffset?: number;
 }
 
 export interface ConversationOptions {
@@ -50,6 +79,11 @@ export interface ConversationReadOptions {
   to?: number;
   userIds?: string[];
   limit?: number;
+}
+
+interface CompactionChunk {
+  readonly entries: readonly AgentEntry[];
+  readonly messages: readonly Extract<AgentEntry, { type: "message" }>[];
 }
 
 interface ReadMessage {
@@ -212,18 +246,75 @@ export class Conversation {
     return limited.sort((left, right) => left.record.timestamp - right.record.timestamp).map(({ record }) => record);
   }
 
+  /** Expands one compartment's canonical raw source without calling a model or writing storage. */
+  public async expandCompartment(compartmentId: string, options: CompartmentExpansionOptions = {}): Promise<CompartmentExpansionResult> {
+    if (!this.storagePathValue) throw new Error("Conversation has not been initialized");
+    await this.storageTail;
+    if (typeof compartmentId !== "string" || compartmentId.trim().length === 0) throw new Error("Compartment ID must be a non-empty string");
+    const offset = options.offset ?? 0;
+    if (!Number.isInteger(offset) || offset < 0) throw new Error("Compartment expansion offset must be a non-negative integer");
+    const requestedLimit = options.limit ?? MAX_EXPANSION_PAGE_SIZE;
+    if (!Number.isInteger(requestedLimit) || requestedLimit <= 0) throw new Error("Compartment expansion limit must be a positive integer");
+    const limit = Math.min(requestedLimit, MAX_EXPANSION_PAGE_SIZE);
+
+    let matched: { readonly filename: string; readonly entry: Extract<AgentEntry, { type: "compact" }> } | undefined;
+    for (const filename of await this.files()) {
+      for (const entry of await createJsonlStorage(join(this.sessionsPath(), filename)).read()) {
+        if (entry.type !== "compact") continue;
+        if (entry.id !== compartmentId && entry.data.compartmentId !== compartmentId) continue;
+        if (matched) throw new Error(`Compartment ID ${JSON.stringify(compartmentId)} is duplicated`);
+        matched = { filename, entry };
+      }
+    }
+    if (!matched) throw new Error(`Compartment ID ${JSON.stringify(compartmentId)} was not found in this conversation`);
+
+    const sourceSession = matched.entry.data.sourceSession;
+    const sourceFiles = sourceSession ? [`${sourceSession.replace(/\\.jsonl$/, "")}.jsonl`] : await this.files();
+    const sourceFileSet = new Set(await this.files());
+    let sourceEntries: readonly AgentEntry[] | undefined;
+    for (const filename of sourceFiles) {
+      if (!sourceFileSet.has(filename)) continue;
+      const entries = await createJsonlStorage(join(this.sessionsPath(), filename)).read();
+      if (entries.some((entry) => entry.id === matched!.entry.data.firstEntryId) && entries.some((entry) => entry.id === matched!.entry.data.lastEntryId)) {
+        sourceEntries = entries;
+        break;
+      }
+    }
+    if (!sourceEntries) throw new Error(`Compartment ${JSON.stringify(compartmentId)} has no readable raw source`);
+    const firstEntryId = matched.entry.data.firstEntryId;
+    const lastEntryId = matched.entry.data.lastEntryId;
+    if (!firstEntryId || !lastEntryId) throw new Error(`Compartment ${JSON.stringify(compartmentId)} has no raw source bounds`);
+    const firstIndex = sourceEntries.findIndex((entry) => entry.id === firstEntryId);
+    const lastIndex = sourceEntries.findIndex((entry) => entry.id === lastEntryId);
+    if (firstIndex < 0 || lastIndex < firstIndex) throw new Error(`Compartment ${JSON.stringify(compartmentId)} has invalid raw source bounds`);
+
+    const records = sourceEntries.slice(firstIndex, lastIndex + 1).flatMap(renderCompressionRecords);
+    const entries = records.slice(offset, offset + limit);
+    const nextOffset = offset + entries.length < records.length ? offset + entries.length : undefined;
+    return {
+      compartmentId: matched.entry.data.compartmentId ?? matched.entry.id,
+      ...(matched.entry.data.compartmentLabel ? { label: matched.entry.data.compartmentLabel } : {}),
+      offset,
+      limit,
+      total: records.length,
+      entries,
+      ...(nextOffset === undefined ? {} : { nextOffset }),
+    };
+  }
+
   public async compact(reason: CompactReason, input: CompactInput): Promise<CompactResult> {
     await this.init();
     if (this.failures >= this.compactConfig.maxFailures) return { compacted: false, reason: "failure_limit" };
     const entries = await this.readStorage();
     const boundary = resolveLatestCompactBoundary(entries);
     const sourceEntries = entries.slice(boundary?.tailStartIndex ?? 0);
+    if (this.compactConfig.mode === "compartment") return this.compactCompartments(reason, input, sourceEntries, boundary);
     const excluded = new Set(input.excludeMessageIds ?? []);
     const sourceForCompaction = sourceEntries.filter((entry) => entry.type !== "message" || !excluded.has(entry.id));
     const messages = sourceForCompaction.filter((entry) => entry.type === "message");
     if (!input.force && messages.length < this.compactConfig.minMessages) return { compacted: false, reason: "minimum_messages" };
     if (messages.length === 0) return { compacted: false, reason: "empty_input" };
-    const content = filterEntriesForCompression(sourceForCompaction);
+    const content = filterEntriesForCompression(sourceForCompaction, { assistantAsFacts: this.compactConfig.assistantAsFacts });
     if (!content) return { compacted: false, reason: "empty_input" };
     try {
       // Only raw entries after the latest boundary are summarized. The previous summary is never
@@ -234,6 +325,7 @@ export class Conversation {
           model: input.model,
           conversation: content,
           signal: input.signal,
+          assistantAsFacts: this.compactConfig.assistantAsFacts,
         })
       ).slice(0, 30_000);
       if (!summary) {
@@ -269,6 +361,81 @@ export class Conversation {
         reason: cause instanceof Error && cause.message === "Compaction produced an empty summary." ? "empty_summary" : "model_failure",
       };
     }
+  }
+
+  private async compactCompartments(
+    _reason: CompactReason,
+    input: CompactInput,
+    sourceEntries: readonly AgentEntry[],
+    boundary: ReturnType<typeof resolveLatestCompactBoundary>,
+  ): Promise<CompactResult> {
+    const excluded = new Set(input.excludeMessageIds ?? []);
+    const sourceForCompaction = sourceEntries.filter((entry) => entry.type !== "message" || !excluded.has(entry.id));
+    const messages = sourceForCompaction.filter((entry) => entry.type === "message" && entry.data.role !== "tool");
+    if (!input.force && messages.length < this.compactConfig.minMessages) return { compacted: false, reason: "minimum_messages" };
+    if (messages.length === 0) return { compacted: false, reason: "empty_input" };
+
+    const chunks = buildCompactionChunks(sourceForCompaction, {
+      maxMessages: this.compactConfig.chunkMessages ?? DEFAULT_COMPARTMENT_MESSAGES,
+      maxChars: this.compactConfig.chunkChars ?? DEFAULT_COMPARTMENT_CHARS,
+    });
+    let compacted = false;
+    let parentCompactId = boundary?.compact.id;
+    let lineageId = boundary?.compact.data.lineageId ?? parentCompactId;
+    for (const [chunkIndex, chunk] of chunks.entries()) {
+      const content = filterEntriesForCompression(chunk.entries, { mode: "compartment", assistantAsFacts: this.compactConfig.assistantAsFacts });
+      if (!content) continue;
+      try {
+        const summary = (
+          await executeCompact({
+            model: input.model,
+            conversation: content,
+            signal: input.signal,
+            mode: "compartment",
+            assistantAsFacts: this.compactConfig.assistantAsFacts,
+          })
+        ).slice(0, 30_000);
+        if (!summary) throw new Error("Compaction produced an empty summary.");
+        const compactId = createRandomId();
+        const timestamps = chunk.messages.map(compactSourceTimestamp);
+        const nextLineageId = lineageId ?? compactId;
+        const compact = createEntry(
+          "compact",
+          {
+            summary,
+            lastEntryId: chunk.entries.at(-1)!.id,
+            firstEntryId: chunk.entries[0]!.id,
+            sourceSession: this.currentSessionId(),
+            lineageId: nextLineageId,
+            mode: "compartment",
+            compartmentId: compactId,
+            compartmentLabel: `compartment-${chunkIndex + 1}`,
+            chunkIndex,
+            startAt: Math.min(...timestamps),
+            endAt: Math.max(...timestamps),
+            ...(parentCompactId ? { parentCompactId } : {}),
+          },
+          { id: compactId },
+        );
+        await this.storage.append(compact);
+        compacted = true;
+        parentCompactId = compact.id;
+        lineageId = nextLineageId;
+        this.failures = 0;
+      } catch (cause) {
+        this.failures += 1;
+        if (input.signal?.aborted) throw cause;
+        await this.syncCompactFragments();
+        if (compacted) return { compacted: true, reason: "partial_failure" };
+        return {
+          compacted: false,
+          reason: cause instanceof Error && cause.message === "Compaction produced an empty summary." ? "empty_summary" : "model_failure",
+        };
+      }
+    }
+    if (!compacted) return { compacted: false, reason: "empty_input" };
+    await this.syncCompactFragments();
+    return { compacted: true };
   }
 
   private setStorage(path: string): void {
@@ -394,6 +561,37 @@ export class Conversation {
   private sessionsPath(): string {
     return join(this.root, "sessions");
   }
+}
+
+function buildCompactionChunks(entries: readonly AgentEntry[], options: { readonly maxMessages: number; readonly maxChars: number }): CompactionChunk[] {
+  const maxMessages = Number.isInteger(options.maxMessages) && options.maxMessages > 0 ? options.maxMessages : DEFAULT_COMPARTMENT_MESSAGES;
+  const maxChars = Number.isInteger(options.maxChars) && options.maxChars > 0 ? options.maxChars : DEFAULT_COMPARTMENT_CHARS;
+  const chunks: CompactionChunk[] = [];
+  let current: AgentEntry[] = [];
+  let messages: Extract<AgentEntry, { type: "message" }>[] = [];
+  let chars = 0;
+  const flush = (): void => {
+    if (messages.length === 0) return;
+    chunks.push({ entries: [...current], messages: [...messages] });
+    current = [];
+    messages = [];
+    chars = 0;
+  };
+
+  for (const entry of entries) {
+    if (entry.type !== "message" || entry.data.role === "tool") {
+      current.push(entry);
+      continue;
+    }
+    const entryChars = renderCompressionRecords(entry).reduce((total, record) => total + record.text.length, 0);
+    if (messages.length > 0 && (messages.length >= maxMessages || chars + entryChars > maxChars)) flush();
+    current.push(entry);
+    messages.push(entry);
+    chars += entryChars;
+    if (messages.length >= maxMessages || chars >= maxChars) flush();
+  }
+  flush();
+  return chunks;
 }
 
 function validateReadOptions(options: ConversationReadOptions): void {

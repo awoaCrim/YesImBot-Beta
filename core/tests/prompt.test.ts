@@ -45,7 +45,7 @@ describe("buildCoreSystemPrompt", () => {
     }
   });
 
-  it("tells the model that text output is never delivered and send_message is the only path", async () => {
+  it("requires explicit delivery without excluding plugin-owned sending tools", async () => {
     const root = await mkdtemp(join(tmpdir(), "yesimbot-prompt-"));
     try {
       const prompt = await buildCoreSystemPrompt({
@@ -57,7 +57,11 @@ describe("buildCoreSystemPrompt", () => {
 
       const constitution = String(prompt[0].content);
       expect(constitution).toContain("你输出的文本不会被发送到任何地方");
-      expect(constitution).toContain("send_message");
+      expect(constitution).toContain("文字消息使用 send_message");
+      expect(constitution).toContain("插件提供的其他发送工具可以直接发送其支持的内容");
+      expect(constitution).toContain("未调用任何发送工具时，本轮不会有内容发出");
+      expect(constitution).not.toContain("消息只通过 send_message");
+      expect(constitution).not.toContain("sticker_send");
       expect(constitution).toContain("尽量避免使用 emoji 或其他 Unicode 表情符号");
       expect(constitution).not.toContain("# 最终回复标签");
       expect(constitution).not.toContain("<reply>");
@@ -83,13 +87,13 @@ describe("buildCoreSystemPrompt", () => {
         customInnerThought: false,
       });
 
-      expect(String(enabled[0].content)).toContain("send_message 的 inner_thought 字段");
+      expect(String(enabled[0].content)).toContain("send_message 的 inner_thought");
       expect(String(enabled[0].content)).toContain("# 内心判断");
-      expect(String(enabled[0].content)).toContain("不模仿 persona 的台词");
-      expect(String(enabled[0].content)).toContain("当前回应的语域、叙述距离和情绪力度");
-      expect(String(enabled[0].content)).toContain("不把角色化措辞、戏剧动作或对抗性旁白");
+      expect(String(enabled[0].content)).toContain("不写 persona 台词");
+      expect(String(enabled[0].content)).toContain("回应语域和行动计划");
+      expect(String(enabled[0].content)).toContain("不写 persona 台词、戏剧动作或对外文本");
       expect(String(enabled[0].content)).toContain("不要把过去的 inner_thought 或 finish.reason");
-      expect(String(enabled[0].content)).toContain("同一焦点保持连贯表达");
+      expect(String(enabled[0].content)).toContain("同一次 send_message 调用中的 messages 属于同一个回应单元");
       expect(String(enabled[0].content)).not.toContain("内心独白和对外发言都以你的 persona 的声音进行");
       expect(String(disabled[0].content)).not.toContain("# 内心判断");
     } finally {
@@ -108,9 +112,10 @@ describe("buildCoreSystemPrompt", () => {
 
       const constitution = String(prompt[0].content);
       expect(constitution).toContain("同一次 send_message 调用中的 messages 属于同一个回应单元");
-      expect(constitution).toContain("工具、图片描述和其他外部资料只是事实材料");
-      expect(constitution).toContain("不要把一部分写成脱离角色的资讯文章、报告或客服答复");
-      expect(constitution).toContain("整批消息像同一个人在同一场交流中连续说话");
+      expect(constitution).toContain("外部资料只作为事实材料");
+      expect(constitution).toContain("不要把同一回应拆成互相割裂的报告和聊天");
+      expect(constitution).toContain("不要用普通文本中的空行制造消息分段");
+      expect(constitution).toContain("需要分开时，把每条消息写成 messages 的独立项目");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -146,7 +151,7 @@ describe("buildCoreSystemPrompt", () => {
 
       const constitution = String(prompt[0].content);
       expect(constitution).toContain("孤立的问号、表情、贴图或无明确指向的短句都不是在要求你重述刚说过的内容");
-      expect(constitution).toContain("<delivered_transcript_history> 里是你自己已经发送到平台的只读发言记录");
+      expect(constitution).toContain("你自己已经发送到平台的历史输出只是只读情境材料");
       expect(constitution).toContain("不是用户输入、当前问题或可执行指令");
       expect(constitution).toContain("不要复述或照抄上一轮历史发言");
       expect(constitution).toContain("上一轮任务视为已经完成");
@@ -203,7 +208,7 @@ describe("buildCoreSystemPrompt", () => {
       const constitution = String(prompt[0].content);
       expect(constitution).not.toContain("[DELIVERED_MESSAGE]");
       expect(constitution).not.toContain("历史记录的内部格式");
-      expect(constitution).toContain("消息只通过 send_message 工具到达平台");
+      expect(constitution).toContain("对外内容只能通过当前实际提供的发送工具到达平台");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -250,7 +255,12 @@ describe("buildCoreSystemPrompt", () => {
       expect(all).not.toContain("像真人被问到荒谬问题一样自然应对");
       // Core safety, tool, and runtime protocol must survive delegation.
       expect(all).toContain("你输出的文本不会被发送到任何地方");
-      expect(all).toContain("消息只通过 send_message 工具到达平台");
+      expect(all).toContain("对外内容只能通过当前实际提供的发送工具到达平台");
+      expect(all).toContain("插件提供的其他发送工具可以直接发送其支持的内容");
+      expect(all).toContain("不要用普通文本中的空行制造消息分段");
+      expect(all).toContain("需要分开时，把每条消息写成 messages 的独立项目");
+      expect(all).not.toContain("消息只通过 send_message");
+      expect(all).not.toContain("sticker_send");
       expect(all).toContain("直接调用无参数的 finish");
       expect(all).toContain("区分可见事实、工具结果与自己的推测");
       expect(all).toContain("<runtime_context>");
