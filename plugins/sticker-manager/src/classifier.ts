@@ -27,16 +27,15 @@ export class ModelStickerClassifier implements StickerClassifier {
   ) {}
 
   public async classify(input: ClassifyInput): Promise<ClassifyResult | undefined> {
-    const modelId = this.config.classificationModel || this.ctx.yesimbot.model.getDefaultChatModelId();
-    if (!modelId) return undefined;
-
     let ref;
     try {
-      ref = this.ctx.yesimbot.model.resolveChatModel(modelId);
+      ref = this.ctx.yesimbot.model.resolveAuxiliaryModel("utility");
     } catch (cause) {
-      this.ctx
-        .logger("yesimbot.sticker-manager")
-        .warn("classification_model_unavailable", { modelId, cause: cause instanceof Error ? cause.message : String(cause) });
+      this.ctx.logger("yesimbot.sticker-manager").warn("classification_model_unavailable", {
+        route: "auxiliary",
+        purpose: "utility",
+        code: cause && typeof cause === "object" && "code" in cause ? String((cause as { code?: unknown }).code) : "unresolvable-model",
+      });
       return undefined;
     }
 

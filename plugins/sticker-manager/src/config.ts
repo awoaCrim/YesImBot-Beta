@@ -29,7 +29,10 @@ export const StickerConfigSchema: Schema<StickerConfig> = Schema.object({
   fuzzyTagMatch: Schema.boolean().default(true).description("sticker_send 的 tag 使用模糊匹配，默认开启"),
   tagRandomRange: Schema.number().min(0).default(1).description("tag 发送随机范围：0 只选最高匹配分，每增加 1 可随机放宽到下一档匹配分"),
   sendStaticAsGif: Schema.boolean().default(true).description("发送静态图片表情包时转为单帧 GIF，默认开启；GIF 原样发送"),
-  stickerElement: Schema.boolean().default(true).description("允许 bot 直接输出 <sticker/> 发送表情，默认开启"),
+  stickerElement: Schema.boolean().default(true).description("启用 Sticker 元素的内部历史投影，默认开启；平台发送必须调用 sticker_send"),
+  enableSteal: Schema.boolean()
+    .default(true)
+    .description("允许 bot 收藏当前消息中的图片（sticker_steal 工具），默认开启；关闭后仍可查询、搜索和发送已有表情包"),
 });
 
 export type { StickerConfig };
