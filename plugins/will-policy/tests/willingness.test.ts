@@ -10,13 +10,13 @@ import { PolicyWillingnessEngine } from "../src/willingness.js";
 const state = { activeTurnId: null };
 const logger = { debug: vi.fn() };
 
-function message(elements: unknown[], channelType = 0 as Universal.Channel.Type): Message {
+function message(elements: unknown[], channelType = 0 as Universal.Channel.Type, userId = "user-1"): Message {
   return createMessage({
     platform: "test",
     selfId: "bot-1",
     timestamp: 1,
     channel: { id: "room-1", type: channelType },
-    user: { id: "user-1" },
+    user: { id: userId },
     messageId: "m-1",
     elements: elements as never,
   });
@@ -46,7 +46,7 @@ describe("PolicyWillingnessEngine", () => {
     const engine = new PolicyWillingnessEngine({ ...defaultWillingnessConfig(), probabilityThreshold: 100, mentionForce: true }, logger);
 
     await expect(engine.decide(message([{ type: "at", attrs: { id: "bot-1" }, children: [] }]), state)).resolves.toBe("trigger");
-    expect(engine.getCurrentWillingness()).toBeGreaterThan(0);
+    expect(engine.getCurrentWillingness("user-1")).toBe(0);
     expect(logger.debug).toHaveBeenCalledWith(expect.stringContaining("will_policy.willingness"), expect.any(Object));
   });
 
@@ -75,13 +75,65 @@ describe("PolicyWillingnessEngine", () => {
     expect(engine.getCurrentWillingness()).toBeGreaterThan(0);
   });
 
-  it("charges reply cost with a zero floor", async () => {
-    const engine = new PolicyWillingnessEngine({ ...defaultWillingnessConfig(), initialScore: 50, replyCost: 30 }, logger);
+  it("does not carry a mention boost into later plain messages", async () => {
+    const engine = new PolicyWillingnessEngine({ ...defaultWillingnessConfig(), mentionForce: true }, logger);
 
-    await engine.observe({ turnId: "turn-1", status: "done", messages: [] });
-    expect(engine["score"]).toBe(20);
+    await expect(engine.decide(message([{ type: "at", attrs: { id: "bot-1" }, children: [] }]), state)).resolves.toBe("trigger");
+    await expect(engine.decide(message([{ type: "text", attrs: { content: "?" }, children: [] }]), state)).resolves.toBe("wait");
+  });
 
-    await engine.observe({ turnId: "turn-1", status: "done", messages: [] });
-    expect(engine["score"]).toBe(0);
+  it("isolates accumulated willingness by message author", async () => {
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    try {
+      const engine = new PolicyWillingnessEngine(
+        { ...defaultWillingnessConfig(), probabilityThreshold: 30, probabilityAmplifier: 1, replyCost: 0, mentionForce: true },
+        logger,
+      );
+
+      await expect(engine.decide(message([], 0, "user-a"), state)).resolves.toBe("wait");
+      await expect(engine.decide(message([], 0, "user-a"), state)).resolves.toBe("wait");
+      await expect(engine.decide(message([{ type: "at", attrs: { id: "bot-1" }, children: [] }], 0, "user-a"), state)).resolves.toBe("trigger");
+
+      await expect(engine.decide(message([], 0, "user-b"), state)).resolves.toBe("wait");
+      await expect(engine.decide(message([], 0, "user-a"), state)).resolves.toBe("trigger");
+    } finally {
+      random.mockRestore();
+    }
+  });
+
+  it("does not treat at-all or at-here as a mention of the bot", async () => {
+    const engine = new PolicyWillingnessEngine({ ...defaultWillingnessConfig(), probabilityThreshold: 100, mentionForce: true }, logger);
+
+    await expect(engine.decide(message([{ type: "at", attrs: { type: "all" }, children: [] }]), state)).resolves.toBe("wait");
+    await expect(engine.decide(message([{ type: "at", attrs: { type: "here" }, children: [] }]), state)).resolves.toBe("wait");
+  });
+
+  it("charges reply cost immediately when a message triggers", async () => {
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    try {
+      const engine = new PolicyWillingnessEngine(
+        {
+          ...defaultWillingnessConfig(),
+          initialScore: 50,
+          probabilityThreshold: 0,
+          probabilityAmplifier: 1,
+          replyCost: 30,
+          textGain: 0,
+          mentionGain: 0,
+          quoteGain: 0,
+          directGain: 0,
+          imageGain: 0,
+        },
+        logger,
+      );
+
+      await expect(engine.decide(message([]), state)).resolves.toBe("trigger");
+      expect(engine.getCurrentWillingness("user-1")).toBe(20);
+
+      await expect(engine.decide(message([]), state)).resolves.toBe("trigger");
+      expect(engine.getCurrentWillingness("user-1")).toBe(0);
+    } finally {
+      random.mockRestore();
+    }
   });
 });

@@ -25,6 +25,7 @@ export class Runtimes {
   private stopTask: Promise<void> | undefined;
   private readonly messageRevisionDisposer: () => void;
   private readonly modelRevisionDisposer: () => void;
+  private readonly polisherRevisionDisposer: () => void;
 
   public constructor(
     private readonly ctx: Context,
@@ -42,6 +43,9 @@ export class Runtimes {
     });
     this.modelRevisionDisposer = ctx.on("yesimbot/model-registry-changed", (revision) => {
       void this.invalidateModelRuntimes(revision);
+    });
+    this.polisherRevisionDisposer = this.polishers.onRevision((revision) => {
+      void this.invalidatePolisherRuntimes(revision);
     });
   }
 
@@ -129,6 +133,7 @@ export class Runtimes {
         bot,
         will: await this.agents.setupWill(willContext, session),
         model: chat.model,
+        historyProjection: chat.capabilities?.historyProjection ?? "default",
         toolChoice,
         compactModel,
         providerTools: chat.tools,
@@ -198,6 +203,7 @@ export class Runtimes {
     this.logger.debug("runtimes.stop", { runtimeCount: this.runtimes.size });
     this.messageRevisionDisposer();
     this.modelRevisionDisposer();
+    this.polisherRevisionDisposer();
     this.stopTask = Promise.allSettled([...this.runtimes.values()].map((runtime) => runtime.stop())).then(() => {
       this.runtimes.clear();
       this.agentRevisions.clear();
@@ -347,6 +353,28 @@ export class Runtimes {
           const runtime = this.runtimes.get(key);
           if (runtime) {
             this.logger.warn("runtimes.invalidate_model", { key, currentRevision, newRevision: revision });
+            await runtime.stop();
+          }
+          this.runtimes.delete(key);
+          this.agentRevisions.delete(key);
+          this.messageRevisions.delete(key);
+          this.modelRevisions.delete(key);
+          this.polisherRevisions.delete(key);
+        }),
+      ),
+    );
+  }
+
+  private async invalidatePolisherRuntimes(revision: number): Promise<void> {
+    if (this.stopped) return;
+    await Promise.all(
+      [...this.runtimes.keys()].map((key) =>
+        this.serialize(key, async () => {
+          const currentRevision = this.polisherRevisions.get(key);
+          if (currentRevision === undefined || currentRevision >= revision) return;
+          const runtime = this.runtimes.get(key);
+          if (runtime) {
+            this.logger.warn("runtimes.invalidate_polisher", { key, currentRevision, newRevision: revision });
             await runtime.stop();
           }
           this.runtimes.delete(key);

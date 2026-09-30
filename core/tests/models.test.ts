@@ -101,6 +101,40 @@ describe("models.json modalities", () => {
     dispose();
     expect(service.revision).toBeGreaterThan(registered);
   });
+  it("loads and isolates model-level thinking settings", async () => {
+    const chat = vi.fn(() => ({}) as never);
+    const provider: ModelProvider = {
+      ...createProvider(),
+      chat,
+      chatModels: () => [
+        {
+          id: "gpt-4o",
+          thinkingLevel: "medium",
+          thinkingLevelMap: { medium: "medium", high: "high" },
+        },
+      ],
+    };
+    const service = await createModelService(
+      {
+        chat: {
+          "openai:gpt-4o": {
+            thinkingLevel: "high",
+            thinkingLevelMap: { high: "high" },
+          },
+        },
+      },
+      undefined,
+      provider,
+    );
+
+    const first = service.resolveChatModel("openai:gpt-4o");
+    expect(chat).toHaveBeenCalledWith("gpt-4o", expect.objectContaining({ thinkingLevel: "high", thinkingLevelMap: { medium: "medium", high: "high" } }));
+    expect(first.entry).toMatchObject({ thinkingLevel: "high", thinkingLevelMap: { medium: "medium", high: "high" } });
+    first.entry.thinkingLevelMap!.high = "low";
+
+    expect(service.resolveChatModel("openai:gpt-4o").entry.thinkingLevelMap).toEqual({ medium: "medium", high: "high" });
+  });
+
   it("loads independent input and output modality arrays when their values are supported", async () => {
     const service = await createModelService({ chat: { "openai:gpt-4o": { modalities: { input: ["image"], output: ["text"] } } } });
 
@@ -134,7 +168,7 @@ describe("models.json modalities", () => {
   it("fails closed when a provider does not declare image tool-result support", async () => {
     const service = await createModelService({});
 
-    expect(service.resolveChatModel("openai:gpt-4o").capabilities).toEqual({ imageToolResult: "unknown" });
+    expect(service.resolveChatModel("openai:gpt-4o").capabilities).toEqual({ imageToolResult: "unknown", historyProjection: "default" });
   });
 
   it("propagates explicit unsupported image tool-result transport capabilities", async () => {
@@ -144,8 +178,21 @@ describe("models.json modalities", () => {
     };
     const service = await createModelService({}, undefined, provider);
 
-    expect(service.resolveChatModel("openai:gpt-4o").capabilities).toEqual({ imageToolResult: "unsupported" });
+    expect(service.resolveChatModel("openai:gpt-4o").capabilities).toEqual({ imageToolResult: "unsupported", historyProjection: "default" });
     expect(provider.chatCapabilities).toHaveBeenCalledWith("gpt-4o");
+  });
+
+  it("resolves provider-scoped history projection capabilities and defaults unknown providers", async () => {
+    const provider: ModelProvider = {
+      ...createProvider(),
+      chatCapabilities: vi.fn(() => ({ imageToolResult: "native" as const, historyProjection: "gemini-native" as const })),
+    };
+    const service = await createModelService({}, undefined, provider);
+
+    expect(service.resolveChatModel("openai:gpt-4o").capabilities.historyProjection).toBe("gemini-native");
+
+    const defaultService = await createModelService({});
+    expect(defaultService.resolveChatModel("openai:gpt-4o").capabilities.historyProjection).toBe("default");
   });
 
   it("resolves the configured auxiliary model with an explicit route", async () => {

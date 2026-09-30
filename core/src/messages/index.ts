@@ -2,6 +2,8 @@ import { createCustomMessage, type AgentMessage, type CustomMessageBase } from "
 import type { UserModelMessage } from "ai";
 import { h, type Element, type Universal } from "koishi";
 
+export const PARAGRAPH_BREAK = /\r?\n[^\S\r\n]*\r?\n(?:[^\S\r\n]*\r?\n)*/;
+
 const MARK = "\u0000";
 
 export interface MessageQuote {

@@ -42,7 +42,8 @@
     "pub": "yarn npm publish --access public"
   },
   "dependencies": {
-    "@ai-sdk/google": "^3.0.0"
+    "@ai-sdk/google": "^3.0.0",
+    "ai": "^6.0.0"
   },
   "devDependencies": {
     "@yesimbot/agent-runtime": "workspace:^",

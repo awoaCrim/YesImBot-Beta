@@ -8,6 +8,7 @@ import {
   EphemeralImageProjectionStore,
   type Agent,
   type AgentEntry,
+  type AgentHistoryMode,
   type AgentInternalEvent,
   type AgentPlugin,
   type AgentToolSet,
@@ -19,6 +20,7 @@ import { Universal, type Bot, type Context, type Logger } from "koishi";
 import type { MessagePolisherCapability } from "../agents/polisher.js";
 import {
   createDescribeImageTool,
+  createExpandCompartmentTool,
   createFinishTool,
   createReadTool,
   createSendMessageTool,
@@ -41,7 +43,7 @@ import {
   type CompactFragmentRecallSource,
 } from "../conversations/fragment-store.js";
 import type { CompactInput, CompactReason, CompactResult } from "../conversations/index.js";
-import { INTERNAL_HISTORY_PROJECTION_PLUGIN } from "../conversations/internal-history.js";
+import { createInternalHistoryProjectionPlugin } from "../conversations/internal-history.js";
 import type { MessageBatchController, MessageBatchInput, MessageBatchPlugin } from "../message-batches/index.js";
 import {
   createEvent,
@@ -56,26 +58,12 @@ import {
   type Message,
   type MessageRecord,
 } from "../messages/index.js";
+import type { HistoryProjectionMode } from "../models/index.js";
 import { buildCoreSystemPrompt } from "./prompt.js";
 
 /** Fixed Core threshold: a provider-reported prompt above this only ever registers a pending compact. */
 const PROMPT_LIMIT_INPUT_TOKENS = 100_000;
 const CORDIS_ORIGINAL = Symbol.for("cordis.original");
-
-const MODEL_INPUT_PLUGIN: AgentPlugin = {
-  name: "core.model-input",
-  enforce: "pre",
-  toModelMessages: async (message, context) => {
-    if (isDeliveredTranscript(message)) {
-      const transcripts = context.history.filter(isDeliveredTranscript);
-      if (transcripts[0]?.id !== message.id) return [];
-      return [formatDeliveredTranscriptHistory(transcripts)];
-    }
-    if (!isMessage(message) && !isEvent(message)) return [];
-    const isCurrent = context.current.some((current) => current.id === message.id);
-    return [isCurrent ? formatCurrentInput(message) : formatInput(message)];
-  },
-};
 
 /** Fallback when a config predates the resident-fragment setting. */
 const DEFAULT_INLINE_FRAGMENTS = 3;
@@ -90,6 +78,8 @@ export type PostOptions = {
   readonly trigger?: boolean;
   readonly ifBusy?: "defer" | "join" | "reject";
   readonly delivery?: "channel" | "silent";
+  /** Overrides the default event isolation for an explicitly posted turn. */
+  readonly historyMode?: AgentHistoryMode;
 };
 
 export interface ChannelRuntimeOptions {
@@ -97,6 +87,8 @@ export interface ChannelRuntimeOptions {
   readonly bot: Bot;
   readonly will: WillEngine;
   readonly model: LanguageModel;
+  /** Provider-scoped request history projection; omitted models use the compatibility default. */
+  readonly historyProjection?: HistoryProjectionMode;
   /** Set by the Core capability gate; the Runtime never infers forced tool choice by itself. */
   readonly toolChoice?: "required";
   readonly providerTools?: ToolSet;
@@ -176,6 +168,7 @@ export class ChannelRuntime {
         onFailed: (notice) => this.announceSendFailed(notice),
       }),
       createReadTool(options.channel.resources, options.readImagePolicy, this.imageProjection),
+      createExpandCompartmentTool(options.channel.conversation),
       createFinishTool(),
     ];
     if (options.visionModel && options.readImagePolicy.mode !== "native") {
@@ -207,8 +200,8 @@ export class ChannelRuntime {
         // compact records with request-only system messages.
         this.compactRecallPlugin(channelKey),
         createSummaryHistoryPlugin(inlineFragmentCount(options.config)),
-        INTERNAL_HISTORY_PROJECTION_PLUGIN,
-        MODEL_INPUT_PLUGIN,
+        createInternalHistoryProjectionPlugin(options.historyProjection ?? "default"),
+        createModelInputPlugin(options.historyProjection ?? "default"),
         this.imageProjectionPlugin(),
         this.silentTurnPlugin(),
         ...options.plugins,
@@ -287,7 +280,7 @@ export class ChannelRuntime {
       const input = await this.persist(event);
       await this.archiveIfOversize();
       const silent = options.delivery === "silent";
-      const result = !trigger ? { kind: "wait" as const, eventId: input.id } : this.start(input, false, ifBusy, silent);
+      const result = !trigger ? { kind: "wait" as const, eventId: input.id } : this.start(input, false, ifBusy, silent, undefined, options.historyMode);
       this.logger.debug("runtime.post", { eventId: input.id, eventType: event.eventType, trigger, ifBusy, silent, result: result.kind });
       return result;
     });
@@ -579,7 +572,14 @@ export class ChannelRuntime {
     return this.context.type === "direct" ? Universal.Channel.Type.DIRECT : Universal.Channel.Type.TEXT;
   }
 
-  private start(input: Message | Event, passive: boolean, ifBusy: "defer" | "join" | "reject", silent = false, reservationId?: string): RuntimeResult {
+  private start(
+    input: Message | Event,
+    passive: boolean,
+    ifBusy: "defer" | "join" | "reject",
+    silent = false,
+    reservationId?: string,
+    historyMode?: AgentHistoryMode,
+  ): RuntimeResult {
     const activeTurnId = this.agent.getActiveTurnId();
     if (ifBusy === "join" && activeTurnId !== null) {
       this.agent.send(input, { ifBusy: "join" });
@@ -588,7 +588,7 @@ export class ChannelRuntime {
     const tracker: TurnDeliveryTracker = { delivered: false, settled: false, ...(reservationId ? { reservationId } : {}) };
     const stream = this.agent.run(input, {
       ifBusy: ifBusy === "join" ? "defer" : ifBusy,
-      historyMode: isEvent(input) ? "event" : "conversation",
+      historyMode: historyMode ?? (isEvent(input) ? "event" : "conversation"),
     });
     const task = this.consume(stream, passive, silent, tracker);
     this.streams.add(task);
@@ -999,6 +999,60 @@ export class ChannelRuntime {
   }
 }
 
+export function createModelInputPlugin(mode: HistoryProjectionMode = "default"): AgentPlugin {
+  return {
+    name: "core.model-input",
+    enforce: "pre",
+    toModelMessages: async (message, context) => {
+      if (isDeliveredTranscript(message)) {
+        if (mode === "gemini-native") return [];
+        const transcripts = context.history.filter(isDeliveredTranscript);
+        if (transcripts[0]?.id !== message.id) return [];
+        return [formatDeliveredTranscriptHistory(transcripts)];
+      }
+      if (!isMessage(message) && !isEvent(message)) return [];
+      const isCurrent = context.current.some((current) => current.id === message.id);
+      return [isCurrent ? formatCurrentInput(message) : formatInput(message)];
+    },
+    ...(mode === "gemini-native" ? { prepareStep: (messages: readonly ModelMessage[]) => mergeAdjacentUserMessages(messages) } : {}),
+  };
+}
+
+export function mergeAdjacentUserMessages(messages: readonly ModelMessage[]): ModelMessage[] {
+  const result: ModelMessage[] = [];
+  for (const message of messages) {
+    const previous = result.at(-1);
+    if (previous?.role === "user" && message.role === "user") {
+      result[result.length - 1] = mergeUserMessages(previous, message);
+    } else {
+      result.push(message);
+    }
+  }
+  return result;
+}
+
+function mergeUserMessages(
+  first: Extract<ModelMessage, { role: "user" }>,
+  second: Extract<ModelMessage, { role: "user" }>,
+): Extract<ModelMessage, { role: "user" }> {
+  const providerOptions =
+    first.providerOptions && second.providerOptions
+      ? { ...first.providerOptions, ...second.providerOptions }
+      : (first.providerOptions ?? second.providerOptions);
+  return {
+    ...first,
+    content: mergeUserContent(first.content, second.content),
+    ...(providerOptions === undefined ? {} : { providerOptions }),
+  };
+}
+
+function mergeUserContent(first: Extract<ModelMessage, { role: "user" }>["content"], second: Extract<ModelMessage, { role: "user" }>["content"]) {
+  if (typeof first === "string" && typeof second === "string") return `${first}\n${second}`;
+  const firstParts = typeof first === "string" ? [{ type: "text" as const, text: first }] : [...first];
+  const secondParts = typeof second === "string" ? [{ type: "text" as const, text: second }] : [...second];
+  return [...firstParts, { type: "text" as const, text: "\n" }, ...secondParts];
+}
+
 function inlineFragmentCount(config: Config): number {
   return Math.max(1, Math.floor(config.session.compact.inlineFragments ?? DEFAULT_INLINE_FRAGMENTS));
 }
@@ -1023,10 +1077,22 @@ function createSummaryHistoryPlugin(inlineFragments: number): AgentPlugin {
       const summaries = resident.map((compact) =>
         createEntry(
           "message",
-          createSystemMessage(formatResidentCompactFragment(compact.data.summary), {
-            id: compact.id,
-            timestamp: compact.timestamp,
-          }),
+          createSystemMessage(
+            formatResidentCompactFragment(
+              compact.data.summary,
+              compact.data.mode === "compartment"
+                ? {
+                    id: compact.data.compartmentId ?? compact.id,
+                    mode: "compartment",
+                    ...(compact.data.compartmentLabel ? { label: compact.data.compartmentLabel } : {}),
+                  }
+                : {},
+            ),
+            {
+              id: compact.id,
+              timestamp: compact.timestamp,
+            },
+          ),
           { id: compact.id, timestamp: compact.timestamp },
         ),
       );

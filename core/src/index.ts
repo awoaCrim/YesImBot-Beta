@@ -14,6 +14,8 @@ export type {
   MessagePolisherCapability,
   PolisherPromptProfile,
   PolisherRequest,
+  PolisherTurnContext,
+  PolisherTurnEntry,
   RolePromptProfileProvider,
   WillBatchDecision,
   WillDebug,
@@ -27,6 +29,10 @@ export { createSendMessagePolisher, extractProtectedTokens, PolisherRegistry, va
 
 export type { ChannelContext, ChannelKey } from "./channels/index.js";
 
+export { DEFAULT_MANAGEMENT_TOOL_SCOPES, isToolAccessAllowed } from "./tool-access.js";
+
+export type { ToolAccessRule } from "./tool-access.js";
+
 export type { ConversationReadOptions } from "./conversations/index.js";
 
 export type { MessageBatchController, MessageBatchInput, MessageBatchPlugin, MessageBatchSetupExtensions } from "./message-batches/index.js";
@@ -36,6 +42,8 @@ export * from "./messages/index.js";
 export type { Translator } from "./messengers/index.js";
 
 export type * from "./models/index.js";
+
+export { createThinkingLevelMapSchema, getSupportedThinkingLevels, resolveThinkingLevel, THINKING_LEVELS } from "./models/index.js";
 
 export { ResourceReadError } from "./resources/index.js";
 

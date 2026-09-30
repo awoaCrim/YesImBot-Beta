@@ -158,13 +158,17 @@ describe("send_message tool", () => {
     const sendMessage = vi.fn(async () => ["message-1"]);
     const tool = createSendMessageTool({ bot: { sendMessage } as never, channelId: "room", resources, pacing: PACING, innerThought: true });
 
-    expect(tool.description).toContain("唯一途径");
+    expect(tool.description).not.toContain("唯一途径");
+    expect(tool.description).toContain("你的普通文本输出不会被发送");
+    expect(tool.description).toContain("其他实际提供的发送工具");
     expect(tool.description).toContain("必须检查 ok");
     expect(tool.description).toContain("inner_thought");
     expect(tool.description).toContain("不要使用 group: 前缀");
-    expect(tool.description).toContain("同一次 send_message 调用里的 messages 属于同一个回应单元");
-    expect(tool.description).toContain("不要一条写成脱离角色的资讯/报告");
-    expect(tool.description).toContain("当前回应的语域、叙述距离和情绪力度");
+    expect(tool.description).toContain("同一次调用中的 messages 属于同一个回应单元");
+    expect(tool.description).toContain("工具、搜索和图片结果只是材料");
+    expect(tool.description).toContain("保持一致的说话身份、语域和情绪力度");
+    expect(tool.description).not.toContain("不要用空行分段");
+    expect(tool.description).toContain("解析失败的资源元素会被丢弃");
     expect(JSON.stringify(tool.inputSchema)).toContain("不要使用 group: 前缀");
     expect(JSON.stringify(tool.inputSchema)).toContain("语域、说话身份和情绪力度");
     expect(typeof tool.terminal).toBe("function");
@@ -229,6 +233,31 @@ describe("send_message tool", () => {
       tool.execute({ messages: ["先说结论", "再说原因"] }, { toolCallId: "call-1", turnId: "turn-1", abortSignal: undefined } as never),
     ).resolves.toEqual({ ok: true, messageIds: ["message-1", "message-2"], count: 2 });
     expect(sent.map((entry) => entry[0])).toEqual(["room", "room"]);
+  });
+
+  it.each(["element", "raw"] as const)("does not treat blank lines as message boundaries in %s mode", async (mode) => {
+    const resources = await createResources();
+    const sendMessage = vi.fn(async () => ["message-1"]);
+    const tool = createSendMessageTool({ bot: { sendMessage } as never, channelId: "room", resources, pacing: PACING, innerThought: false });
+
+    await expect(
+      tool.execute({ messages: ["第一段\n\n第二段"], mode }, { toolCallId: "call-1", turnId: "turn-1", abortSignal: undefined } as never),
+    ).resolves.toEqual({ ok: true, messageIds: ["message-1"], count: 1 });
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessage).toHaveBeenCalledWith("room", [h.text("第一段\n\n第二段")]);
+  });
+
+  it("keeps explicit message elements as delivery boundaries", async () => {
+    const resources = await createResources();
+    const sendMessage = vi.fn(async () => [`message-${sendMessage.mock.calls.length}`]);
+    const tool = createSendMessageTool({ bot: { sendMessage } as never, channelId: "room", resources, pacing: PACING, innerThought: false });
+
+    await expect(tool.execute({ messages: ["一<message/>二"] }, { toolCallId: "call-1", turnId: "turn-1", abortSignal: undefined } as never)).resolves.toEqual({
+      ok: true,
+      messageIds: ["message-1", "message-2"],
+      count: 1,
+    });
+    expect(sendMessage.mock.calls.map((call) => call[1])).toEqual([[h.text("一")], [h.text("二")]]);
   });
 
   it("normalizes OneBot group-prefixed channel IDs before delivery", async () => {
