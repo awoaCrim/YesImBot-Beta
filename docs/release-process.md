@@ -51,6 +51,8 @@ manifest 不放在 payload 内，避免自引用 payload hash。库与 Koishi pl
 
 复制 `scripts/release-profile.example.json` 到 ignored `.release-local/ssh1.json`，填实际 hostname、宿主/容器 sourceRoot、dataRoot、configPath、stateRoot、Koishi/NapCat 容器名和 localhost 健康地址。stateRoot 必须与源码/业务数据完全分离；远端 state/runs/run 为 root-owned `0700`。真实 profile、私钥和 token 不提交。
 
+兼容性 fingerprint 会把宿主 `sourceRoot` 以新的只读路径挂入目标镜像，避免嵌套 Koishi boilerplate 的 ancestor `node_modules` 污染 YesImBot workspace graph；这不是绕过实际运行检查。停服前后仍会用目标容器的真实 mount 执行 import probe，并继续执行容器 identity、HTTP、启动和数据 guards。
+
 公开资产下载不需要 token；手动本地 publish 可从 `GH_TOKEN`/`GITHUB_TOKEN` 或 Git Credential Manager 获取凭据。不要把 token 粘贴在命令参数、日志或文档中。GitHub Release workflow 使用权限限定的临时 `GITHUB_TOKEN`，不是本机 PAT。
 
 ## 一条命令部署

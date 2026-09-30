@@ -133,6 +133,21 @@ class ContractTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 cli.runtime_fingerprint(root, [{"path": "core"}])
 
+    def test_compatibility_fingerprints_isolated_source_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deployment = object.__new__(runner.Deployment)
+            deployment.source = Path(directory).resolve()
+            deployment.koishi = "koishi"
+            deployment.manifest = manifest()
+            with patch.object(runner, "inspect", return_value={"image": "image"}), patch.object(
+                runner, "command", return_value=json.dumps(deployment.manifest["runtime"])
+            ) as mocked:
+                self.assertEqual(deployment.compatibility(), hashlib.sha256(runner.canonical(deployment.manifest["runtime"])).hexdigest())
+            args = mocked.call_args.args[0]
+            self.assertNotIn("--volumes-from", args)
+            self.assertIn(str(deployment.source) + ":/release-source:ro", args)
+            self.assertEqual(json.loads(args[-1])["root"], "/release-source")
+
     def test_named_library_direct_class_default_and_apply_exports(self):
         exports = [("library", "exports.createAgent = () => {};"), ("plugin", "module.exports = class Plugin {};"),
                    ("plugin", "exports.default = class Plugin {};"), ("plugin", "exports.apply = () => {};"),

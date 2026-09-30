@@ -338,10 +338,23 @@ class Deployment:
         return command(["docker", "run", "--rm", "--network", "none", "--read-only", "--volumes-from", self.koishi + ":ro",
                         "--workdir", self.profile["containerSourceRoot"], "--entrypoint", "node", image, "-e", script, canonical(value).decode()], 180)
 
+    def isolated_source_node(self, script, value):
+        # The production image may wrap this project below an unrelated Koishi
+        # boilerplate root with its own node_modules. Fingerprint the release
+        # workspace through a fresh source-root mount so ancestor dependencies
+        # cannot create duplicate peer contexts. loadable() below still probes
+        # the actual container mount before start/health verification.
+        image = inspect(self.koishi)["image"]
+        probe = {**value, "root": "/release-source"}
+        return command(["docker", "run", "--rm", "--network", "none", "--read-only",
+                        "--volume", str(self.source) + ":/release-source:ro",
+                        "--workdir", "/release-source", "--entrypoint", "node", image, "-e", script,
+                        canonical(probe).decode()], 180)
+
     def compatibility(self):
         workspaces = self.manifest["workspaces"]
-        actual = json.loads(self.container_node(RUNTIME_PROBE, {"root": self.profile["containerSourceRoot"],
-                                                              "workspaces": [w["path"] for w in workspaces]}))
+        actual = json.loads(self.isolated_source_node(RUNTIME_PROBE, {
+            "workspaces": [w["path"] for w in workspaces]}))
         require(actual == self.manifest["runtime"], "runtime/workspace/Node ABI mismatch; explicit dependency upgrade required")
         return hashlib.sha256(canonical(actual)).hexdigest()
 
