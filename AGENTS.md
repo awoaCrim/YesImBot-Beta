@@ -130,4 +130,5 @@ When finishing a coding task, summarize:
 - 格式：`<type>(scope): <summary>`
 - `scope` 可选
 - `summary` 使用中文、动词开头、长度 ≤ 50 字、不加句号
+- 提交标题必须说明实际改动内容，不能只写“发布版本”、版本号或 tag；release commit 也要写清同步、发布流程、部署脚本等具体变化，版本号只能作为补充信息
 - 常用 `type`：`feat` / `fix` / `refactor` / `docs` / `test` / `chore`
