@@ -69,7 +69,8 @@ jobs:
             node:24.14.0-alpine3.23@sha256:7fddd9ddeae8196abf4a3ef2de34e11f7b1a722119f91f28ddf1e99dcafdf114 \
             -ec '
               set -eu
-              apk add --no-cache python3 make g++ git libc6-compat
+              apk add --no-cache bash python3 make g++ git libc6-compat
+              git config --global --add safe.directory /workspace
               HUSKY=0 node .yarn/releases/yarn-4.12.0.cjs install --immutable
               python3 scripts/release.py pack --source-sha "$SOURCE_SHA" --run-id "$RUN_ID" --repository "$REPOSITORY"
             '
