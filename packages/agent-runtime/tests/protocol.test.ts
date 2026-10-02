@@ -19,6 +19,7 @@ const USAGE = { inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0
 function createScriptedModel(steps: readonly ScriptedStep[]) {
   let callCount = 0;
   const observedToolChoices: unknown[] = [];
+  const observedPrompts: unknown[] = [];
 
   const model = {
     specificationVersion: "v3",
@@ -28,8 +29,9 @@ function createScriptedModel(steps: readonly ScriptedStep[]) {
     async doGenerate() {
       throw new Error("not implemented");
     },
-    async doStream(options: { toolChoice?: unknown }) {
+    async doStream(options: { toolChoice?: unknown; prompt?: unknown }) {
       observedToolChoices.push(options.toolChoice);
+      observedPrompts.push(options.prompt);
       const index = callCount;
       callCount += 1;
       const step = steps[Math.min(index, steps.length - 1)] ?? { kind: "empty" };
@@ -61,6 +63,7 @@ function createScriptedModel(steps: readonly ScriptedStep[]) {
       };
     },
     observedToolChoices,
+    observedPrompts,
     get callCount() {
       return callCount;
     },
@@ -138,9 +141,30 @@ describe("agent protocol invariant", () => {
     }
   });
 
-  it("keeps an intermediate-only turn from ending successfully", async () => {
+  it("repairs an intermediate-only turn with one request-only terminal step", async () => {
+    const model = createScriptedModel([
+      { kind: "tool", toolName: "inspect", input: "{}" },
+      { kind: "empty" },
+      { kind: "tool", toolName: "finalize", input: "{}" },
+    ]);
+    const { tools, execute } = createTerminalTools();
+    const agent = createAgent({ model, tools, requireTerminalTool: true });
+
+    const { events } = await runTurn(agent);
+
+    expect(events).toContain("turn.done");
+    expect(events).not.toContain("turn.failed");
+    expect(execute).toHaveBeenCalledOnce();
+    expect(model.callCount).toBe(3);
+    expect(model.observedToolChoices.at(-1)).toEqual({ type: "required" });
+    expect(JSON.stringify(model.observedPrompts.at(-1))).toContain("internal repair step");
+    expect(JSON.stringify(await agent.storage.read())).not.toContain("internal repair step");
+    expect((await agent.storage.read()).filter((entry) => entry.type === "message" && entry.data.role === "user")).toHaveLength(1);
+  });
+
+  it("preserves the protocol failure when terminal recovery also stops without a terminal tool", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const model = createScriptedModel([{ kind: "tool", toolName: "inspect", input: "{}" }, { kind: "empty" }]);
+    const model = createScriptedModel([{ kind: "tool", toolName: "inspect", input: "{}" }, { kind: "empty" }, { kind: "empty" }]);
     const agent = createAgent({ model, tools: createTerminalTools().tools, requireTerminalTool: true });
 
     try {
@@ -149,6 +173,7 @@ describe("agent protocol invariant", () => {
       expect(events).not.toContain("turn.done");
       expect(failure?.name).toBe("AgentProtocolError");
       expect(failure?.message).toContain("non-terminal-tool");
+      expect(model.callCount).toBe(3);
     } finally {
       errorSpy.mockRestore();
     }
@@ -240,6 +265,17 @@ describe("agent protocol invariant", () => {
     } finally {
       errorSpy.mockRestore();
     }
+  });
+
+  it("leaves intermediate-only turns untouched when a terminal tool is not required", async () => {
+    const model = createScriptedModel([{ kind: "tool", toolName: "inspect", input: "{}" }, { kind: "empty" }]);
+    const agent = createAgent({ model, tools: createTerminalTools().tools });
+
+    const { events } = await runTurn(agent);
+
+    expect(events).toContain("turn.done");
+    expect(events).not.toContain("turn.failed");
+    expect(model.callCount).toBe(2);
   });
 
   it("leaves plain text turns untouched when a terminal tool is not required", async () => {
