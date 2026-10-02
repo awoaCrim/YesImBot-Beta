@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const generateText = vi.hoisted(() => vi.fn());
 vi.mock("koishi", async () => import("@koishijs/core"));
 vi.mock("ai", async (original) => ({ ...(await original<typeof import("ai")>()), generateText }));
+import { formatContinuityState, parseContinuityDraft } from "../src/conversations/compact.js";
 import type { CompactFragmentInput, CompactFragmentWriter } from "../src/conversations/fragment-store.js";
 import { Conversation } from "../src/conversations/index.js";
 import { createMessage, type MessageRecord } from "../src/messages/index.js";
@@ -591,6 +592,99 @@ describe("Conversation compartment mode", () => {
     expect(generateText).toHaveBeenCalledTimes(beforeCalls);
     expect(await conversation.storage.read()).toEqual(beforeStorage);
     await expect(conversation.expandCompartment("missing")).rejects.toThrow("was not found");
+  });
+});
+
+describe("Conversation continuity", () => {
+  it("persists a verified structured card once and reuses the same source fingerprint", async () => {
+    generateText.mockReset().mockResolvedValue({
+      text: JSON.stringify({
+        goal: "完成连续性实现",
+        decisions: ["采用只读历史卡片"],
+        constraints: ["不暴露内部指令"],
+        facts: ["历史来源可核对"],
+        unresolved: ["需要继续验证"],
+        completed: ["已保存来源边界"],
+        pending: ["等待下一轮"],
+      }),
+    });
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-continuity-"));
+    roots.push(root);
+    const conversation = new Conversation(root, { minMessages: 1, maxFailures: 3, mode: "compartment" });
+    await conversation.init();
+    await conversation.storage.append(
+      createEntry("message", { id: "m1", timestamp: 100, role: "user", content: "历史目标" }, { id: "m1", timestamp: 100 }),
+      createEntry("message", { id: "m2", timestamp: 200, role: "user", content: "历史决定" }, { id: "m2", timestamp: 200 }),
+    );
+
+    const first = await conversation.ensureContinuity({ model: {} as never, sourceEntryIds: ["m1", "m2"] });
+    const second = await conversation.ensureContinuity({ model: {} as never, sourceEntryIds: ["m2", "m1"] });
+    expect(first.reused).toBe(false);
+    expect(second.reused).toBe(true);
+    expect(second.entry.id).toBe(first.entry.id);
+    expect(first.entry.data).toMatchObject({ sourceCount: 2, firstEntryId: "m1", lastEntryId: "m2", sourceStartAt: 100, sourceEndAt: 200 });
+    expect((await conversation.storage.read()).filter((entry) => entry.type === "continuity")).toHaveLength(1);
+    expect(generateText).toHaveBeenCalledOnce();
+    const firstCall = generateText.mock.calls[0];
+    expect(firstCall).toBeDefined();
+    expect((firstCall![0] as { prompt: string }).prompt).toContain("historical-data");
+    expect(formatContinuityState(first.entry.data)).toContain("historical-data");
+    expect(formatContinuityState(first.entry.data)).not.toContain("forged");
+  });
+
+  it("recalls only verified same-lineage continuity before the current source bound", async () => {
+    generateText.mockReset().mockResolvedValue({
+      text: JSON.stringify({
+        goal: "完成连续性实现",
+        decisions: ["采用只读历史卡片"],
+        constraints: [],
+        facts: ["来源可核对"],
+        unresolved: [],
+        completed: [],
+        pending: ["继续验证"],
+      }),
+    });
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-continuity-recall-"));
+    roots.push(root);
+    const conversation = new Conversation(root, { minMessages: 1, maxFailures: 3, mode: "compartment" });
+    await conversation.init();
+    await conversation.storage.append(
+      createEntry("message", { id: "m1", timestamp: 100, role: "user", content: "历史目标" }, { id: "m1", timestamp: 100 }),
+      createEntry("message", { id: "m2", timestamp: 200, role: "user", content: "历史决定" }, { id: "m2", timestamp: 200 }),
+    );
+    const saved = await conversation.ensureContinuity({ model: {} as never, sourceEntryIds: ["m1", "m2"] });
+    const recalled = await conversation.recallContinuity({
+      lineageId: saved.entry.data.lineageId,
+      query: "连续性",
+      before: 201,
+      limit: 3,
+    });
+    expect(recalled.map((entry) => entry.id)).toEqual([saved.entry.id]);
+    expect(await conversation.recallContinuity({ lineageId: saved.entry.data.lineageId, query: "连续性", before: 199, limit: 3 })).toEqual([]);
+    expect(await conversation.recallContinuity({ lineageId: "other-lineage", query: "连续性", before: 201, limit: 3 })).toEqual([]);
+
+    await conversation.storage.append(
+      createEntry("continuity", { ...saved.entry.data, sourceFingerprint: "0".repeat(64) }, { id: "forged-continuity", timestamp: saved.entry.timestamp + 1 }),
+    );
+    expect(
+      (await conversation.recallContinuity({ lineageId: saved.entry.data.lineageId, query: "连续性", before: 201, limit: 3 })).map((entry) => entry.id),
+    ).toEqual([saved.entry.id]);
+  });
+
+  it("rejects malformed model output and keeps canonical history unchanged", async () => {
+    generateText.mockReset().mockResolvedValue({
+      text: JSON.stringify({ goal: "bad", decisions: [], constraints: [], facts: [], unresolved: [], completed: [], pending: [], lineageId: "forged" }),
+    });
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-continuity-invalid-"));
+    roots.push(root);
+    const conversation = new Conversation(root, { minMessages: 1, maxFailures: 3, mode: "compartment" });
+    await conversation.init();
+    await conversation.storage.append(createEntry("message", { id: "m1", timestamp: 1, role: "user", content: "source" }, { id: "m1" }));
+    await expect(conversation.ensureContinuity({ model: {} as never, sourceEntryIds: ["m1"] })).rejects.toThrow("InvalidContinuityOutput");
+    expect((await conversation.storage.read()).filter((entry) => entry.type === "continuity")).toEqual([]);
+    expect(() =>
+      parseContinuityDraft(JSON.stringify({ goal: "", decisions: [], constraints: [], facts: [], unresolved: [], completed: [], pending: [] })),
+    ).toThrow("InvalidContinuityOutput");
   });
 });
 

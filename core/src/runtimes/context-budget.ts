@@ -13,7 +13,13 @@ export interface ContextBudget {
   readonly maxLoadedBlocks: number;
   readonly pageTokens: number;
   readonly retainTurns: number;
-  readonly mediaReserveTokens?: number;
+}
+
+export interface ContextBudgetRemovedUnit {
+  readonly indices: readonly number[];
+  readonly kind: AgentRequestOrigin["kind"];
+  readonly sourceEntryIds: readonly string[];
+  readonly blockIds: readonly string[];
 }
 
 export interface ContextBudgetPlan {
@@ -24,6 +30,9 @@ export interface ContextBudgetPlan {
   readonly mandatoryHistoryTokens: number;
   readonly estimatedHistoryTokens: number;
   readonly evictedBlockIds: readonly string[];
+  readonly removedSourceEntryIds: readonly string[];
+  readonly removedHistorySourceEntryIds: readonly string[];
+  readonly removedUnits: readonly ContextBudgetRemovedUnit[];
   readonly removedMessages: number;
 }
 
@@ -33,6 +42,8 @@ export interface ContextBudgetPlanOptions {
    * this disabled because provider-reported usage is authoritative for completed requests.
    */
   readonly enforceBudget?: boolean;
+  /** Keep units covering these proven source IDs when constructing a bounded raw fallback. */
+  readonly preserveSourceEntryIds?: ReadonlySet<string>;
 }
 
 interface RequestUnit {
@@ -41,6 +52,7 @@ interface RequestUnit {
   kind: AgentRequestOrigin["kind"];
   timestamp: number;
   readonly blockIds: Set<string>;
+  readonly sourceEntryIds: Set<string>;
 }
 
 export class ContextBudgetError extends Error {
@@ -84,7 +96,6 @@ export function resolveContextBudget(
   positiveInteger(recentMessages, 200);
   positiveInteger(maxLoadedBlocks, 4);
   if (!Number.isSafeInteger(retainTurns) || retainTurns < 0 || retainTurns > 2) throw new ContextBudgetError("InvalidContextBudget");
-  if (config.mediaReserveTokens !== undefined) positiveInteger(config.mediaReserveTokens);
   return {
     contextWindow,
     outputTokens,
@@ -95,49 +106,43 @@ export function resolveContextBudget(
     maxLoadedBlocks,
     pageTokens,
     retainTurns,
-    ...(config.mediaReserveTokens === undefined ? {} : { mediaReserveTokens: config.mediaReserveTokens }),
   };
 }
 
 /** UTF-8/framing estimate, not provider tokenization. Media payload bytes are never counted as text. */
-export function estimateContextValue(value: unknown, mediaReserveTokens?: number): number {
+export function estimateContextValue(value: unknown): number {
   if (value === undefined || typeof value === "function" || typeof value === "symbol") return 0;
   if (value === null) return 4;
   if (typeof value === "string") return Buffer.byteLength(JSON.stringify(value), "utf8");
   if (typeof value === "number" || typeof value === "boolean") return String(value).length;
-  if (Array.isArray(value)) return 2 + value.reduce((sum, entry) => sum + estimateContextValue(entry, mediaReserveTokens) + 1, 0);
+  if (Array.isArray(value)) return 2 + value.reduce((sum, entry) => sum + estimateContextValue(entry) + 1, 0);
   if (typeof value !== "object") throw new ContextBudgetError("UnsupportedBudgetMedia");
   const record = value as Record<string, unknown>;
   const media = typeof record.type === "string" && ["image", "file", "image-data", "image-url", "file-data", "file-url", "media"].includes(record.type);
   if (media) {
-    if (mediaReserveTokens === undefined) throw new ContextBudgetError("UnsupportedBudgetMedia");
+    // Media payloads are provider-specific and must not be treated as UTF-8 text or
+    // rejected because no local token estimate is available. Count only framing and
+    // non-payload metadata; the provider remains authoritative for actual usage.
     return (
-      mediaReserveTokens +
       64 +
       Object.entries(record).reduce(
-        (sum, [key, entry]) =>
-          ["image", "file", "data", "url"].includes(key) ? sum : sum + estimateContextValue(key) + estimateContextValue(entry, mediaReserveTokens) + 2,
+        (sum, [key, entry]) => (["image", "file", "data", "url"].includes(key) ? sum : sum + estimateContextValue(key) + estimateContextValue(entry) + 2),
         0,
       )
     );
   }
   if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) throw new ContextBudgetError("UnsupportedBudgetMedia");
   if (value instanceof URL) return estimateContextValue(value.href);
-  return 2 + Object.entries(record).reduce((sum, [key, entry]) => sum + estimateContextValue(key) + estimateContextValue(entry, mediaReserveTokens) + 2, 0);
+  return 2 + Object.entries(record).reduce((sum, [key, entry]) => sum + estimateContextValue(key) + estimateContextValue(entry) + 2, 0);
 }
 
-export function estimateContextMessage(message: ModelMessage, mediaReserveTokens?: number): number {
-  return 32 + estimateContextValue(message, mediaReserveTokens);
+export function estimateContextMessage(message: ModelMessage): number {
+  return 32 + estimateContextValue(message);
 }
 
-export async function estimateContextBase(
-  context: Pick<AgentModelRequestContext, "system" | "tools" | "toolChoice">,
-  mediaReserveTokens?: number,
-): Promise<number> {
+export async function estimateContextBase(context: Pick<AgentModelRequestContext, "system" | "tools" | "toolChoice">): Promise<number> {
   const tools = await contextToolDefinitions(context.tools);
-  return (
-    128 + estimateContextValue(context.system, mediaReserveTokens) + estimateContextValue(tools, mediaReserveTokens) + estimateContextValue(context.toolChoice)
-  );
+  return 128 + estimateContextValue(context.system) + estimateContextValue(tools) + estimateContextValue(context.toolChoice);
 }
 
 /** Operates only on proven optional history. Protocol-linked messages form one removal unit. */
@@ -151,20 +156,24 @@ export function planContextRequest(
   const messages = context.messages;
   const enforceBudget = options.enforceBudget ?? true;
   const units = requestUnits(messages, context.projection?.describe(messages) ?? messages.map(() => undefined));
-  const costs = messages.map((message) => estimateContextMessage(message, budget.mediaReserveTokens));
+  const costs = messages.map((message) => estimateContextMessage(message));
   const removed = new Set<number>();
   const evicted = new Set<string>();
+  const removedUnits: RequestUnit[] = [];
   const cost = (unit: RequestUnit) => unit.indices.reduce((sum, index) => sum + costs[index]!, 0);
   const drop = (unit: RequestUnit) => {
     for (const index of unit.indices) removed.add(index);
     for (const id of unit.blockIds) evicted.add(id);
+    if (!removedUnits.includes(unit)) removedUnits.push(unit);
   };
+  const preserved = (unit: RequestUnit) =>
+    options.preserveSourceEntryIds !== undefined && [...unit.sourceEntryIds].some((id) => options.preserveSourceEntryIds!.has(id));
   const history = units.filter((unit) => !unit.mandatory && unit.kind === "history").sort((a, b) => b.timestamp - a.timestamp);
   // Current context-tool receipts are protected, but their historical material
   // still shares H with summaries/pages (and already counts once in mandatory I).
   const mandatoryHistoryCost = units
     .filter((unit) => unit.mandatory)
-    .reduce((sum, unit) => sum + unit.indices.reduce((total, index) => total + contextToolHistoryCost(messages[index]!, budget.mediaReserveTokens), 0), 0);
+    .reduce((sum, unit) => sum + unit.indices.reduce((total, index) => total + contextToolHistoryCost(messages[index]!), 0), 0);
   const measuredMandatoryHistory = Math.ceil(mandatoryHistoryCost * multiplier);
   if (enforceBudget && measuredMandatoryHistory > budget.historyTokens) throw new ContextBudgetError("ContextBudgetExceeded");
   const optionalHistoryBudget = Math.max(0, budget.historyTokens - measuredMandatoryHistory);
@@ -179,7 +188,7 @@ export function planContextRequest(
   let ringCost = 0;
   for (const unit of history) {
     const unitCost = cost(unit);
-    if (kept >= budget.recentMessages || ringCost + unitCost > ringAllowance) drop(unit);
+    if (!preserved(unit) && (kept >= budget.recentMessages || ringCost + unitCost > ringAllowance)) drop(unit);
     else {
       kept += unit.indices.length;
       ringCost += unitCost;
@@ -196,13 +205,21 @@ export function planContextRequest(
       Math.ceil((baseTokens + mandatoryCost + optionalCost) * multiplier) <= budget.inputTokens
     )
       break;
-    if (removed.has(unit.indices[0]!)) continue;
+    if (removed.has(unit.indices[0]!) || preserved(unit)) continue;
     drop(unit);
     optionalCost -= cost(unit);
   }
   const estimatedInputTokens = Math.ceil((baseTokens + mandatoryCost + optionalCost) * multiplier);
   if (enforceBudget && (estimatedInputTokens > budget.inputTokens || Math.ceil(optionalCost * multiplier) > optionalHistoryBudget))
     throw new ContextBudgetError("ContextBudgetExceeded");
+  const removedSourceEntryIds = new Set<string>();
+  const removedHistorySourceEntryIds = new Set<string>();
+  for (const unit of removedUnits) {
+    for (const id of unit.sourceEntryIds) {
+      removedSourceEntryIds.add(id);
+      if (unit.kind === "history") removedHistorySourceEntryIds.add(id);
+    }
+  }
   return {
     messages: messages.filter((_, index) => !removed.has(index)),
     estimatedInputTokens,
@@ -211,18 +228,24 @@ export function planContextRequest(
     mandatoryHistoryTokens: Math.ceil(mandatoryHistoryCost * multiplier),
     estimatedHistoryTokens: Math.ceil(mandatoryHistoryCost * multiplier) + Math.ceil(optionalCost * multiplier),
     evictedBlockIds: [...evicted],
+    removedSourceEntryIds: [...removedSourceEntryIds],
+    removedHistorySourceEntryIds: [...removedHistorySourceEntryIds],
+    removedUnits: removedUnits.map((unit) => ({
+      indices: [...unit.indices],
+      kind: unit.kind,
+      sourceEntryIds: [...unit.sourceEntryIds],
+      blockIds: [...unit.blockIds],
+    })),
     removedMessages: removed.size,
   };
 }
 
-function contextToolHistoryCost(message: ModelMessage, reserve?: number): number {
+function contextToolHistoryCost(message: ModelMessage): number {
   if (message.role !== "tool") return 0;
   return message.content.reduce(
     (sum, part) =>
       sum +
-      (part.type === "tool-result" && ["ctx_blocks", "ctx_load", "ctx_release", "ctx_expand"].includes(part.toolName)
-        ? 32 + estimateContextValue(part, reserve)
-        : 0),
+      (part.type === "tool-result" && ["ctx_blocks", "ctx_load", "ctx_release", "ctx_expand"].includes(part.toolName) ? 32 + estimateContextValue(part) : 0),
     0,
   );
 }
@@ -268,7 +291,7 @@ function requestUnits(messages: readonly ModelMessage[], origins: readonly (Agen
   const byRoot = new Map<number, RequestUnit>();
   messages.forEach((_, index) => {
     const origin = origins[index];
-    const mandatory = !origin || !["history", "summary", "recall", "loaded"].includes(origin.kind) || unresolved.has(index);
+    const mandatory = !origin || !["history", "summary", "continuity", "recall", "loaded"].includes(origin.kind) || unresolved.has(index);
     const root = find(index);
     const unit = byRoot.get(root) ?? {
       indices: [],
@@ -276,12 +299,14 @@ function requestUnits(messages: readonly ModelMessage[], origins: readonly (Agen
       kind: origin?.kind ?? "mandatory",
       timestamp: origin?.timestamp ?? 0,
       blockIds: new Set<string>(),
+      sourceEntryIds: new Set<string>(),
     };
     unit.indices.push(index);
     unit.mandatory ||= mandatory;
     if (origin && rank(origin.kind) > rank(unit.kind)) unit.kind = origin.kind;
     unit.timestamp = Math.min(unit.timestamp, origin?.timestamp ?? unit.timestamp);
     if (origin?.blockId) unit.blockIds.add(origin.blockId);
+    for (const id of origin?.sourceEntryIds ?? []) unit.sourceEntryIds.add(id);
     byRoot.set(root, unit);
   });
   return [...byRoot.values()];
@@ -308,10 +333,12 @@ function rank(kind: AgentRequestOrigin["kind"]): number {
       return 1;
     case "history":
       return 2;
-    case "summary":
+    case "continuity":
       return 3;
-    default:
+    case "summary":
       return 4;
+    default:
+      return 5;
   }
 }
 

@@ -35,6 +35,8 @@ import type { WillBatchDecision, WillEngine, WillReservationOutcome, WillState }
 import { type Channel, type ChannelContext, deriveChannelKey } from "../channels/index.js";
 import type { Config } from "../config.js";
 import { resolveLatestCompactBoundary } from "../conversations/boundary.js";
+import { formatRecalledContinuities } from "../conversations/compact.js";
+import type { ContinuityEntry } from "../conversations/context-blocks.js";
 import { formatDeliveredTranscriptHistory, isDeliveredTranscript } from "../conversations/delivered-transcript.js";
 import {
   COMPACT_FRAGMENT_RECALL_LIMIT,
@@ -70,7 +72,7 @@ import { ContextWorkspace } from "./context-workspace.js";
 import { buildCoreSystemPrompt } from "./prompt.js";
 
 /** Fixed Core threshold: a provider-reported prompt above this only ever registers a pending compact. */
-const PROMPT_LIMIT_INPUT_TOKENS = 100_000;
+const PROMPT_LIMIT_INPUT_TOKENS = 150_000;
 const CORDIS_ORIGINAL = Symbol.for("cordis.original");
 
 /** Fallback when a config predates the resident-fragment setting. */
@@ -131,6 +133,10 @@ interface TurnDeliveryTracker {
   deliveredMessageId?: string;
   settled: boolean;
   settlement?: Promise<void>;
+}
+
+interface DirectImageInputOptions {
+  readonly resolveImage: (assetId: string, signal?: AbortSignal) => Promise<InputImageResolution>;
 }
 
 export class ChannelRuntime {
@@ -194,6 +200,7 @@ export class ChannelRuntime {
         config: options.config.session.magicContext!,
         compactMode: options.config.session.compact.mode,
         model: options.model,
+        continuityModel: options.compactModel ?? options.model,
         modelLimit: options.contextModelLimit,
         resolveModelLimit: options.resolveContextModelLimit,
         ...(options.historyProjection === "gemini-native" ? { mergeMessages: mergeAdjacentUserMessages } : {}),
@@ -208,7 +215,14 @@ export class ChannelRuntime {
       ...(this.contextWorkspace
         ? {
             requestProjection: projection,
-            beforeModelRequest: (context) => this.contextWorkspace!.guard(context),
+            beforeModelRequest: async (context) => {
+              const messages = await this.contextWorkspace!.guard(context);
+              if (context.historyMode !== "event") return messages;
+              return {
+                messages,
+                activeTools: Object.keys(context.tools).filter((name) => !name.startsWith("ctx_")),
+              };
+            },
             maxOutputTokens: (model) => this.contextWorkspace!.outputLimit(model),
           }
         : {}),
@@ -982,7 +996,10 @@ export class ChannelRuntime {
     let anchor: CompactFragmentLineageNode | undefined;
     let knownFragments: CompactFragmentLineageNode[] = [];
     let captured = false;
-    const recalls = new Map<string, { query: string; lineageId: string; anchorId: string; before: number; fragments: CompactFragment[] }>();
+    const recalls = new Map<
+      string,
+      { query: string; lineageId: string; anchorId: string; before: number; fragments: CompactFragment[]; continuities: ContinuityEntry[] }
+    >();
     return {
       name: "core.compact-recall",
       enforce: "pre",
@@ -1005,7 +1022,7 @@ export class ChannelRuntime {
         captured = false;
         const source = this.options.compactFragments;
         const current = lineageId && anchor && before !== undefined ? { lineageId, anchor, before } : undefined;
-        if (!source || !current) return undefined;
+        if (!current) return undefined;
 
         const previous = recalls.get(context.turnId);
         const requestQuery = extractCurrentMessageQuery(messages);
@@ -1013,6 +1030,7 @@ export class ChannelRuntime {
         if (!query) return undefined;
 
         let fragments: CompactFragment[];
+        let continuities: ContinuityEntry[];
         if (
           previous?.query === query &&
           previous.lineageId === current.lineageId &&
@@ -1020,28 +1038,48 @@ export class ChannelRuntime {
           previous.before === current.before
         ) {
           fragments = previous.fragments;
+          continuities = previous.continuities;
         } else {
+          fragments = [];
+          continuities = [];
+          if (source) {
+            try {
+              const candidates = await source.recall({
+                channelKey,
+                lineageId: current.lineageId,
+                query,
+                anchor: current.anchor,
+                knownFragments,
+                before: current.before,
+                excludeIds: residentIds,
+                limit: COMPACT_FRAGMENT_RECALL_LIMIT,
+              });
+              const seen = new Set<string>();
+              for (const fragment of candidates) {
+                if (residentIds.has(fragment.id) || (fragment.endAt ?? fragment.createdAt) > current.before || seen.has(fragment.id)) continue;
+                seen.add(fragment.id);
+                fragments.push(fragment);
+                if (fragments.length >= COMPACT_FRAGMENT_RECALL_LIMIT) break;
+              }
+            } catch (cause) {
+              this.logger.warn("runtime.compact_recall_failed", { errorName: cause instanceof Error ? cause.name : typeof cause });
+            }
+          }
           try {
-            const candidates = await source.recall({
-              channelKey,
-              lineageId: current.lineageId,
-              query,
-              anchor: current.anchor,
-              knownFragments,
-              before: current.before,
-              excludeIds: residentIds,
-            });
-            const seen = new Set<string>();
-            fragments = [];
-            for (const fragment of candidates) {
-              if (residentIds.has(fragment.id) || (fragment.endAt ?? fragment.createdAt) > current.before || seen.has(fragment.id)) continue;
-              seen.add(fragment.id);
-              fragments.push(fragment);
-              if (fragments.length === COMPACT_FRAGMENT_RECALL_LIMIT) break;
+            const remaining = Math.max(0, COMPACT_FRAGMENT_RECALL_LIMIT - fragments.length);
+            if (remaining > 0) {
+              continuities = [
+                ...(await this.options.channel.conversation.recallContinuity({
+                  lineageId: current.lineageId,
+                  query,
+                  before: current.before,
+                  excludeIds: new Set([...residentIds, ...fragments.map((fragment) => fragment.id)]),
+                  limit: remaining,
+                })),
+              ];
             }
           } catch (cause) {
-            this.logger.warn("runtime.compact_recall_failed", { errorName: cause instanceof Error ? cause.name : typeof cause });
-            fragments = [];
+            this.logger.warn("runtime.continuity_recall_failed", { errorName: cause instanceof Error ? cause.name : typeof cause });
           }
           recalls.set(context.turnId, {
             query,
@@ -1049,13 +1087,24 @@ export class ChannelRuntime {
             anchorId: current.anchor.id,
             before: current.before,
             fragments,
+            continuities,
           });
         }
 
-        if (fragments.length === 0) return undefined;
-        this.logger.debug("runtime.compact_recall", { count: fragments.length, lineageId: current.lineageId });
-        const recalled: ModelMessage = { role: "system", content: formatRecalledFragments(fragments) };
-        context.projection?.register(recalled, { kind: "recall", sourceEntryIds: fragments.map((fragment) => fragment.id), timestamp: 0 });
+        if (fragments.length === 0 && continuities.length === 0) return undefined;
+        this.logger.debug("runtime.compact_recall", { count: fragments.length + continuities.length, lineageId: current.lineageId });
+        const recalled: ModelMessage = {
+          role: "system",
+          content: [
+            ...(fragments.length ? [formatRecalledFragments(fragments)] : []),
+            ...(continuities.length ? [formatRecalledContinuities(continuities)] : []),
+          ].join("\n"),
+        };
+        context.projection?.register(recalled, {
+          kind: "recall",
+          sourceEntryIds: [...fragments.map((fragment) => fragment.id), ...continuities.map((entry) => entry.id)],
+          timestamp: 0,
+        });
         return [recalled, ...messages];
       },
       onTurnFinish: (_result, context) => {
@@ -1079,10 +1128,6 @@ export class ChannelRuntime {
           : { type: "allow" },
     };
   }
-}
-
-interface DirectImageInputOptions {
-  readonly resolveImage: (assetId: string, signal?: AbortSignal) => Promise<InputImageResolution>;
 }
 
 export function createModelInputPlugin(mode: HistoryProjectionMode = "default", deferMerge = false, directImageInput?: DirectImageInputOptions): AgentPlugin {

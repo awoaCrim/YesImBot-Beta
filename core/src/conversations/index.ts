@@ -1,14 +1,40 @@
 import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 
-import { createEntry, createJsonlStorage, createRandomId, type AgentEntry, type AgentStorage } from "@yesimbot/agent-runtime";
+import {
+  createContinuityEntry,
+  createEntry,
+  createJsonlStorage,
+  createRandomId,
+  type AgentEntry,
+  type AgentStorage,
+  type ContinuityEntryData,
+} from "@yesimbot/agent-runtime";
 import type { LanguageModel } from "ai";
 
 import type { MessageRecord } from "../messages/index.js";
 import { resolveLatestCompactBoundary } from "./boundary.js";
-import { compactSourceTimestamp, executeCompact, filterEntriesForCompression, renderCompressionRecords, type CompressionRecord } from "./compact.js";
-import { normalizedSessionId, resolveCompactSource, type CompactEntry, type ContextSourceSnapshot } from "./context-blocks.js";
-import type { CompactFragmentInput, CompactFragmentWriter } from "./fragment-store.js";
+import {
+  compactSourceTimestamp,
+  CONTINUITY_PROMPT_VERSION,
+  executeCompact,
+  executeContinuity,
+  filterEntriesForCompression,
+  mergeContinuityDrafts,
+  renderCompressionRecords,
+  renderContinuitySourceChunks,
+  validateContinuityEntryData,
+  type CompressionRecord,
+} from "./compact.js";
+import {
+  normalizedSessionId,
+  rangeFingerprint,
+  resolveCompactSource,
+  type CompactEntry,
+  type ContextSourceSnapshot,
+  type ContinuityEntry,
+} from "./context-blocks.js";
+import { recallTerms, type CompactFragmentInput, type CompactFragmentWriter } from "./fragment-store.js";
 
 const DEFAULT_COMPARTMENT_MESSAGES = 20;
 const DEFAULT_COMPARTMENT_CHARS = 12_000;
@@ -29,6 +55,21 @@ export interface CompactInput {
   signal?: AbortSignal;
   force?: boolean;
   excludeMessageIds?: readonly string[];
+}
+
+export interface ContinuityInput {
+  readonly model: LanguageModel;
+  readonly sourceEntryIds: readonly string[];
+  readonly signal?: AbortSignal;
+  readonly lineageId?: string;
+}
+
+export interface ContinuityRecallOptions {
+  readonly lineageId: string;
+  readonly query: string;
+  readonly before: number;
+  readonly excludeIds?: ReadonlySet<string>;
+  readonly limit?: number;
 }
 
 export interface ConversationCompactConfig {
@@ -107,7 +148,7 @@ export class Conversation {
   private fileStorageValue: AgentStorage<AgentEntry> | undefined;
   private storageTail: Promise<void> = Promise.resolve();
   private failures = 0;
-  private readonly compactSourceIndex = new Map<string, { stamp: string; compacts: readonly CompactEntry[] }>();
+  private readonly compactSourceIndex = new Map<string, { stamp: string; compacts: readonly CompactEntry[]; continuities: readonly ContinuityEntry[] }>();
 
   public constructor(root: string, compactConfig: ConversationCompactConfig = { minMessages: 15, maxFailures: 3 }, options: ConversationOptions = {}) {
     this.root = root;
@@ -190,7 +231,7 @@ export class Conversation {
       const result = await this.compact("manual", input);
       const entries = await this.readStorage();
       const resident = this.archiveSeed(entries);
-      if (result.compacted || resident.some((entry) => entry.type === "compact")) {
+      if (result.compacted || resident.some((entry) => entry.type === "compact" || entry.type === "continuity")) {
         this.setStorage(await this.createSession(resident));
         await this.rebuildCompactFragments();
         return;
@@ -206,7 +247,7 @@ export class Conversation {
     const active = (await this.status()).active;
     if (!active || active.size <= maxBytes) return false;
     const resident = this.archiveSeed(await this.readStorage());
-    if (resident.some((entry) => entry.type === "compact")) {
+    if (resident.some((entry) => entry.type === "compact" || entry.type === "continuity")) {
       this.setStorage(await this.createSession(resident));
       await this.rebuildCompactFragments();
     } else {
@@ -257,10 +298,12 @@ export class Conversation {
     const filenames = (await this.files()).filter((name) => /^[0-9A-Za-zTZ_-]+\.jsonl$/.test(name));
     const sessionIds = filenames.map(normalizedSessionId);
     const compacts: CompactEntry[] = [];
+    const continuities: ContinuityEntry[] = [];
     for (const filename of filenames) {
       const id = normalizedSessionId(filename);
       if (id === sessionId) {
         compacts.push(...entries.filter((entry): entry is CompactEntry => entry.type === "compact"));
+        continuities.push(...entries.filter((entry): entry is ContinuityEntry => entry.type === "continuity"));
         continue;
       }
       const info = await stat(join(this.sessionsPath(), filename));
@@ -268,18 +311,22 @@ export class Conversation {
       const cached = this.compactSourceIndex.get(id);
       if (cached?.stamp === stamp) {
         compacts.push(...cached.compacts);
+        continuities.push(...cached.continuities);
         continue;
       }
       const historical = await createJsonlStorage(join(this.sessionsPath(), filename)).read();
       const indexed = historical.filter((entry): entry is CompactEntry => entry.type === "compact");
-      this.compactSourceIndex.set(id, { stamp, compacts: indexed });
+      const indexedContinuities = historical.filter((entry): entry is ContinuityEntry => entry.type === "continuity");
+      this.compactSourceIndex.set(id, { stamp, compacts: indexed, continuities: indexedContinuities });
       compacts.push(...indexed);
+      continuities.push(...indexedContinuities);
     }
     for (const id of this.compactSourceIndex.keys()) if (!sessionIds.includes(id)) this.compactSourceIndex.delete(id);
     return {
       sessionId,
       entries,
       compacts,
+      continuities,
       sessionIds,
       readSession: async (input) => {
         const id = normalizedSessionId(input);
@@ -287,6 +334,160 @@ export class Conversation {
         return id === sessionId ? entries : createJsonlStorage(join(this.sessionsPath(), `${id}.jsonl`)).read();
       },
     };
+  }
+
+  /**
+   * Creates or reuses one bounded continuity card for an exact verified source set. The model only
+   * supplies semantic fields; all provenance is rebuilt from canonical JSONL before the append.
+   */
+  public async ensureContinuity(input: ContinuityInput): Promise<{ readonly entry: ContinuityEntry; readonly reused: boolean }> {
+    await this.init();
+    const sourceIds = [...new Set(input.sourceEntryIds)];
+    if (sourceIds.length === 0 || sourceIds.length > 256) throw new Error("ContinuitySourceUnavailable");
+    return this.mutateStorage(async () => {
+      const entries = await this.currentStorage().read();
+      const positions = new Map<string, number>();
+      entries.forEach((entry, index) => {
+        if (sourceIds.includes(entry.id)) {
+          if (positions.has(entry.id)) throw new Error("ContinuitySourceConflict");
+          positions.set(entry.id, index);
+        }
+      });
+      if (positions.size !== sourceIds.length) throw new Error("ContinuitySourceUnavailable");
+      const sourceEntries = sourceIds.map((id) => entries[positions.get(id)!]!).sort((left, right) => positions.get(left.id)! - positions.get(right.id)!);
+      if (sourceEntries.some((entry) => entry.type !== "message")) throw new Error("ContinuitySourceUnavailable");
+      const sourceFingerprint = rangeFingerprint(sourceEntries);
+      const sourceSession = this.currentSessionId();
+      const verifiedLineageId = continuityLineage(entries, sourceSession);
+      if (input.lineageId !== undefined && input.lineageId !== verifiedLineageId) throw new Error("ContinuitySourceConflict");
+      const lineageId = verifiedLineageId;
+      const firstEntryId = sourceEntries[0]!.id;
+      const lastEntryId = sourceEntries.at(-1)!.id;
+      const timestamps = sourceEntries.map((entry) => compactSourceTimestamp(entry as Extract<AgentEntry, { type: "message" }>));
+      const sourceManifest = sourceEntries.map((entry) => entry.id);
+      const existing = entries
+        .filter((entry): entry is ContinuityEntry => entry.type === "continuity")
+        .filter((entry) => {
+          try {
+            const data = validateContinuityEntryData(entry.data);
+            return (
+              data.lineageId === lineageId &&
+              data.sourceSession === sourceSession &&
+              data.firstEntryId === firstEntryId &&
+              data.lastEntryId === lastEntryId &&
+              data.sourceCount === sourceEntries.length &&
+              data.sourceFingerprint === sourceFingerprint &&
+              (data.sourceEntryIds === undefined || JSON.stringify(data.sourceEntryIds) === JSON.stringify(sourceManifest))
+            );
+          } catch {
+            return false;
+          }
+        });
+      if (existing.length > 0) {
+        const first = existing[0]!;
+        if (existing.some((entry) => JSON.stringify(entry.data) !== JSON.stringify(first.data))) throw new Error("ContinuitySourceConflict");
+        return { entry: first, reused: true };
+      }
+
+      const sourceChunks = renderContinuitySourceChunks(sourceEntries);
+      if (sourceChunks.length === 0) throw new Error("ContinuitySourceUnavailable");
+      const drafts = [];
+      for (const content of sourceChunks) drafts.push(await executeContinuity({ model: input.model, conversation: content, signal: input.signal }));
+      const draft = mergeContinuityDrafts(drafts);
+      const data: ContinuityEntryData = {
+        version: 1,
+        lineageId,
+        sourceSession,
+        firstEntryId,
+        lastEntryId,
+        sourceCount: sourceEntries.length,
+        sourceEntryIds: sourceManifest,
+        sourceStartAt: Math.min(...timestamps),
+        sourceEndAt: Math.max(...timestamps),
+        sourceFingerprint,
+        promptVersion: CONTINUITY_PROMPT_VERSION,
+        goal: draft.goal,
+        decisions: [...draft.decisions],
+        constraints: [...draft.constraints],
+        facts: [...draft.facts],
+        unresolved: [...draft.unresolved],
+        completed: [...draft.completed],
+        pending: [...draft.pending],
+        ...(input.lineageId ? {} : continuityParent(entries, lineageId, Math.min(...timestamps))),
+      };
+      validateContinuityEntryData(data);
+      const entry = createContinuityEntry(data);
+      await this.currentStorage().append(entry);
+      return { entry, reused: false };
+    });
+  }
+
+  /** Bounded lexical recall over canonical continuity metadata; raw source remains explicit-only. */
+  public async recallContinuity(options: ContinuityRecallOptions): Promise<readonly ContinuityEntry[]> {
+    const snapshot = await this.contextSources();
+    const terms = recallTerms(options.query);
+    if (terms.length === 0) return [];
+    const limit = Math.min(3, Math.max(1, options.limit ?? 3));
+    const byId = new Map<string, { readonly entry: ContinuityEntry; readonly data: ContinuityEntryData; readonly signature: string }>();
+    const conflictingIds = new Set<string>();
+    for (const entry of snapshot.continuities ?? []) {
+      let data: ContinuityEntryData;
+      try {
+        data = validateContinuityEntryData(entry.data);
+      } catch {
+        byId.delete(entry.id);
+        conflictingIds.add(entry.id);
+        continue;
+      }
+      if (conflictingIds.has(entry.id)) continue;
+      const signature = JSON.stringify(data);
+      const previous = byId.get(entry.id);
+      if (previous && previous.signature !== signature) {
+        byId.delete(entry.id);
+        conflictingIds.add(entry.id);
+        continue;
+      }
+      if (!previous) byId.set(entry.id, { entry, data, signature });
+    }
+    const bySource = new Map<string, { readonly id: string; readonly signature: string }>();
+    const conflictingSources = new Set<string>();
+    for (const [id, value] of byId) {
+      const sourceKey = JSON.stringify([
+        value.data.sourceSession,
+        value.data.lineageId,
+        value.data.firstEntryId,
+        value.data.lastEntryId,
+        value.data.sourceCount,
+        value.data.sourceFingerprint,
+      ]);
+      if (conflictingSources.has(sourceKey)) {
+        byId.delete(id);
+        continue;
+      }
+      const previous = bySource.get(sourceKey);
+      if (!previous) {
+        bySource.set(sourceKey, { id, signature: value.signature });
+      } else if (previous.signature !== value.signature) {
+        byId.delete(previous.id);
+        byId.delete(id);
+        bySource.delete(sourceKey);
+        conflictingSources.add(sourceKey);
+      } else {
+        byId.delete(id);
+      }
+    }
+    const candidates: Array<{ entry: ContinuityEntry; score: number; endAt: number }> = [];
+    for (const { entry, data } of byId.values()) {
+      const endAt = data.sourceEndAt ?? entry.timestamp;
+      if (data.lineageId !== options.lineageId || endAt > options.before || options.excludeIds?.has(entry.id)) continue;
+      if (!(await continuitySourceAvailable(snapshot, data))) continue;
+      const text = JSON.stringify([data.goal, ...data.decisions, ...data.constraints, ...data.facts, ...data.unresolved, ...data.completed, ...data.pending]);
+      const available = new Set(recallTerms(text));
+      const score = terms.reduce((total, term) => total + (available.has(term) ? 1 : 0), 0);
+      if (score > 0) candidates.push({ entry, score, endAt });
+    }
+    candidates.sort((left, right) => right.score - left.score || right.endAt - left.endAt || left.entry.id.localeCompare(right.entry.id));
+    return candidates.slice(0, limit).map(({ entry }) => entry);
   }
 
   /** Expands one compartment's canonical raw source without calling a model or writing storage. */
@@ -681,6 +882,57 @@ function isUserTurnMessage(value: AgentEntry["data"]): boolean {
  * readable, and recall uses their entry timestamp as a conservative bound without persisting it as
  * a source-message time; no event time is invented inside the summary text itself.
  */
+async function continuitySourceAvailable(snapshot: ContextSourceSnapshot, data: ContinuityEntryData): Promise<boolean> {
+  try {
+    const sessionId = normalizedSessionId(data.sourceSession);
+    if (!snapshot.sessionIds.includes(sessionId)) return false;
+    const entries = sessionId === snapshot.sessionId ? snapshot.entries : await snapshot.readSession(sessionId);
+    const first = entries.flatMap((entry, index) => (entry.id === data.firstEntryId ? [index] : []));
+    const last = entries.flatMap((entry, index) => (entry.id === data.lastEntryId ? [index] : []));
+    if (first.length !== 1 || last.length !== 1 || last[0]! < first[0]!) return false;
+    const range = entries.slice(first[0], last[0]! + 1);
+    const messageCount = range.filter((entry) => entry.type === "message").length;
+    if (messageCount < data.sourceCount) return false;
+    if (data.sourceEntryIds) {
+      const selected = data.sourceEntryIds.map((id) => entries.filter((entry) => entry.id === id));
+      if (selected.some((matches) => matches.length !== 1 || matches[0]!.type !== "message")) return false;
+      const sourceEntries = selected.map(([entry]) => entry!);
+      const sourcePositions = sourceEntries.map((entry) => entries.indexOf(entry));
+      if (
+        data.sourceEntryIds[0] !== data.firstEntryId ||
+        data.sourceEntryIds.at(-1) !== data.lastEntryId ||
+        sourcePositions.some((position, index) => position < 0 || (index > 0 && position <= sourcePositions[index - 1]!)) ||
+        sourceEntries.length !== data.sourceCount ||
+        rangeFingerprint(sourceEntries) !== data.sourceFingerprint
+      )
+        return false;
+    } else {
+      if (messageCount !== data.sourceCount || rangeFingerprint(range.filter((entry) => entry.type === "message")) !== data.sourceFingerprint) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function continuityLineage(entries: readonly AgentEntry[], sessionId: string): string {
+  const latest = [...entries].reverse().find((entry): entry is CompactEntry => entry.type === "compact");
+  return latest?.data.lineageId ?? latest?.id ?? sessionId;
+}
+
+function continuityParent(entries: readonly AgentEntry[], lineageId: string, before: number): { readonly parentStateId?: string } {
+  const parent = [...entries].reverse().find((entry): entry is ContinuityEntry => {
+    if (entry.type !== "continuity") return false;
+    try {
+      const data = validateContinuityEntryData(entry.data);
+      return data.lineageId === lineageId && (data.sourceEndAt ?? entry.timestamp) < before;
+    } catch {
+      return false;
+    }
+  });
+  return parent ? { parentStateId: parent.id } : {};
+}
+
 function toCompactFragment(entry: Extract<AgentEntry, { type: "compact" }>, channelKey: string): CompactFragmentInput {
   const { data } = entry;
   return {

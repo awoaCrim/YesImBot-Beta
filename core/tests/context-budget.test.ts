@@ -68,12 +68,11 @@ describe("request budget", () => {
     });
     expect(full - empty).toBeGreaterThan(2000);
   });
-  it("never estimates media using payload length and requires explicit reserve", () => {
+  it("does not budget media payloads as text or require an explicit reserve", () => {
     const image = { type: "image", image: new Uint8Array(100_000) };
-    expect(() => estimateContextValue(image)).toThrow("UnsupportedBudgetMedia");
-    expect(estimateContextValue(image, 2000)).toBe(estimateContextValue({ type: "image", image: new Uint8Array(1) }, 2000));
-    expect(() => estimateContextValue(new Uint8Array(10), 2000)).toThrow("UnsupportedBudgetMedia");
-    expect(estimateContextValue({ ...image, providerOptions: { extension: "x".repeat(5000) } }, 2000)).toBeGreaterThan(7000);
+    expect(estimateContextValue(image)).toBe(estimateContextValue({ type: "image", image: new Uint8Array(1) }));
+    expect(() => estimateContextValue(new Uint8Array(10))).toThrow("UnsupportedBudgetMedia");
+    expect(estimateContextValue({ ...image, providerOptions: { extension: "x".repeat(5000) } })).toBeGreaterThan(5000);
   });
   it("reduces history on the first request without provider usage, preserving current and unknown additions", () => {
     const projection = new AgentRequestProjection();

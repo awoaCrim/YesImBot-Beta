@@ -36,8 +36,36 @@ export interface CompactEntryData {
   chunkIndex?: number;
 }
 
+/**
+ * Optional, append-only historical continuity metadata. Generic Agent Runtime treats this as
+ * opaque state; Core owns validation and decides whether/how to render it for a provider request.
+ */
+export interface ContinuityEntryData {
+  version: 1;
+  lineageId: string;
+  sourceSession: string;
+  firstEntryId: string;
+  lastEntryId: string;
+  sourceCount: number;
+  /** Optional bounded manifest for exact source verification; Core may omit it for legacy records. */
+  sourceEntryIds?: string[];
+  sourceStartAt?: number;
+  sourceEndAt?: number;
+  sourceFingerprint: string;
+  promptVersion: string;
+  goal: string;
+  decisions: string[];
+  constraints: string[];
+  facts: string[];
+  unresolved: string[];
+  completed: string[];
+  pending: string[];
+  parentStateId?: string;
+}
+
 export interface AgentCustomEntries {
   compact: CompactEntryData;
+  continuity: ContinuityEntryData;
   event: AgentInternalEvent;
   message: AgentMessage;
   state: AgentState;
@@ -55,6 +83,10 @@ export function createEntry<T extends keyof AgentCustomEntries>(type: T, data: A
 
 export function createMessageEntry(message: AgentMessage, options: CreateEntryOptions = {}): AgentEntry<"message"> {
   return createEntry("message", message, options);
+}
+
+export function createContinuityEntry(data: ContinuityEntryData, options: CreateEntryOptions = {}): AgentEntry<"continuity"> {
+  return createEntry("continuity", data, options);
 }
 
 export function createStateEntry(state: AgentState, options: CreateEntryOptions = {}): AgentEntry<"state"> {

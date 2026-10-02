@@ -4,7 +4,7 @@ import type { ModelMessage } from "ai";
 
 /** Request-only provenance. These fields are never serialized to the provider or durable log. */
 export interface AgentRequestOrigin {
-  readonly kind: "mandatory" | "live" | "history" | "summary" | "recall" | "loaded";
+  readonly kind: "mandatory" | "live" | "history" | "summary" | "continuity" | "recall" | "loaded";
   readonly sourceEntryIds: readonly string[];
   readonly timestamp?: number;
   readonly blockId?: string;

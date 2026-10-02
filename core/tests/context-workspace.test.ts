@@ -53,6 +53,41 @@ function modelWithScript(script: readonly { toolName: string; input: () => strin
   return { model, calls };
 }
 
+function modelWithText(text: string): LanguageModelV3 {
+  return {
+    specificationVersion: "v3",
+    provider: "mock-continuity",
+    modelId: "continuity",
+    supportedUrls: {},
+    async doGenerate() {
+      return {
+        content: [{ type: "text", text }],
+        finishReason: { unified: "stop", raw: undefined },
+        usage: { inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 1, text: 1, reasoning: 0 } },
+        warnings: [],
+      };
+    },
+    async doStream() {
+      return {
+        stream: new ReadableStream<LanguageModelV3StreamPart>({
+          start(controller) {
+            controller.enqueue({ type: "stream-start", warnings: [] });
+            controller.enqueue({ type: "text-start", id: "continuity-text" });
+            controller.enqueue({ type: "text-delta", id: "continuity-text", delta: text });
+            controller.enqueue({ type: "text-end", id: "continuity-text" });
+            controller.enqueue({
+              type: "finish",
+              finishReason: { unified: "stop", raw: undefined },
+              usage: { inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 1, text: 1, reasoning: 0 } },
+            });
+            controller.close();
+          },
+        }),
+      };
+    },
+  };
+}
+
 async function fixture(texts = ["已结束的历史原文"], extra: Partial<ConstructorParameters<typeof ContextWorkspace>[2]> = {}) {
   const root = await mkdtemp(join(tmpdir(), "yesimbot-workspace-"));
   roots.push(root);
@@ -167,6 +202,45 @@ describe("context workspace", () => {
     await f.workspace.guard(context(f, "turn", 1, [extra]));
     expect(f.workspace.status().loadedBlocks).toBeLessThan(4);
   });
+  it("automatically persists and injects a read-only continuity card before evicting old history", async () => {
+    const f = await fixture(
+      Array.from({ length: 30 }, (_, index) => `历史${index}:` + "x".repeat(1800)),
+      {
+        continuityModel: modelWithText(
+          JSON.stringify({
+            goal: "保持长期任务目标",
+            decisions: ["使用结构化连续性"],
+            constraints: ["只读历史资料"],
+            facts: ["来源可核对"],
+            unresolved: ["仍有问题待处理"],
+            completed: ["已保存历史窗口"],
+            pending: ["继续下一轮"],
+          }),
+        ),
+      },
+    );
+    const messages = await f.workspace.guard(context(f));
+    const continuity = (await f.conversation.storage.read()).filter((entry) => entry.type === "continuity");
+    expect(continuity).toHaveLength(1);
+    expect(messages.some((message) => String(message.content).includes("<continuity_state"))).toBe(true);
+    expect(JSON.stringify(messages)).toContain("historical-data");
+    expect(JSON.stringify(messages)).not.toContain("sourceEntryIds");
+    expect(f.workspace.status().loadedBlocks).toBe(0);
+  });
+
+  it("keeps a loaded page resident when continuity admission fails", async () => {
+    const f = await fixture(["需要保留的原文".repeat(500)], {
+      continuityModel: modelWithText("not-json"),
+    });
+    await f.workspace.guard(context(f));
+    const id = (await f.workspace.blocks({})).blocks[0]!.id;
+    await f.workspace.load({ blockId: id });
+
+    const oversized: ModelMessage = { role: "assistant", content: "x".repeat(43_500) };
+    await expect(f.workspace.guard(context(f, "pressure", 1, [oversized]))).rejects.toThrow("ContextContinuityUnavailable");
+    expect(f.workspace.status().loadedBlocks).toBe(1);
+  });
+
   it("uses matching provider usage as the calibration source in either direction", async () => {
     const f = await fixture();
     await f.workspace.guard(context(f));
@@ -380,6 +454,17 @@ describe("real AgentRuntime provider boundary", () => {
       bot: bot as never,
       will: { decide: async () => "trigger", observe: async () => {} } as never,
       model: scripted.model,
+      compactModel: modelWithText(
+        JSON.stringify({
+          goal: "保留历史目标",
+          decisions: ["继续当前任务"],
+          constraints: ["遵守来源边界"],
+          facts: ["历史请求包含已确认事实"],
+          unresolved: ["仍需核对原文"],
+          completed: ["已保存连续性卡片"],
+          pending: ["等待下一步请求"],
+        }),
+      ),
       readImagePolicy: { mode: "unavailable" },
       historyProjection: "gemini-native",
       config: Config({
@@ -510,7 +595,7 @@ describe("real AgentRuntime provider boundary", () => {
     expect(events.at(-1)).toMatchObject({ type: "turn.done" });
     expect(JSON.stringify(events)).not.toContain("ContextBudgetExceeded");
   });
-  it("still rejects media whose provider token cost cannot be measured locally", async () => {
+  it("passes image input without a local media budget restriction", async () => {
     const f = await fixture();
     const agent = createAgent({
       model: f.model,
@@ -519,8 +604,9 @@ describe("real AgentRuntime provider boundary", () => {
       beforeModelRequest: (request) => f.workspace.guard(request),
     });
     const events = await Array.fromAsync(agent.run(createUserMessage([{ type: "image", image: new Uint8Array([1]), mediaType: "image/png" }])));
-    expect(f.calls).toHaveLength(0);
-    expect(events.at(-1)).toMatchObject({ type: "turn.failed", error: { message: "UnsupportedBudgetMedia" } });
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]!.prompt).toEqual(expect.arrayContaining([expect.objectContaining({ role: "user" })]));
+    expect(events.at(-1)).toMatchObject({ type: "turn.done" });
   });
   it("applies Gemini merge only after selection, preserving the current input and system prefix", async () => {
     const f = await fixture(

@@ -154,6 +154,23 @@ describe("request-only projection", () => {
     });
     expect((await Array.fromAsync(agent.run(createUserMessage("now")))).at(-1)?.type).toBe("turn.done");
   });
+  it("applies a guard-selected active tool allow-list at the provider boundary", async () => {
+    const projection = new AgentRequestProjection();
+    const { model, requests } = modelWithCalls();
+    const agent = createAgent({
+      model,
+      requestProjection: projection,
+      tools: [
+        { name: "ctx_load", inputSchema: jsonSchema({ type: "object", properties: {} }), execute: () => ({ ok: true }) },
+        { name: "finish", inputSchema: jsonSchema({ type: "object", properties: {} }), execute: () => ({ ok: true }) },
+      ],
+      beforeModelRequest: async (context) => ({ messages: context.messages, activeTools: ["finish"] }),
+    });
+    await Array.fromAsync(agent.run(createUserMessage("now")));
+    const tools = requests[0]?.tools as readonly { name?: string }[] | undefined;
+    expect(tools?.map((tool) => tool.name)).toEqual(["finish"]);
+  });
+
   it("resolves output cap using the actually plugin-selected model and preserves disabled requests", async () => {
     const initial = modelWithCalls();
     const selected = modelWithCalls(0, "replacement");
