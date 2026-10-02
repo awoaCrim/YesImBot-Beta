@@ -5,6 +5,7 @@ import type { AgentEntry } from "./entry.js";
 import { createDiagnostic, createInternalEvent } from "./event.js";
 import type { AgentInternalEventInit } from "./event.js";
 import type { AgentMessage } from "./message.js";
+import type { AgentRequestProjection } from "./request-projection.js";
 import type { AgentStateManager } from "./state.js";
 import type { AgentStorage } from "./storage.js";
 import { mergeTools, type AgentToolSet, type ToolDecision } from "./tools.js";
@@ -65,8 +66,11 @@ export interface MessageTransformContext extends HookContextBase {
 
 export interface ModelMessageContext extends HookContextBase {
   readonly turnId?: string;
+  readonly projection?: AgentRequestProjection;
   readonly history: readonly AgentMessage[];
   readonly current: readonly AgentMessage[];
+  /** Messages produced during the active turn, including prior step inputs and tool continuations. */
+  readonly live?: readonly AgentMessage[];
 }
 
 export interface PromptContext extends HookContextBase {
@@ -86,6 +90,7 @@ export interface TurnFinishContext extends HookContextBase {
 }
 
 export interface PrepareStepContext extends HookContextBase {
+  readonly projection?: AgentRequestProjection;
   readonly turnId: string;
   readonly stepNumber: number;
 }

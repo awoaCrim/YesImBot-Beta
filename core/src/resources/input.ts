@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { h, type Context, type Element } from "koishi";
 
 import type { AssetStore } from "./asset.js";
+import type { ImageFailureCode } from "./image-failure.js";
 import type { ChannelResources } from "./index.js";
 
 const DATA_URL = /^data:([^;,]+)(;base64)?,([\s\S]*)$/;
@@ -39,6 +40,12 @@ interface ResourceProbe {
   type: string | null;
 }
 
+class InputResourceError extends Error {
+  public constructor(public readonly code: ImageFailureCode) {
+    super(code);
+  }
+}
+
 /** Persists inbound image and restricted text-file elements while the Session is live. */
 export async function persistElements(ctx: Context, elements: readonly Element[], resources: ChannelResources): Promise<Element[]> {
   const budget: ResourceBudget = { images: 0, files: 0, bytes: 0 };
@@ -60,21 +67,42 @@ async function persistElement(ctx: Context, element: Element, store: AssetStore,
 }
 
 async function storeImage(ctx: Context, element: Element, store: AssetStore, budget: ResourceBudget): Promise<Element> {
-  if (typeof element.attrs.src !== "string" || budget.images >= MAX_IMAGES) return element;
+  const existingId = element.attrs.id;
+  if (typeof existingId === "string" && /^[a-f0-9]{32}$/.test(existingId)) return element;
+  const source = element.attrs.src;
+  if (typeof source !== "string" || source.trim().length === 0) return failedImage("missing_source");
+  if (budget.images >= MAX_IMAGES) return failedImage("image_limit");
   budget.images += 1;
+  const remaining = MAX_TOTAL_BYTES - budget.bytes;
+  if (remaining <= 0) return failedImage("total_size_limit");
+
+  let data: Uint8Array;
   try {
-    const data = await loadResource(ctx, element.attrs.src, "image", Math.min(MAX_BYTES_PER_IMAGE, MAX_TOTAL_BYTES - budget.bytes));
-    if (budget.bytes + data.byteLength > MAX_TOTAL_BYTES) return element;
-    budget.bytes += data.byteLength;
-    return h("img", {
-      id: await store.put(data),
-      ...(element.attrs.subType === undefined ? {} : { subType: element.attrs.subType }),
-      ...(element.attrs.sub_type === undefined ? {} : { sub_type: element.attrs.sub_type }),
-      ...(element.attrs.summary === undefined ? {} : { summary: element.attrs.summary }),
-    });
-  } catch {
-    return element;
+    data = await loadResource(ctx, source, "image", Math.min(MAX_BYTES_PER_IMAGE, remaining));
+  } catch (cause) {
+    return failedImage(cause instanceof InputResourceError ? cause.code : "download_failed");
   }
+  if (budget.bytes + data.byteLength > MAX_TOTAL_BYTES) return failedImage("total_size_limit");
+
+  // Reserve the bytes before awaiting the store so concurrent elements cannot exceed the total.
+  budget.bytes += data.byteLength;
+  let id: string;
+  try {
+    id = await store.put(data);
+  } catch {
+    budget.bytes -= data.byteLength;
+    return failedImage("save_failed");
+  }
+  return h("img", {
+    id,
+    ...(element.attrs.subType === undefined ? {} : { subType: element.attrs.subType }),
+    ...(element.attrs.sub_type === undefined ? {} : { sub_type: element.attrs.sub_type }),
+    ...(element.attrs.summary === undefined ? {} : { summary: element.attrs.summary }),
+  });
+}
+
+function failedImage(code: ImageFailureCode): Element {
+  return h("img", { yesimbotFailure: code });
 }
 
 async function storeTextFile(ctx: Context, element: Element, store: AssetStore, budget: ResourceBudget): Promise<Element> {
@@ -116,9 +144,18 @@ function isUtf8Text(bytes: Uint8Array): boolean {
 
 async function loadResource(ctx: Context, src: string, kind: ResourceKind, maxBytes: number): Promise<Uint8Array> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(new Error("Resource download timed out")), RESOURCE_TIMEOUT_MS);
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error("Resource download timed out"));
+  }, RESOURCE_TIMEOUT_MS);
   try {
     return await loadResourceBytes(ctx, src, kind, controller.signal, maxBytes);
+  } catch (cause) {
+    if (cause instanceof InputResourceError) throw cause;
+    if (timedOut || (cause instanceof Error && /timed out|timeout/i.test(cause.message))) throw new InputResourceError("timeout");
+    if (cause instanceof Error && /exceeds byte limit/i.test(cause.message)) throw new InputResourceError("too_large");
+    throw new InputResourceError("download_failed");
   } finally {
     clearTimeout(timeout);
   }
@@ -136,9 +173,8 @@ async function loadResourceBytes(ctx: Context, src: string, kind: ResourceKind, 
 
 async function loadRemote(ctx: Context, src: string, kind: ResourceKind, signal: AbortSignal, maxBytes: number): Promise<Uint8Array> {
   const probe = await headProbe(ctx, src);
-  if (probe && ((probe.length !== null && probe.length > maxBytes) || !matchesKind(probe.type, kind))) {
-    throw new Error("Resource rejected by HEAD pre-check");
-  }
+  if (probe !== null && probe.length !== null && probe.length > maxBytes) throw new InputResourceError("too_large");
+  if (probe !== null && !matchesKind(probe.type, kind)) throw new InputResourceError(kind === "image" ? "not_image" : "download_failed");
   const response = await ctx.http(src, { responseType: "stream", signal });
   return readBoundedStream(response.data, signal, maxBytes);
 }

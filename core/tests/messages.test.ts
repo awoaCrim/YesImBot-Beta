@@ -10,7 +10,9 @@ import {
   createEvent,
   createMessage,
   formatCurrentInput,
+  formatCurrentInputWithImages,
   formatInput,
+  formatInputWithImages,
   isEvent,
   isMessage,
   isMessageRecord,
@@ -23,7 +25,7 @@ import {
   type RecordBase,
 } from "../src/messages/index.js";
 import { parseReply } from "../src/messages/index.js";
-import { scope } from "./helpers/index.js";
+import { PNG_BYTES, scope } from "./helpers/index.js";
 
 type Input = Message | Event;
 
@@ -524,7 +526,7 @@ describe("formatInput", () => {
     const input = createMessage(miMessageRecordWithText('<img src="https://example.test/x.png"/><img src="data:image/png;base64,AAAA"/>'));
     const result = await project(input);
 
-    expect(result.content).toContain("[图片]");
+    expect(result.content).toContain("[图片：资源不可用]");
     expect(String(result.content)).not.toContain("https://");
     expect(String(result.content)).not.toContain("base64");
   });
@@ -651,5 +653,73 @@ describe("parseReply", () => {
     const segments = parseReply(" r0  not a real capture");
     expect(segments).toHaveLength(1);
     expect(text(segments[0])).toBe("r0 not a real capture");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Request-only image input
+// ---------------------------------------------------------------------------
+
+const TEST_ASSET_ONE = "11111111111111111111111111111111";
+const TEST_ASSET_TWO = "22222222222222222222222222222222";
+
+function imageMessage(elements: readonly Element[], quote?: MessageRecord["quote"]): Message {
+  return createMessage({
+    ...messageRecord(),
+    messageId: "image-message",
+    elements,
+    ...(quote ? { quote } : {}),
+  });
+}
+
+describe("request-only image input", () => {
+  it("renders bounded failure reasons instead of a bare image placeholder", () => {
+    const input = imageMessage([h("img", { yesimbotFailure: "timeout" }), h.text("后续")]);
+    const content = String(formatInput(input).content);
+
+    expect(content).toContain("[图片：读取超时]");
+    expect(content).not.toContain("[图片]");
+    expect(String(formatInput(imageMessage([h("img", {})])).content)).toContain("[图片：资源不可用]");
+  });
+
+  it("projects image bytes in message and quote order without mutating the message", async () => {
+    const input = imageMessage([h.text("当前"), h("img", { id: TEST_ASSET_TWO }), h.text("结束")], {
+      messageId: "quoted-1",
+      elements: [h.text("引用"), h("img", { id: TEST_ASSET_ONE })],
+      author: { id: "quoted-user" },
+    });
+    const resolver = vi.fn(async (assetId: string) => ({ bytes: assetId === TEST_ASSET_ONE ? PNG_BYTES : new Uint8Array([1, 2, 3]), mediaType: "image/png" }));
+    const before = structuredClone(input.data);
+
+    const projected = await formatCurrentInputWithImages(input, resolver);
+
+    expect(projected.content).toEqual([
+      { type: "text", text: expect.stringContaining('[QUOTED_MESSAGE id="quoted-1" sender="quoted-user"]') },
+      { type: "image", image: PNG_BYTES, mediaType: "image/png" },
+      { type: "text", text: expect.stringContaining("当前") },
+      { type: "image", image: new Uint8Array([1, 2, 3]), mediaType: "image/png" },
+      { type: "text", text: expect.stringContaining("[/CURRENT_MESSAGE]") },
+    ]);
+    expect(resolver.mock.calls.map(([assetId]) => assetId)).toEqual([TEST_ASSET_ONE, TEST_ASSET_TWO]);
+    expect(input.data).toEqual(before);
+    expect(JSON.stringify(projected.content)).not.toContain("asset://");
+  });
+
+  it("resolves images nested inside message elements in source order", async () => {
+    const input = imageMessage([h("paragraph", {}, [h.text("前"), h("img", { id: TEST_ASSET_ONE }), h.text("后")])]);
+    const projected = await formatInputWithImages(input, async () => ({ bytes: PNG_BYTES, mediaType: "image/png" }));
+
+    expect(projected.content).toEqual([
+      { type: "text", text: expect.stringContaining("前") },
+      { type: "image", image: PNG_BYTES, mediaType: "image/png" },
+      { type: "text", text: expect.stringContaining("后") },
+    ]);
+  });
+
+  it("keeps a bounded failure reason when request-only image resolution fails", async () => {
+    const input = imageMessage([h.text("前"), h("img", { id: TEST_ASSET_ONE }), h.text("后")]);
+    const projected = await formatInputWithImages(input, async () => ({ error: "resource_missing" }));
+
+    expect(String(projected.content)).toContain("[图片：资源不存在]");
   });
 });

@@ -7,6 +7,7 @@ import type { LanguageModel } from "ai";
 import type { MessageRecord } from "../messages/index.js";
 import { resolveLatestCompactBoundary } from "./boundary.js";
 import { compactSourceTimestamp, executeCompact, filterEntriesForCompression, renderCompressionRecords, type CompressionRecord } from "./compact.js";
+import { normalizedSessionId, resolveCompactSource, type CompactEntry, type ContextSourceSnapshot } from "./context-blocks.js";
 import type { CompactFragmentInput, CompactFragmentWriter } from "./fragment-store.js";
 
 const DEFAULT_COMPARTMENT_MESSAGES = 20;
@@ -106,6 +107,7 @@ export class Conversation {
   private fileStorageValue: AgentStorage<AgentEntry> | undefined;
   private storageTail: Promise<void> = Promise.resolve();
   private failures = 0;
+  private readonly compactSourceIndex = new Map<string, { stamp: string; compacts: readonly CompactEntry[] }>();
 
   public constructor(root: string, compactConfig: ConversationCompactConfig = { minMessages: 15, maxFailures: 3 }, options: ConversationOptions = {}) {
     this.root = root;
@@ -246,6 +248,47 @@ export class Conversation {
     return limited.sort((left, right) => left.record.timestamp - right.record.timestamp).map(({ record }) => record);
   }
 
+  /** Rebuildable archive metadata index; never caches a second copy of archived raw bodies. */
+  public async contextSources(): Promise<ContextSourceSnapshot> {
+    if (!this.storagePathValue) throw new Error("Conversation has not been initialized");
+    await this.storageTail;
+    const sessionId = this.currentSessionId();
+    const entries = await this.readStorage();
+    const filenames = (await this.files()).filter((name) => /^[0-9A-Za-zTZ_-]+\.jsonl$/.test(name));
+    const sessionIds = filenames.map(normalizedSessionId);
+    const compacts: CompactEntry[] = [];
+    for (const filename of filenames) {
+      const id = normalizedSessionId(filename);
+      if (id === sessionId) {
+        compacts.push(...entries.filter((entry): entry is CompactEntry => entry.type === "compact"));
+        continue;
+      }
+      const info = await stat(join(this.sessionsPath(), filename));
+      const stamp = `${info.size}:${info.mtimeMs}:${info.ctimeMs}`;
+      const cached = this.compactSourceIndex.get(id);
+      if (cached?.stamp === stamp) {
+        compacts.push(...cached.compacts);
+        continue;
+      }
+      const historical = await createJsonlStorage(join(this.sessionsPath(), filename)).read();
+      const indexed = historical.filter((entry): entry is CompactEntry => entry.type === "compact");
+      this.compactSourceIndex.set(id, { stamp, compacts: indexed });
+      compacts.push(...indexed);
+    }
+    for (const id of this.compactSourceIndex.keys()) if (!sessionIds.includes(id)) this.compactSourceIndex.delete(id);
+    return {
+      sessionId,
+      entries,
+      compacts,
+      sessionIds,
+      readSession: async (input) => {
+        const id = normalizedSessionId(input);
+        if (!sessionIds.includes(id)) throw new Error("Source session is not available");
+        return id === sessionId ? entries : createJsonlStorage(join(this.sessionsPath(), `${id}.jsonl`)).read();
+      },
+    };
+  }
+
   /** Expands one compartment's canonical raw source without calling a model or writing storage. */
   public async expandCompartment(compartmentId: string, options: CompartmentExpansionOptions = {}): Promise<CompartmentExpansionResult> {
     if (!this.storagePathValue) throw new Error("Conversation has not been initialized");
@@ -257,43 +300,13 @@ export class Conversation {
     if (!Number.isInteger(requestedLimit) || requestedLimit <= 0) throw new Error("Compartment expansion limit must be a positive integer");
     const limit = Math.min(requestedLimit, MAX_EXPANSION_PAGE_SIZE);
 
-    let matched: { readonly filename: string; readonly entry: Extract<AgentEntry, { type: "compact" }> } | undefined;
-    for (const filename of await this.files()) {
-      for (const entry of await createJsonlStorage(join(this.sessionsPath(), filename)).read()) {
-        if (entry.type !== "compact") continue;
-        if (entry.id !== compartmentId && entry.data.compartmentId !== compartmentId) continue;
-        if (matched) throw new Error(`Compartment ID ${JSON.stringify(compartmentId)} is duplicated`);
-        matched = { filename, entry };
-      }
-    }
-    if (!matched) throw new Error(`Compartment ID ${JSON.stringify(compartmentId)} was not found in this conversation`);
-
-    const sourceSession = matched.entry.data.sourceSession;
-    const sourceFiles = sourceSession ? [`${sourceSession.replace(/\\.jsonl$/, "")}.jsonl`] : await this.files();
-    const sourceFileSet = new Set(await this.files());
-    let sourceEntries: readonly AgentEntry[] | undefined;
-    for (const filename of sourceFiles) {
-      if (!sourceFileSet.has(filename)) continue;
-      const entries = await createJsonlStorage(join(this.sessionsPath(), filename)).read();
-      if (entries.some((entry) => entry.id === matched!.entry.data.firstEntryId) && entries.some((entry) => entry.id === matched!.entry.data.lastEntryId)) {
-        sourceEntries = entries;
-        break;
-      }
-    }
-    if (!sourceEntries) throw new Error(`Compartment ${JSON.stringify(compartmentId)} has no readable raw source`);
-    const firstEntryId = matched.entry.data.firstEntryId;
-    const lastEntryId = matched.entry.data.lastEntryId;
-    if (!firstEntryId || !lastEntryId) throw new Error(`Compartment ${JSON.stringify(compartmentId)} has no raw source bounds`);
-    const firstIndex = sourceEntries.findIndex((entry) => entry.id === firstEntryId);
-    const lastIndex = sourceEntries.findIndex((entry) => entry.id === lastEntryId);
-    if (firstIndex < 0 || lastIndex < firstIndex) throw new Error(`Compartment ${JSON.stringify(compartmentId)} has invalid raw source bounds`);
-
-    const records = sourceEntries.slice(firstIndex, lastIndex + 1).flatMap(renderCompressionRecords);
+    const source = await resolveCompactSource(await this.contextSources(), compartmentId);
+    const records = source.range.flatMap(renderCompressionRecords);
     const entries = records.slice(offset, offset + limit);
     const nextOffset = offset + entries.length < records.length ? offset + entries.length : undefined;
     return {
-      compartmentId: matched.entry.data.compartmentId ?? matched.entry.id,
-      ...(matched.entry.data.compartmentLabel ? { label: matched.entry.data.compartmentLabel } : {}),
+      compartmentId: source.compact.data.compartmentId ?? source.compact.id,
+      ...(source.compact.data.compartmentLabel ? { label: source.compact.data.compartmentLabel } : {}),
       offset,
       limit,
       total: records.length,

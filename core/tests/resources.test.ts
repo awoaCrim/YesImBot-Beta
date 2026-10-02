@@ -83,6 +83,16 @@ describe("session-live input resources", () => {
     expect(elements).toEqual([h("img", { id: "0123456789abcdef0123456789abcdef" })]);
   });
 
+  it("records a bounded reason when an inbound image has no source", async () => {
+    const ctx = { http: vi.fn(), logger: vi.fn(() => ({ debug: vi.fn() })) };
+    const resources = { assets: { put: vi.fn() } };
+
+    const elements = await persistElements(ctx as never, [h("img", {})], resources as never);
+
+    expect(elements).toEqual([h("img", { yesimbotFailure: "missing_source" })]);
+    expect(resources.assets.put).not.toHaveBeenCalled();
+  });
+
   it("uses an inbound file name when persisting a text script", async () => {
     const script = new TextEncoder().encode("print('ok')\n");
     const http = Object.assign(

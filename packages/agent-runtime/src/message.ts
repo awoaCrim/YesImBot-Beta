@@ -76,14 +76,16 @@ export function createCustomMessage<T extends AgentCustomMessageType>(
 export async function buildModelMessages(options: {
   history: AgentMessage[];
   current: AgentMessage[];
+  live?: AgentMessage[];
   pluginHost: PluginHost;
-  context: Omit<ModelMessageContext, "history" | "current">;
+  context: Omit<ModelMessageContext, "history" | "current" | "live">;
 }): Promise<ModelMessage[]> {
   const history = await options.pluginHost.helpers.transformMessages(options.history, options.context);
   const context: ModelMessageContext = Object.freeze({
     ...options.context,
     history: Object.freeze([...history]),
     current: Object.freeze([...options.current]),
+    ...(options.live ? { live: Object.freeze([...options.live]) } : {}),
   });
   const allMessages = [...context.history, ...context.current];
   const result: ModelMessage[] = [];
@@ -92,13 +94,18 @@ export async function buildModelMessages(options: {
     if (message.role === "custom") {
       const converted = await options.pluginHost.helpers.toModelMessages(message, context);
       if (converted.length > 0) {
+        for (const output of converted) {
+          if (!context.projection?.origin(output)) context.projection?.inherit(output, [message]);
+        }
         result.push(...(converted as ModelMessage[]));
       }
       continue;
     }
 
     if (isModelMessageRole(message.role)) {
-      result.push(toPlainModelMessage(message));
+      const output = toPlainModelMessage(message);
+      context.projection?.inherit(output, [message]);
+      result.push(output);
     }
   }
 

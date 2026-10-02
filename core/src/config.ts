@@ -28,7 +28,7 @@ export const Config: Schema<Config> = Schema.intersect([
       .description("允许接收消息的频道；默认拒绝全部频道"),
   }).description("基础配置"),
   Schema.object({
-    imageInput: Schema.boolean().default(true).description("允许支持图片输入的模型通过 read 工具读取图片"),
+    imageInput: Schema.boolean().default(true).description("允许支持图片输入的模型直接接收当前消息图片，并通过 read 工具读取图片"),
     modelRetries: Schema.number().min(0).max(5).default(3).description("主聊天模型遇到可重试 HTTP 429 时的最大重试次数"),
     resourceReadTimeout: Schema.number().min(1).default(30).description("资源读取超时时间（秒）"),
   }).description("模型输入与资源读取"),
@@ -66,6 +66,17 @@ export const Config: Schema<Config> = Schema.intersect([
           .default(5 * 1024)
           .description("单个会话文件归档上限（KB）；0 = 禁用"),
       }).description("自动归档"),
+      magicContext: Schema.object({
+        enabled: Schema.boolean().default(false).description("启用请求前预算与历史块工作集；仅支持 compartment 模式"),
+        contextWindow: finiteInteger(1).description("明确的上下文窗口；与模型 limit 同时存在时取较小值"),
+        outputReserveTokens: finiteInteger(1).default(8192).description("实际请求输出上限与输出预留"),
+        historyBudgetPercentage: finiteNumber(Number.MIN_VALUE, 100).default(25).description("可选历史占有效输入预算的比例；总额最多 20000"),
+        recentMessages: finiteInteger(1, 200).default(20).description("近期历史软保留目标；不拆分完整工具单元"),
+        maxLoadedBlocks: finiteInteger(1, 4).default(4).description("同时驻留的历史块数；每块仅一页"),
+        pageTokenBudget: finiteInteger(128, 4096).default(4096).description("每页文本的估算预算；仍须满足总历史预算"),
+        retainTurns: finiteInteger(0, 2).default(2).description("加载当轮之后继续保留的正常会话轮数"),
+        mediaReserveTokens: finiteInteger(1).description("显式非文本媒体预算；未配置时新预算路径拒绝不可计量媒体"),
+      }).description("Magic Context（默认关闭）"),
     }).description("会话管理"),
   }),
 ]) as Schema<Config>;
@@ -99,9 +110,23 @@ export interface SessionArchiveConfig {
   maxKB: number;
 }
 
+export interface MagicContextConfig {
+  enabled: boolean;
+  contextWindow?: number;
+  outputReserveTokens: number;
+  historyBudgetPercentage: number;
+  recentMessages: number;
+  maxLoadedBlocks: number;
+  pageTokenBudget: number;
+  retainTurns: number;
+  mediaReserveTokens?: number;
+}
+
 export interface SessionConfig {
   compact: SessionCompactConfig;
   archive: SessionArchiveConfig;
+  /** Optional so configurations and integrations predating Magic Context remain compatible. */
+  magicContext?: Partial<MagicContextConfig>;
 }
 
 export interface Config {

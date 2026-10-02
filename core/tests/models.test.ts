@@ -59,6 +59,19 @@ afterEach(async () => {
 });
 
 describe("models.json modalities", () => {
+  it("resolves context limits from actual registered provider/model identity without guessing names", async () => {
+    const provider: ModelProvider = {
+      ...createProvider(),
+      chat: () => ({ specificationVersion: "v3", provider: "openai.responses", modelId: "gpt-4o", supportedUrls: {} }) as never,
+    };
+    const service = await createModelService({ chat: { "openai:gpt-4o": { limit: { context: 128_000, output: 16_000 } } } }, undefined, provider);
+    const ref = service.resolveChatModel("openai:gpt-4o");
+    expect(service.contextLimit(ref.model)).toEqual({ context: 128_000, output: 16_000 });
+    expect(service.contextLimit("openai:gpt-4o")).toEqual({ context: 128_000, output: 16_000 });
+    expect(service.contextLimit("unregistered:gpt-4o")).toBeUndefined();
+    expect(service.contextLimit({ provider: "unknown", modelId: "gpt-4o" } as never)).toBeUndefined();
+    expect(service.contextLimit({ provider: "openai", modelId: "other" } as never)).toBeUndefined();
+  });
   it("preserves configured embedding defaults through provider registration, resolution, listing, and query", async () => {
     const embedding = {};
     const provider: ModelProvider = {

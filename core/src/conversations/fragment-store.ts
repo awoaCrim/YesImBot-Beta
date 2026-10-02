@@ -251,7 +251,7 @@ function fragmentEndedAt(fragment: CompactFragment): number {
   return fragment.endAt ?? fragment.createdAt;
 }
 
-function escapeXmlText(value: string): string {
+export function escapeXmlText(value: string): string {
   return value.replace(/[&<>"]/g, (character) => {
     switch (character) {
       case "&":

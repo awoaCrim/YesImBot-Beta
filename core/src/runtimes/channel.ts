@@ -1,5 +1,6 @@
 import {
   AgentBusyError,
+  AgentRequestProjection,
   createAgent,
   createEntry,
   createEventEntry,
@@ -21,6 +22,7 @@ import type { MessagePolisherCapability } from "../agents/polisher.js";
 import {
   createDescribeImageTool,
   createExpandCompartmentTool,
+  createContextWorkspaceTools,
   createFinishTool,
   createReadTool,
   createSendMessageTool,
@@ -49,16 +51,22 @@ import {
   createEvent,
   createMessage,
   formatCurrentInput,
+  formatCurrentInputWithImages,
   formatInput,
+  formatInputWithImages,
   isEvent,
   isMessage,
   isMessageRecord,
   type Event,
   type EventRecord,
+  type InputImageResolution,
   type Message,
   type MessageRecord,
 } from "../messages/index.js";
 import type { HistoryProjectionMode } from "../models/index.js";
+import type { ImageFailureCode } from "../resources/image-failure.js";
+import { ResourceReadError } from "../resources/index.js";
+import { ContextWorkspace } from "./context-workspace.js";
 import { buildCoreSystemPrompt } from "./prompt.js";
 
 /** Fixed Core threshold: a provider-reported prompt above this only ever registers a pending compact. */
@@ -87,8 +95,12 @@ export interface ChannelRuntimeOptions {
   readonly bot: Bot;
   readonly will: WillEngine;
   readonly model: LanguageModel;
+  readonly contextModelLimit?: { context: number; output: number };
+  readonly resolveContextModelLimit?: (model: LanguageModel) => { context: number; output: number } | undefined;
   /** Provider-scoped request history projection; omitted models use the compatibility default. */
   readonly historyProjection?: HistoryProjectionMode;
+  /** Directly projects current-turn persisted images when config and the primary model allow it. */
+  readonly directImageInput?: boolean;
   /** Set by the Core capability gate; the Runtime never infers forced tool choice by itself. */
   readonly toolChoice?: "required";
   readonly providerTools?: ToolSet;
@@ -126,6 +138,7 @@ export class ChannelRuntime {
   public readonly selfId: string;
 
   private readonly agent: Agent;
+  private readonly contextWorkspace?: ContextWorkspace;
   private readonly imageProjection: EphemeralImageProjectionStore;
   private readonly logger: Logger;
   private messageBatchController: MessageBatchController | undefined;
@@ -175,10 +188,30 @@ export class ChannelRuntime {
       tools.push(createDescribeImageTool(options.visionModel, options.channel.resources));
     }
     const channelKey = deriveChannelKey(this.context);
+    const projection = options.config.session.magicContext?.enabled ? new AgentRequestProjection() : undefined;
+    if (projection) {
+      this.contextWorkspace = new ContextWorkspace(options.channel.conversation, projection, {
+        config: options.config.session.magicContext!,
+        compactMode: options.config.session.compact.mode,
+        model: options.model,
+        modelLimit: options.contextModelLimit,
+        resolveModelLimit: options.resolveContextModelLimit,
+        ...(options.historyProjection === "gemini-native" ? { mergeMessages: mergeAdjacentUserMessages } : {}),
+        onDiagnostic: (metadata) => this.logger.debug("runtime.context_budget", metadata),
+      });
+      tools.push(...createContextWorkspaceTools(this.contextWorkspace));
+    }
     this.agent = createAgent({
       id: channelKey,
       model: options.model,
       maxRetries: options.config.modelRetries,
+      ...(this.contextWorkspace
+        ? {
+            requestProjection: projection,
+            beforeModelRequest: (context) => this.contextWorkspace!.guard(context),
+            maxOutputTokens: (model) => this.contextWorkspace!.outputLimit(model),
+          }
+        : {}),
       // Every Core turn must end on a terminal tool: `finish` for silence, `send_message` for
       // platform output. Plain assistant text is internal reasoning and never a reply.
       requireTerminalTool: true,
@@ -198,10 +231,32 @@ export class ChannelRuntime {
       plugins: [
         // Capture compact anchors from canonical entries before the history projection replaces
         // compact records with request-only system messages.
+        ...(this.contextWorkspace
+          ? [
+              {
+                name: "core.context-workspace",
+                enforce: "pre" as const,
+                transformEntries: (entries: readonly AgentEntry[]) => {
+                  this.contextWorkspace!.capture(entries);
+                },
+                onTurnFinish: (result: import("@yesimbot/agent-runtime").TurnResult) => {
+                  this.contextWorkspace!.finish(result);
+                },
+              },
+            ]
+          : []),
         this.compactRecallPlugin(channelKey),
-        createSummaryHistoryPlugin(inlineFragmentCount(options.config)),
-        createInternalHistoryProjectionPlugin(options.historyProjection ?? "default"),
-        createModelInputPlugin(options.historyProjection ?? "default"),
+        createSummaryHistoryPlugin(inlineFragmentCount(options.config), projection),
+        createInternalHistoryProjectionPlugin(options.historyProjection ?? "default", projection),
+        createModelInputPlugin(
+          options.historyProjection ?? "default",
+          this.contextWorkspace !== undefined,
+          options.directImageInput
+            ? {
+                resolveImage: (assetId, signal) => this.resolveInputImage(assetId, signal),
+              }
+            : undefined,
+        ),
         this.imageProjectionPlugin(),
         this.silentTurnPlugin(),
         ...options.plugins,
@@ -351,6 +406,7 @@ export class ChannelRuntime {
 
   public stop(): Promise<void> {
     if (this.stopTask) return this.stopTask;
+    this.contextWorkspace?.stop();
     this.logger.warn("runtime.stop_requested", {
       platform: this.context.platform,
       channelId: this.context.channelId,
@@ -764,6 +820,7 @@ export class ChannelRuntime {
   /** Provider-reported prompt size is the only automatic compaction trigger. */
   private observePromptUsage(event: TurnStepEvent): void {
     const inputTokens = event.usage?.inputTokens;
+    this.contextWorkspace?.observeUsage(event.turnId, event.step, inputTokens);
     if (typeof inputTokens !== "number" || !Number.isFinite(inputTokens) || inputTokens <= PROMPT_LIMIT_INPUT_TOKENS) return;
     if (this.promptLimitCompact && this.promptLimitCompact.inputTokens >= inputTokens) return;
 
@@ -882,6 +939,29 @@ export class ChannelRuntime {
     });
   }
 
+  private async resolveInputImage(assetId: string, signal?: AbortSignal): Promise<InputImageResolution> {
+    try {
+      const opened = await this.options.channel.resources.openStrict(`asset://${assetId}`, signal);
+      const mediaType = this.options.channel.resources.detectImageMediaType(opened.bytes);
+      return mediaType ? { bytes: opened.bytes, mediaType } : { error: "not_image" };
+    } catch (cause) {
+      if (!(cause instanceof ResourceReadError)) return { error: "resource_unavailable" };
+      const error: ImageFailureCode =
+        cause.code === "resource_not_found"
+          ? "resource_missing"
+          : cause.code === "timeout"
+            ? "timeout"
+            : cause.code === "resource_too_large"
+              ? "too_large"
+              : cause.code === "resource_read_aborted"
+                ? "resource_aborted"
+                : cause.code === "resource_unavailable"
+                  ? "resource_unavailable"
+                  : "download_failed";
+      return { error };
+    }
+  }
+
   private imageProjectionPlugin(): AgentPlugin {
     return {
       name: "core.image-projection",
@@ -974,7 +1054,9 @@ export class ChannelRuntime {
 
         if (fragments.length === 0) return undefined;
         this.logger.debug("runtime.compact_recall", { count: fragments.length, lineageId: current.lineageId });
-        return [{ role: "system" as const, content: formatRecalledFragments(fragments) }, ...messages];
+        const recalled: ModelMessage = { role: "system", content: formatRecalledFragments(fragments) };
+        context.projection?.register(recalled, { kind: "recall", sourceEntryIds: fragments.map((fragment) => fragment.id), timestamp: 0 });
+        return [recalled, ...messages];
       },
       onTurnFinish: (_result, context) => {
         recalls.delete(context.turnId);
@@ -999,7 +1081,11 @@ export class ChannelRuntime {
   }
 }
 
-export function createModelInputPlugin(mode: HistoryProjectionMode = "default"): AgentPlugin {
+interface DirectImageInputOptions {
+  readonly resolveImage: (assetId: string, signal?: AbortSignal) => Promise<InputImageResolution>;
+}
+
+export function createModelInputPlugin(mode: HistoryProjectionMode = "default", deferMerge = false, directImageInput?: DirectImageInputOptions): AgentPlugin {
   return {
     name: "core.model-input",
     enforce: "pre",
@@ -1008,13 +1094,20 @@ export function createModelInputPlugin(mode: HistoryProjectionMode = "default"):
         if (mode === "gemini-native") return [];
         const transcripts = context.history.filter(isDeliveredTranscript);
         if (transcripts[0]?.id !== message.id) return [];
-        return [formatDeliveredTranscriptHistory(transcripts)];
+        const output = formatDeliveredTranscriptHistory(transcripts);
+        context.projection?.inherit(output, transcripts);
+        return [output];
       }
       if (!isMessage(message) && !isEvent(message)) return [];
       const isCurrent = context.current.some((current) => current.id === message.id);
+      const isLive = directImageInput !== undefined && context.live?.some((live) => live.id === message.id) === true;
+      if (directImageInput && (isCurrent || isLive)) {
+        const resolve = (assetId: string) => directImageInput.resolveImage(assetId, context.signal);
+        return [isCurrent ? await formatCurrentInputWithImages(message, resolve) : await formatInputWithImages(message, resolve)];
+      }
       return [isCurrent ? formatCurrentInput(message) : formatInput(message)];
     },
-    ...(mode === "gemini-native" ? { prepareStep: (messages: readonly ModelMessage[]) => mergeAdjacentUserMessages(messages) } : {}),
+    ...(mode === "gemini-native" && !deferMerge ? { prepareStep: (messages: readonly ModelMessage[]) => mergeAdjacentUserMessages(messages) } : {}),
   };
 }
 
@@ -1063,7 +1156,7 @@ function inlineFragmentCount(config: Config): number {
  * older ones live in the fragment store and are recalled on demand. Every summary is emitted as a
  * leading system entry before any non-system content.
  */
-function createSummaryHistoryPlugin(inlineFragments: number): AgentPlugin {
+function createSummaryHistoryPlugin(inlineFragments: number, projection?: AgentRequestProjection): AgentPlugin {
   return {
     name: "core.compact-history",
     enforce: "pre",
@@ -1074,8 +1167,8 @@ function createSummaryHistoryPlugin(inlineFragments: number): AgentPlugin {
       const resident = entries
         .filter((entry): entry is Extract<AgentEntry, { type: "compact" }> => entry.type === "compact")
         .slice(-Math.max(1, inlineFragments));
-      const summaries = resident.map((compact) =>
-        createEntry(
+      const summaries = resident.map((compact) => {
+        const entry = createEntry(
           "message",
           createSystemMessage(
             formatResidentCompactFragment(
@@ -1094,8 +1187,10 @@ function createSummaryHistoryPlugin(inlineFragments: number): AgentPlugin {
             },
           ),
           { id: compact.id, timestamp: compact.timestamp },
-        ),
-      );
+        );
+        projection?.register(entry.data, { kind: "summary", sourceEntryIds: [compact.id], timestamp: compact.timestamp });
+        return entry;
+      });
       const preservedBeforeCompact = entries.slice(boundary.tailStartIndex, boundary.compactIndex).filter((entry) => entry.type !== "compact");
       const afterCompact = entries.slice(boundary.compactIndex + 1);
       return [...summaries, ...preservedBeforeCompact, ...afterCompact];

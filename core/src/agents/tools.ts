@@ -3,9 +3,12 @@ import { generateText, type LanguageModel } from "ai";
 import { h, type Bot, type Element } from "koishi";
 
 import type { PacingConfig } from "../config.js";
+import { ContextSourceError } from "../conversations/context-blocks.js";
 import type { CompartmentExpansionRecord, Conversation } from "../conversations/index.js";
 import { parseReply } from "../messages/index.js";
 import { detectImageMediaType, prepareOutputSegments, ResourceReadError, type ChannelResources } from "../resources/index.js";
+import { ContextBudgetError } from "../runtimes/context-budget.js";
+import type { ContextWorkspace, ContextBlocksInput, ContextLoadInput } from "../runtimes/context-workspace.js";
 import { buildPolisherTurnContext, validatePolishedMessages, type PolisherTurnContext } from "./polisher.js";
 
 const READ_MAX_TEXT_CHARS = 30_000;
@@ -311,6 +314,65 @@ export function createReadTool(
       };
     },
   };
+}
+
+export function createContextWorkspaceTools(workspace: ContextWorkspace): AgentTool[] {
+  const run = async (operation: () => Promise<unknown>) => {
+    try {
+      return await operation();
+    } catch (cause) {
+      return {
+        ok: false,
+        error: {
+          name: "ContextWorkspaceError",
+          code: cause instanceof ContextSourceError || cause instanceof ContextBudgetError ? cause.code : "ContextReadFailed",
+        },
+      };
+    }
+  };
+  return [
+    {
+      name: "ctx_blocks",
+      description: "只读分页浏览当前会话可访问的历史块及加载状态。query 是词法搜索；无 query 可浏览。摘要不是原文证据，summary-only 无原文边界。",
+      inputSchema: jsonSchema<ContextBlocksInput>({
+        type: "object",
+        properties: {
+          query: { type: "string", maxLength: 1024 },
+          cursor: { type: "string", maxLength: 256 },
+          limit: { type: "integer", minimum: 1, maximum: 20 },
+        },
+        additionalProperties: false,
+      }),
+      execute: (input: ContextBlocksInput) => run(() => workspace.blocks(input)),
+    },
+    {
+      name: "ctx_load",
+      description:
+        "将 ctx_blocks 给出的一个历史块原文页加载到后续模型步骤的只读上下文。每块仅一页，新页替换旧页；回执无正文。加载可能因预算或到期被淘汰，可用 ctx_blocks 核对。不会修改原始历史或发送消息。",
+      inputSchema: jsonSchema<ContextLoadInput>({
+        type: "object",
+        properties: {
+          blockId: { type: "string", minLength: 1, maxLength: 256 },
+          cursor: { type: "string", maxLength: 256 },
+          limit: { type: "integer", minimum: 1, maximum: 50 },
+        },
+        required: ["blockId"],
+        additionalProperties: false,
+      }),
+      execute: (input: ContextLoadInput) => run(() => workspace.load(input)),
+    },
+    {
+      name: "ctx_release",
+      description: "释放已加载的历史块页，后续步骤不再驻留该正文。重复释放幂等；原文和摘要不删除。",
+      inputSchema: jsonSchema<{ blockId: string }>({
+        type: "object",
+        properties: { blockId: { type: "string", minLength: 1, maxLength: 256 } },
+        required: ["blockId"],
+        additionalProperties: false,
+      }),
+      execute: (input: { blockId: string }) => run(() => workspace.release(input.blockId)),
+    },
+  ];
 }
 
 async function describeImageBytes(options: {

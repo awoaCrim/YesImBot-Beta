@@ -20,7 +20,17 @@ describe("Config schema", () => {
 
     expect(sessionGroup).toBeDefined();
     expect(sessionGroup?.type).toBe("object");
-    expect(Object.keys(sessionGroup?.dict ?? {})).toEqual(["compact", "archive"]);
+    expect(Object.keys(sessionGroup?.dict ?? {})).toEqual(["compact", "archive", "magicContext"]);
+  });
+
+  it("keeps Magic Context disabled for old configurations and accepts compartment opt-in", () => {
+    const resolved = Config({ chatModel: "test:model" } as never) as { session: { magicContext: { enabled: boolean } } };
+    expect(resolved.session.magicContext.enabled).toBe(false);
+    const enabled = Config({
+      chatModel: "test:model",
+      session: { compact: { mode: "compartment" }, magicContext: { enabled: true, contextWindow: 50_000 } },
+    } as never) as { session: { magicContext: { enabled: boolean; contextWindow: number } } };
+    expect(enabled.session.magicContext).toMatchObject({ enabled: true, contextWindow: 50_000 });
   });
 
   it("defaults custom inner thought to disabled", () => {
