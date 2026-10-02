@@ -35,6 +35,8 @@ import { createTurnQueue, TurnResult, type AgentHistoryMode, type AgentWaitOptio
 
 const DEFAULT_MAX_STEPS = 20;
 const MAX_MODEL_RETRIES = 5;
+const TERMINAL_TOOL_RECOVERY_PROMPT =
+  "The previous step used a non-terminal tool and stopped before completing the turn. Continue now by calling exactly one available terminal tool. Use send_message with continue omitted or false, or call finish. Do not call an intermediate tool and do not reply with assistant text; this is an internal repair step.";
 
 const RETRYABLE_429_ONLY_MIDDLEWARE: LanguageModelMiddleware = {
   specificationVersion: "v3",
@@ -104,7 +106,8 @@ export interface AgentConfig {
   maxOutputTokens?: number | ((model: LanguageModel) => number);
   /**
    * Rejects a turn that never produced a terminal tool call instead of settling it as successful.
-   * Defaults to `false` so existing callers keep their current turn semantics.
+   * If an intermediate tool already ran, the runtime allows one request-only terminal repair before
+   * failing. Defaults to `false` so existing callers keep their current turn semantics.
    */
   requireTerminalTool?: boolean;
   initialState?: AgentState;
@@ -524,23 +527,40 @@ export function createAgent(config: AgentConfig): Agent {
     let sawTerminalToolCall = false;
     let sawIntermediateToolCall = false;
     let sawNonEmptyText = false;
+    let runTerminalRecovery = false;
+    let terminalRecoveryAttempted = false;
+    let nextTurnStepNumber = 0;
 
     try {
       await ensureInit();
       isTerminalToolCall = createTerminalToolCallMatcher(frozenTools);
+      const terminalToolNames = new Set(frozenTools.filter((tool) => tool.terminal === true || typeof tool.terminal === "function").map((tool) => tool.name));
       await emitInternal({ type: "turn.start", turnId: request.turnId });
 
-      while (currentBatch.length > 0) {
-        const currentEntries = await persistCurrentMessages(currentBatch, request.turnId);
+      while (currentBatch.length > 0 || runTerminalRecovery) {
+        const isTerminalRecovery = runTerminalRecovery;
+        runTerminalRecovery = false;
+
+        const currentEntries = isTerminalRecovery ? [] : await persistCurrentMessages(currentBatch, request.turnId);
         rememberLiveEntries(currentEntries);
         allMessages.push(...currentEntries.map((entry) => entry.data));
 
-        const modelMessages = await buildBoundaryModelMessages(request.turnId, currentEntries, liveTurnEntries, abortSignal, request.historyMode);
+        const baseModelMessages = await buildBoundaryModelMessages(request.turnId, currentEntries, liveTurnEntries, abortSignal, request.historyMode);
+        const recoveryMessage: ModelMessage | undefined = isTerminalRecovery ? { role: "user", content: TERMINAL_TOOL_RECOVERY_PROMPT } : undefined;
+        const prepareRequestMessages = (messages: readonly ModelMessage[]): ModelMessage[] => {
+          if (!recoveryMessage) return [...messages];
+          return [...messages.filter((message) => !(message.role === "user" && message.content === TERMINAL_TOOL_RECOVERY_PROMPT)), recoveryMessage];
+        };
+        const modelMessages = prepareRequestMessages(baseModelMessages);
 
         let aborted = false;
         let persistedResponseMessageCount = 0;
         const retry = prepareRetryModel(model, maxRetries);
-        const effectiveTools = { ...toAiToolSet(resolveTools(request.turnId, () => allMessages, abortSignal)), ...frozenProviderTools };
+        const resolvedTools = toAiToolSet(resolveTools(request.turnId, () => allMessages, abortSignal));
+        const effectiveTools: ToolSet = isTerminalRecovery
+          ? Object.fromEntries(Object.entries(resolvedTools).filter(([name]) => terminalToolNames.has(name)))
+          : { ...resolvedTools, ...frozenProviderTools };
+        const requestToolChoice = isTerminalRecovery ? "required" : config.toolChoice;
         const outputCap = () => (typeof config.maxOutputTokens === "function" ? config.maxOutputTokens(retry.model) : config.maxOutputTokens);
         const response = streamText({
           model: retry.model,
@@ -548,8 +568,10 @@ export function createAgent(config: AgentConfig): Agent {
           messages: modelMessages,
           tools: effectiveTools,
           ...(config.maxOutputTokens === undefined ? {} : { maxOutputTokens: outputCap() }),
-          ...(config.toolChoice ? { toolChoice: config.toolChoice } : {}),
-          stopWhen: [isLoopFinished(), stepCountIs(maxSteps), allToolCallsTerminal(frozenTools)],
+          ...(requestToolChoice ? { toolChoice: requestToolChoice } : {}),
+          stopWhen: isTerminalRecovery
+            ? [stepCountIs(1), allToolCallsTerminal(frozenTools)]
+            : [isLoopFinished(), stepCountIs(maxSteps), allToolCallsTerminal(frozenTools)],
           abortSignal,
           prepareStep: async ({ stepNumber }) => {
             let messages = modelMessages;
@@ -574,16 +596,22 @@ export function createAgent(config: AgentConfig): Agent {
               stepNumber,
               signal: abortSignal,
             };
-            const prepared = await pluginHost.helpers.prepareStep(messages, prepareContext);
+            const prepared = prepareRequestMessages(await pluginHost.helpers.prepareStep(messages, prepareContext));
             const guard = config.beforeModelRequest;
-            if (!guard) return { messages: [...prepared], ...(config.maxOutputTokens === undefined ? {} : { maxOutputTokens: outputCap() }) };
+            if (!guard) {
+              return {
+                messages: prepared,
+                ...(requestToolChoice ? { toolChoice: requestToolChoice } : {}),
+                ...(config.maxOutputTokens === undefined ? {} : { maxOutputTokens: outputCap() }),
+              };
+            }
 
             const guarded = await guard({
               model: retry.model,
               system: frozenSystemPrompt,
               messages: prepared,
               tools: effectiveTools,
-              ...(config.toolChoice ? { toolChoice: config.toolChoice } : {}),
+              ...(requestToolChoice ? { toolChoice: requestToolChoice } : {}),
               currentMessageIds: [...liveTurnEntries.keys()],
               ...(config.requestProjection ? { projection: config.requestProjection, historyMode: request.historyMode } : {}),
               turnId: request.turnId,
@@ -597,10 +625,15 @@ export function createAgent(config: AgentConfig): Agent {
                   abortSignal,
                   request.historyMode,
                 );
-                return pluginHost.helpers.prepareStep(rebuilt, prepareContext);
+                const rebuiltPrepared = await pluginHost.helpers.prepareStep(prepareRequestMessages(rebuilt), prepareContext);
+                return prepareRequestMessages(rebuiltPrepared);
               },
             });
-            return { messages: [...(guarded ?? prepared)], ...(config.maxOutputTokens === undefined ? {} : { maxOutputTokens: outputCap() }) };
+            return {
+              messages: prepareRequestMessages(guarded ?? prepared),
+              ...(requestToolChoice ? { toolChoice: requestToolChoice } : {}),
+              ...(config.maxOutputTokens === undefined ? {} : { maxOutputTokens: outputCap() }),
+            };
           },
           maxRetries: retry.maxRetries,
           onAbort() {
@@ -644,7 +677,7 @@ export function createAgent(config: AgentConfig): Agent {
             await emitInternal({
               type: "turn.step",
               turnId: request.turnId,
-              step: step.stepNumber,
+              step: nextTurnStepNumber++,
               usage: step.usage,
               finishReason: step.finishReason,
               reasoningText: step.reasoningText,
@@ -671,6 +704,21 @@ export function createAgent(config: AgentConfig): Agent {
         }
 
         currentBatch = await request.drainJoined();
+        // A provider may stop after executing an intermediate tool without starting another model
+        // step. Give it one ephemeral terminal-only request, without persisting a synthetic user
+        // message; a second miss still reaches the protocol failure below.
+        if (
+          !isTerminalRecovery &&
+          !terminalRecoveryAttempted &&
+          config.requireTerminalTool &&
+          !sawTerminalToolCall &&
+          sawIntermediateToolCall &&
+          currentBatch.length === 0 &&
+          terminalToolNames.size > 0
+        ) {
+          terminalRecoveryAttempted = true;
+          runTerminalRecovery = true;
+        }
       }
 
       if (config.requireTerminalTool && !sawTerminalToolCall) {
