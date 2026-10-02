@@ -103,8 +103,8 @@ export function renderContinuitySourceChunks(entries: readonly AgentEntry[]): st
     if (current) chunks.push(current);
     current = "";
   };
-  for (const line of rendered.split("\\n")) {
-    const candidate = current ? `${current}\\n${line}` : line;
+  for (const line of rendered.split("\n")) {
+    const candidate = current ? `${current}\n${line}` : line;
     if (Buffer.byteLength(candidate, "utf8") <= MAX_CONTINUITY_SOURCE_BYTES) {
       current = candidate;
       continue;

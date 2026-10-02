@@ -237,8 +237,33 @@ describe("context workspace", () => {
     await f.workspace.load({ blockId: id });
 
     const oversized: ModelMessage = { role: "assistant", content: "x".repeat(43_500) };
-    await expect(f.workspace.guard(context(f, "pressure", 1, [oversized]))).rejects.toThrow("ContextContinuityUnavailable");
+    const messages = await f.workspace.guard(context(f, "pressure", 1, [oversized]));
+    expect(messages.some((message) => String(message.content).includes("<continuity_state"))).toBe(false);
     expect(f.workspace.status().loadedBlocks).toBe(1);
+  });
+
+  it("does not fail the provider turn when continuity admission cannot fit a raw fallback", async () => {
+    const f = await fixture(
+      Array.from({ length: 30 }, (_, index) => `历史${index}:` + "x".repeat(1800)),
+      { continuityModel: modelWithText("not-json") },
+    );
+    const agent = createAgent({
+      model: f.model,
+      storage: f.conversation.storage,
+      requestProjection: f.projection,
+      beforeModelRequest: (request) => f.workspace.guard(request),
+      plugins: [
+        {
+          name: "pressure",
+          prepareStep(messages) {
+            return [...messages, { role: "assistant", content: "x".repeat(43_500) }];
+          },
+        },
+      ],
+    });
+    const events = await Array.fromAsync(agent.run(createUserMessage("正常请求")));
+    expect(events.at(-1)).toMatchObject({ type: "turn.done" });
+    expect(f.calls).toHaveLength(1);
   });
 
   it("uses matching provider usage as the calibration source in either direction", async () => {
