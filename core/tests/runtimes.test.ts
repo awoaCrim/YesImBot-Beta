@@ -1423,7 +1423,7 @@ describe("ChannelRuntime provider-usage compaction", () => {
   });
 
   it.each([
-    ["exactly at the threshold", 100_000],
+    ["exactly at the threshold", 150_000],
     ["without usage", undefined],
     ["with non-finite usage", Number.NaN],
     ["with negative usage", -1],
@@ -1442,10 +1442,10 @@ describe("ChannelRuntime provider-usage compaction", () => {
     }
   });
 
-  it("compacts when a provider response reports more than 100,000 input tokens", async () => {
+  it("compacts when a provider response reports more than 150,000 input tokens", async () => {
     const { value, channel, root } = await createResponseRuntime();
     const compact = vi.spyOn(channel.conversation, "compact").mockResolvedValue({ compacted: true });
-    state.run.mockReturnValue(completedPromptUsageReply([100_001]));
+    state.run.mockReturnValue(completedPromptUsageReply([150_001]));
     try {
       const result = await value.post(event);
       if (result.kind === "run") await result.done;
@@ -1467,7 +1467,7 @@ describe("ChannelRuntime provider-usage compaction", () => {
     );
     const { value, channel, root } = await createResponseRuntime();
     const compact = vi.spyOn(channel.conversation, "compact").mockResolvedValue({ compacted: true });
-    state.run.mockReturnValue(completedPromptUsageReply([100_001]));
+    state.run.mockReturnValue(completedPromptUsageReply([150_001]));
     try {
       const result = await value.post(event);
       if (result.kind === "run") await result.done;
@@ -1494,7 +1494,7 @@ describe("ChannelRuntime provider-usage compaction", () => {
     );
     const { value, channel, root } = await createResponseRuntime();
     const compact = vi.spyOn(channel.conversation, "compact");
-    state.run.mockReturnValue(completedPromptUsageReply([100_001]));
+    state.run.mockReturnValue(completedPromptUsageReply([150_001]));
     try {
       const result = await value.post(event);
       if (result.kind === "run") await result.done;
@@ -1514,7 +1514,7 @@ describe("ChannelRuntime provider-usage compaction", () => {
   it("shares an in-flight manual compact instead of starting another for provider usage", async () => {
     const { value, channel, root } = await createResponseRuntime();
     const compact = vi.spyOn(channel.conversation, "compact").mockResolvedValue({ compacted: true });
-    state.run.mockReturnValue(completedPromptUsageReply([100_001]));
+    state.run.mockReturnValue(completedPromptUsageReply([150_001]));
     try {
       const result = await value.post(event);
       const manual = value.compact("manual");
@@ -1543,7 +1543,7 @@ describe("ChannelRuntime provider-usage compaction", () => {
       .spyOn(channel.conversation, "compact")
       .mockResolvedValueOnce({ compacted: false, reason: "busy" })
       .mockResolvedValueOnce({ compacted: true });
-    state.run.mockReturnValue(completedPromptUsageReply([100_001]));
+    state.run.mockReturnValue(completedPromptUsageReply([150_001]));
     try {
       const result = await value.post(event);
       const manual = value.compact("manual");
@@ -1569,7 +1569,7 @@ describe("ChannelRuntime provider-usage compaction", () => {
       .spyOn(channel.conversation, "compact")
       .mockRejectedValueOnce(new Error("manual compact failed"))
       .mockResolvedValueOnce({ compacted: true });
-    state.run.mockReturnValue(completedPromptUsageReply([100_001]));
+    state.run.mockReturnValue(completedPromptUsageReply([150_001]));
     try {
       const result = await value.post(event);
       const manual = value.compact("manual");
@@ -1591,7 +1591,7 @@ describe("ChannelRuntime provider-usage compaction", () => {
   it("coalesces multiple over-limit model steps into one compact", async () => {
     const { value, channel, root } = await createResponseRuntime();
     const compact = vi.spyOn(channel.conversation, "compact").mockResolvedValue({ compacted: true });
-    state.run.mockReturnValue(completedPromptUsageReply([100_001, 115_000]));
+    state.run.mockReturnValue(completedPromptUsageReply([150_001, 155_000]));
     try {
       const result = await value.post(event);
       if (result.kind === "run") await result.done;
@@ -1623,7 +1623,7 @@ describe("ChannelRuntime provider-usage compaction", () => {
   it("does not schedule another compact when the compact operation fails", async () => {
     const { value, channel, root } = await createResponseRuntime();
     const compact = vi.spyOn(channel.conversation, "compact").mockRejectedValue(new Error("compact unavailable"));
-    state.run.mockReturnValue(completedPromptUsageReply([100_001]));
+    state.run.mockReturnValue(completedPromptUsageReply([150_001]));
     try {
       const result = await value.post(event);
       if (result.kind === "run") await result.done;

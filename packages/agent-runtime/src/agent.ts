@@ -56,7 +56,15 @@ const RETRYABLE_429_ONLY_MIDDLEWARE: LanguageModelMiddleware = {
   },
 };
 
-export type AgentModelRequestGuard = (context: AgentModelRequestContext) => Promise<readonly ModelMessage[] | void>;
+export type AgentModelRequestGuardResult =
+  | readonly ModelMessage[]
+  | {
+      readonly messages: readonly ModelMessage[];
+      /** Optional per-step tool allow-list, applied by the AI SDK prepareStep boundary. */
+      readonly activeTools?: readonly string[];
+    };
+
+export type AgentModelRequestGuard = (context: AgentModelRequestContext) => Promise<AgentModelRequestGuardResult | void>;
 
 export interface AgentSendOptions {
   ifBusy?: "defer" | "join" | "reject";
@@ -629,8 +637,11 @@ export function createAgent(config: AgentConfig): Agent {
                 return prepareRequestMessages(rebuiltPrepared);
               },
             });
+            const guardedObject = !Array.isArray(guarded) && guarded ? (guarded as Exclude<AgentModelRequestGuardResult, readonly ModelMessage[]>) : undefined;
+            const guardedMessages = guardedObject?.messages ?? (Array.isArray(guarded) ? guarded : prepared);
             return {
-              messages: prepareRequestMessages(guarded ?? prepared),
+              messages: prepareRequestMessages(guardedMessages),
+              ...(guardedObject?.activeTools === undefined ? {} : { activeTools: [...guardedObject.activeTools] }),
               ...(requestToolChoice ? { toolChoice: requestToolChoice } : {}),
               ...(config.maxOutputTokens === undefined ? {} : { maxOutputTokens: outputCap() }),
             };

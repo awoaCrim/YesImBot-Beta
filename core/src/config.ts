@@ -75,7 +75,7 @@ export const Config: Schema<Config> = Schema.intersect([
         maxLoadedBlocks: finiteInteger(1, 4).default(4).description("同时驻留的历史块数；每块仅一页"),
         pageTokenBudget: finiteInteger(128, 4096).default(4096).description("每页文本的估算预算；仍须满足总历史预算"),
         retainTurns: finiteInteger(0, 2).default(2).description("加载当轮之后继续保留的正常会话轮数"),
-        mediaReserveTokens: finiteInteger(1).description("显式非文本媒体预算；未配置时新预算路径拒绝不可计量媒体"),
+        mediaReserveTokens: finiteInteger(1).description("兼容旧配置；媒体 payload 不计入本地文本预算"),
       }).description("Magic Context（默认关闭）"),
     }).description("会话管理"),
   }),
@@ -119,6 +119,7 @@ export interface MagicContextConfig {
   maxLoadedBlocks: number;
   pageTokenBudget: number;
   retainTurns: number;
+  /** Deprecated compatibility field; media payloads are not locally budgeted. */
   mediaReserveTokens?: number;
 }
 

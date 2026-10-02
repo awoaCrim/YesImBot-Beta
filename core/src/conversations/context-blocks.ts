@@ -9,15 +9,18 @@ import { collectDeliveredSourceRecords } from "./internal-history.js";
 
 export type CompactEntry = Extract<AgentEntry, { type: "compact" }>;
 
+export type ContinuityEntry = Extract<AgentEntry, { type: "continuity" }>;
+
 type Cursor =
   | { kind: "page"; blockId: string; fingerprint: string; record: number; offset: number }
   | { kind: "list"; fingerprint: string; query: string; offset: number };
 
-/** Archive bodies are read on demand; the persistent-source cache holds compact metadata only. */
+/** Archive bodies are read on demand; the persistent-source cache holds compact/continuity metadata only. */
 export interface ContextSourceSnapshot {
   readonly sessionId: string;
   readonly entries: readonly AgentEntry[];
   readonly compacts: readonly CompactEntry[];
+  readonly continuities?: readonly ContinuityEntry[];
   readonly sessionIds: readonly string[];
   readSession(sessionId: string): Promise<readonly AgentEntry[]>;
 }

@@ -2,10 +2,18 @@ import { type AgentEntry, type AgentModelRequestContext, type AgentRequestProjec
 import type { LanguageModel, ModelMessage } from "ai";
 
 import type { MagicContextConfig } from "../config.js";
-import { ContextBlockStore, ContextSourceError, type ContextBlockPage } from "../conversations/context-blocks.js";
+import { formatContinuityState } from "../conversations/compact.js";
+import { ContextBlockStore, ContextSourceError, type ContextBlockPage, type ContinuityEntry } from "../conversations/context-blocks.js";
 import { escapeXmlText } from "../conversations/fragment-store.js";
 import type { Conversation } from "../conversations/index.js";
-import { estimateContextBase, estimateContextMessage, planContextRequest, resolveContextBudget, type ContextBudget } from "./context-budget.js";
+import {
+  estimateContextBase,
+  estimateContextMessage,
+  planContextRequest,
+  resolveContextBudget,
+  type ContextBudget,
+  type ContextBudgetPlan,
+} from "./context-budget.js";
 
 export type ContextBlocksInput = { query?: string; cursor?: string; limit?: number };
 
@@ -17,6 +25,8 @@ export interface ContextWorkspaceOptions {
   readonly config: Partial<MagicContextConfig>;
   readonly compactMode?: string;
   readonly model: LanguageModel;
+  /** Existing compact model, or the primary model as a channel-level fallback. */
+  readonly continuityModel?: LanguageModel;
   readonly modelLimit?: { context: number; output: number };
   readonly resolveModelLimit?: (model: LanguageModel) => { context: number; output: number } | undefined;
   readonly mergeMessages?: (messages: readonly ModelMessage[]) => ModelMessage[];
@@ -128,17 +138,85 @@ export class ContextWorkspace {
     const system = history.filter((message) => message.role === "system");
     const dialogue = history.filter((message) => message.role !== "system");
     const candidate = [...system, ...(this.eventOnly ? [] : [notice]), ...pageMessages, ...dialogue];
-    const base = await estimateContextBase(context, this.budget.mediaReserveTokens);
+    const base = await estimateContextBase(context);
     this.checkGeneration(generation);
-    const plan = planContextRequest({ messages: candidate, projection: this.projection }, this.budget, base, this.multiplier, {
+    let plan = planContextRequest({ messages: candidate, projection: this.projection }, this.budget, base, this.multiplier, {
       // Provider-reported inputTokens is authoritative after a request. The local estimate still
       // removes optional history, but it must not reject a request solely because it overestimates
       // protected content before the provider has measured the final prompt.
       enforceBudget: false,
     });
-    for (const id of plan.evictedBlockIds) this.remove(id, "evicted");
+
+    // The request planner is pure. Do not mutate loaded-page residency until the continuity bridge
+    // has either been persisted or a bounded raw fallback has been admitted.
+    let continuityFailed = false;
+    let committedEvictedBlockIds = new Set(plan.evictedBlockIds);
+    const affectedSourceIds = removedContinuitySourceIds(plan);
+    const continuityModel = this.options.continuityModel;
+    if (!this.eventOnly && continuityModel && affectedSourceIds.size > 0) {
+      let continuity: ContinuityEntry | undefined;
+      try {
+        const ensured = await this.conversation.ensureContinuity({
+          model: continuityModel,
+          sourceEntryIds: [...affectedSourceIds],
+          signal: context.signal,
+        });
+        this.checkGeneration(generation);
+        continuity = ensured.entry;
+      } catch (cause) {
+        continuityFailed = true;
+        if (context.signal.aborted || (cause instanceof ContextSourceError && (cause.code === "StaleContextRead" || cause.code === "ContextStopped")))
+          throw cause;
+        const fallback = planContextRequest({ messages: candidate, projection: this.projection }, this.budget, base, this.multiplier, {
+          enforceBudget: false,
+          preserveSourceEntryIds: affectedSourceIds,
+        });
+        const fallbackMessages = this.options.mergeMessages ? this.options.mergeMessages(fallback.messages) : [...fallback.messages];
+        const fallbackEstimate = Math.ceil((base + fallbackMessages.reduce((sum, message) => sum + estimateContextMessage(message), 0)) * this.multiplier);
+        const fallbackHistory = fallback.estimatedHistoryTokens;
+        if (fallbackEstimate <= this.budget.inputTokens && fallbackHistory <= this.budget.historyTokens) {
+          plan = fallback;
+        } else {
+          throw new ContextSourceError("ContextContinuityUnavailable");
+        }
+      }
+
+      if (continuity) {
+        const continuityMessage: ModelMessage = { role: "system", content: formatContinuityState(continuity.data, continuity.id, continuity.timestamp) };
+        this.projection.register(continuityMessage, {
+          kind: "continuity",
+          sourceEntryIds: [continuity.id],
+          timestamp: continuity.timestamp,
+        });
+        const firstDialogue = plan.messages.findIndex((message) => message.role !== "system");
+        const insertion = firstDialogue < 0 ? plan.messages.length : firstDialogue;
+        const withContinuity = [...plan.messages.slice(0, insertion), continuityMessage, ...plan.messages.slice(insertion)];
+        const retainedSourceIds = retainedOptionalSourceIds(plan.messages, this.projection);
+        retainedSourceIds.add(continuity.id);
+        const replanned = planContextRequest({ messages: withContinuity, projection: this.projection }, this.budget, base, this.multiplier, {
+          enforceBudget: false,
+          preserveSourceEntryIds: retainedSourceIds,
+        });
+        if (replanned.messages.includes(continuityMessage)) {
+          for (const id of replanned.evictedBlockIds) committedEvictedBlockIds.add(id);
+          plan = replanned;
+        } else {
+          continuityFailed = true;
+          const fallback = planContextRequest({ messages: candidate, projection: this.projection }, this.budget, base, this.multiplier, {
+            enforceBudget: false,
+            preserveSourceEntryIds: affectedSourceIds,
+          });
+          const fallbackMessages = this.options.mergeMessages ? this.options.mergeMessages(fallback.messages) : [...fallback.messages];
+          const fallbackEstimate = Math.ceil((base + fallbackMessages.reduce((sum, message) => sum + estimateContextMessage(message), 0)) * this.multiplier);
+          if (fallbackEstimate <= this.budget.inputTokens && fallback.estimatedHistoryTokens <= this.budget.historyTokens) plan = fallback;
+          else throw new ContextSourceError("ContextContinuityUnavailable");
+        }
+      }
+    }
+
+    if (!continuityFailed) for (const id of committedEvictedBlockIds) this.remove(id, "evicted");
     const final = this.options.mergeMessages ? this.options.mergeMessages(plan.messages) : [...plan.messages];
-    const rawEstimate = base + final.reduce((sum, message) => sum + estimateContextMessage(message, this.budget.mediaReserveTokens), 0);
+    const rawEstimate = base + final.reduce((sum, message) => sum + estimateContextMessage(message), 0);
     this.lastEstimate = Math.ceil(rawEstimate * this.multiplier);
     this.lastMandatory = plan.mandatoryInputTokens;
     this.lastMandatoryHistory = plan.mandatoryHistoryTokens;
@@ -352,6 +430,25 @@ export function formatContextPage(page: ContextBlockPage): ModelMessage {
       "</context_block>",
     ].join("\n"),
   };
+}
+
+function removedContinuitySourceIds(plan: ContextBudgetPlan): Set<string> {
+  const sourceIds = new Set<string>();
+  for (const unit of plan.removedUnits) {
+    if (unit.kind !== "history" && unit.kind !== "loaded") continue;
+    for (const id of unit.sourceEntryIds) sourceIds.add(id);
+  }
+  return sourceIds;
+}
+
+function retainedOptionalSourceIds(messages: readonly ModelMessage[], projection: AgentRequestProjection): Set<string> {
+  const sourceIds = new Set<string>();
+  for (const message of messages) {
+    const origin = projection.origin(message);
+    if (!origin || origin.kind === "mandatory" || origin.kind === "live" || origin.kind === "recall") continue;
+    for (const id of origin.sourceEntryIds) sourceIds.add(id);
+  }
+  return sourceIds;
 }
 
 function modelIdentity(model: LanguageModel): string {
