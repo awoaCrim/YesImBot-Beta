@@ -20,6 +20,8 @@ export * from "./media.js";
 
 export * from "./plugin.js";
 
+export * from "./request-projection.js";
+
 export * from "./state.js";
 
 export * from "./storage.js";

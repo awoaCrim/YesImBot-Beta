@@ -24,6 +24,7 @@ import type { AgentMessage } from "./message.js";
 import { buildModelMessages, createAssistantMessage, createToolMessage } from "./message.js";
 import type { AgentPlugin, AgentPluginRuntime, SystemPromptAppend, ToolHookContext } from "./plugin.js";
 import { createPluginHost, normalizeSystemPromptAppend } from "./plugin.js";
+import type { AgentRequestProjection } from "./request-projection.js";
 import type { AgentState } from "./state.js";
 import { AgentStateManager, createStateManager } from "./state.js";
 import type { AgentStorage } from "./storage.js";
@@ -68,6 +69,8 @@ export interface AgentModelRequestContext {
   readonly tools: ToolSet;
   readonly toolChoice?: "required";
   readonly currentMessageIds: readonly string[];
+  readonly projection?: AgentRequestProjection;
+  readonly historyMode?: AgentHistoryMode;
   readonly turnId: string;
   readonly stepNumber: number;
   readonly signal: AbortSignal;
@@ -95,6 +98,10 @@ export interface AgentConfig {
    * replaces the request for this step; throwing prevents the provider request.
    */
   beforeModelRequest?: AgentModelRequestGuard;
+  /** Optional request-only provenance for guards; no metadata is added to provider messages. */
+  requestProjection?: AgentRequestProjection;
+  /** Optional output cap. Absent preserves the provider's existing default. */
+  maxOutputTokens?: number | ((model: LanguageModel) => number);
   /**
    * Rejects a turn that never produced a terminal tool call instead of settling it as successful.
    * Defaults to `false` so existing callers keep their current turn semantics.
@@ -405,6 +412,23 @@ export function createAgent(config: AgentConfig): Agent {
     // The persisted-history projection may only see messages that predate this turn; current-turn
     // entries keep their raw assistant/tool pairing and must not be dropped as delivered output.
     const historicalEntries = persisted.filter((entry) => entry.type !== "message" || !liveEntries.has(entry.id));
+    const projection = config.requestProjection;
+    if (projection) {
+      for (const entry of historicalEntries) {
+        if (entry.type === "message")
+          projection.register(entry.data, {
+            kind: entry.data.role === "system" ? "mandatory" : "history",
+            sourceEntryIds: [entry.id],
+            timestamp: entry.timestamp,
+          });
+      }
+      for (const entry of liveEntries.values())
+        projection.register(entry.data, {
+          kind: "live",
+          sourceEntryIds: [entry.id],
+          timestamp: entry.timestamp,
+        });
+    }
     const projectedHistory = historyMode === "event" ? [] : await pluginHost.helpers.transformEntries(historicalEntries);
 
     // A projection may deliberately reorder persisted history (for example, moving a compact
@@ -416,8 +440,15 @@ export function createAgent(config: AgentConfig): Agent {
       .filter((entry): entry is Extract<AgentEntry, { type: "message" }> => entry.type === "message")
       .map((entry) => entry.data);
     const current = currentEntries.map((entry) => entry.data);
+    const live = [...liveEntries.values()].map((entry) => entry.data);
 
-    return buildModelMessages({ history, current, pluginHost, context: { runtime: { id }, channel, state, turnId, signal } });
+    return buildModelMessages({
+      history,
+      current,
+      live,
+      pluginHost,
+      context: { runtime: { id }, channel, state, turnId, signal, ...(projection ? { projection } : {}) },
+    });
   };
 
   const createTurnStream = (turnId: string): AsyncIterable<AgentInternalEvent> => {
@@ -510,11 +541,13 @@ export function createAgent(config: AgentConfig): Agent {
         let persistedResponseMessageCount = 0;
         const retry = prepareRetryModel(model, maxRetries);
         const effectiveTools = { ...toAiToolSet(resolveTools(request.turnId, () => allMessages, abortSignal)), ...frozenProviderTools };
+        const outputCap = () => (typeof config.maxOutputTokens === "function" ? config.maxOutputTokens(retry.model) : config.maxOutputTokens);
         const response = streamText({
           model: retry.model,
           system: frozenSystemPrompt,
           messages: modelMessages,
           tools: effectiveTools,
+          ...(config.maxOutputTokens === undefined ? {} : { maxOutputTokens: outputCap() }),
           ...(config.toolChoice ? { toolChoice: config.toolChoice } : {}),
           stopWhen: [isLoopFinished(), stepCountIs(maxSteps), allToolCallsTerminal(frozenTools)],
           abortSignal,
@@ -533,6 +566,7 @@ export function createAgent(config: AgentConfig): Agent {
             }
 
             const prepareContext = {
+              ...(config.requestProjection ? { projection: config.requestProjection } : {}),
               runtime: { id },
               channel,
               state,
@@ -542,7 +576,7 @@ export function createAgent(config: AgentConfig): Agent {
             };
             const prepared = await pluginHost.helpers.prepareStep(messages, prepareContext);
             const guard = config.beforeModelRequest;
-            if (!guard) return { messages: [...prepared] };
+            if (!guard) return { messages: [...prepared], ...(config.maxOutputTokens === undefined ? {} : { maxOutputTokens: outputCap() }) };
 
             const guarded = await guard({
               model: retry.model,
@@ -551,6 +585,7 @@ export function createAgent(config: AgentConfig): Agent {
               tools: effectiveTools,
               ...(config.toolChoice ? { toolChoice: config.toolChoice } : {}),
               currentMessageIds: [...liveTurnEntries.keys()],
+              ...(config.requestProjection ? { projection: config.requestProjection, historyMode: request.historyMode } : {}),
               turnId: request.turnId,
               stepNumber,
               signal: abortSignal,
@@ -565,7 +600,7 @@ export function createAgent(config: AgentConfig): Agent {
                 return pluginHost.helpers.prepareStep(rebuilt, prepareContext);
               },
             });
-            return { messages: [...(guarded ?? prepared)] };
+            return { messages: [...(guarded ?? prepared)], ...(config.maxOutputTokens === undefined ? {} : { maxOutputTokens: outputCap() }) };
           },
           maxRetries: retry.maxRetries,
           onAbort() {

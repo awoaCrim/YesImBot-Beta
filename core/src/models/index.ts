@@ -217,6 +217,13 @@ export class ModelService {
     };
   }
 
+  /** Limits for the actual registry-wrapped model, including a plugin-selected quota route. */
+  public contextLimit(model: LanguageModel): ChatModelConfig["limit"] {
+    const id = typeof model === "string" ? model : formatModelId(model.provider, model.modelId);
+    const limit = this.chatModels.get(id)?.config.limit;
+    return limit ? { ...limit } : undefined;
+  }
+
   public resolveAuxiliaryModel(purpose: AuxiliaryPurpose, context?: ChannelContext): AuxiliaryModelRef {
     const source = "config.auxiliaryModel" as const;
     const configured = this.config.auxiliaryModel;

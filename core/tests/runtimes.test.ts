@@ -38,6 +38,7 @@ vi.mock("@yesimbot/agent-runtime", async (original) => {
 });
 
 import { createAgent, createEntry, EphemeralImageProjectionStore } from "@yesimbot/agent-runtime";
+import { h } from "koishi";
 
 import { Agents } from "../src/agents/index.js";
 import { PolisherRegistry, type MessagePolisherCapability } from "../src/agents/polisher.js";
@@ -46,8 +47,9 @@ import type { Config } from "../src/config.js";
 import { createDeliveredTranscriptMessage } from "../src/conversations/delivered-transcript.js";
 import { MessageBatchRegistry, type MessageBatchInput, type MessageBatchPlugin } from "../src/message-batches/index.js";
 import { createMessage, type Event, type MessageRecord } from "../src/messages/index.js";
-import { ChannelRuntime, type ChannelRuntimeOptions } from "../src/runtimes/channel.js";
+import { ChannelRuntime, createModelInputPlugin, type ChannelRuntimeOptions } from "../src/runtimes/channel.js";
 import { resolveReadImagePolicy, Runtimes } from "../src/runtimes/index.js";
+import { PNG_BYTES } from "./helpers/index.js";
 
 const config: Config = {
   basePath: "/tmp",
@@ -221,6 +223,48 @@ describe("ChannelRuntime scheduling", () => {
     state.settleReservation.mockReset().mockResolvedValue(undefined);
     state.observe.mockReset();
   });
+  it("registers the working-set tools and final guard only after explicit compartment opt-in", async () => {
+    const { value, channel, root } = await runtime(undefined, {
+      session: { ...config.session, compact: { ...config.session.compact, mode: "compartment" }, magicContext: { enabled: true, contextWindow: 50_000 } },
+    });
+    try {
+      const enabled = vi.mocked(createAgent).mock.calls.at(-1)![0];
+      expect(enabled.tools?.map((tool) => tool.name)).toEqual(expect.arrayContaining(["ctx_expand", "ctx_blocks", "ctx_load", "ctx_release"]));
+      expect(enabled.beforeModelRequest).toBeTypeOf("function");
+      expect(enabled.requestProjection).toBeDefined();
+      expect(enabled.maxOutputTokens).toBeTypeOf("function");
+      expect(
+        () =>
+          new ChannelRuntime(new Context(), {
+            channel,
+            bot: { selfId: "bot" } as never,
+            will: {} as never,
+            model: {} as never,
+            readImagePolicy: { mode: "unavailable" },
+            config: {
+              ...config,
+              session: { ...config.session, compact: { ...config.session.compact, mode: "summary" }, magicContext: { enabled: true, contextWindow: 50_000 } },
+            },
+            plugins: [],
+          }),
+      ).toThrow("InvalidContextBudget");
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+    const legacy = await runtime();
+    try {
+      const disabled = vi.mocked(createAgent).mock.calls.at(-1)![0];
+      expect(disabled.tools?.map((tool) => tool.name)).not.toContain("ctx_load");
+      expect(disabled.beforeModelRequest).toBeUndefined();
+      expect(disabled.maxOutputTokens).toBeUndefined();
+      expect(disabled.requestProjection).toBeUndefined();
+    } finally {
+      await legacy.value.stop();
+      await rm(legacy.root, { recursive: true, force: true });
+    }
+  });
+
   it("passes provider-executed tools and retry configuration only to the main Agent", async () => {
     const providerTools = { web_search: { type: "provider", id: "test.web_search", inputSchema: {} as never } } as ToolSet;
     const { value, root } = await runtime(providerTools, { modelRetries: 3 });
@@ -259,6 +303,29 @@ describe("ChannelRuntime scheduling", () => {
       await value.stop();
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  it("projects direct image bytes for the current input and later live-turn continuations", async () => {
+    const assetId = "33333333333333333333333333333333";
+    const current = createMessage({ ...message("image-1", "443306717", 2), elements: [h("img", { id: assetId })] });
+    const resolveImage = vi.fn(async (id: string) => ({ bytes: new Uint8Array([1, 2, 3]), mediaType: id === assetId ? "image/png" : "image/jpeg" }));
+    const plugin = createModelInputPlugin("default", false, { resolveImage });
+
+    const first = await plugin.toModelMessages!(current, { history: [], current: [current], live: [current] } as never);
+    const continuation = await plugin.toModelMessages!(current, { history: [current], current: [], live: [current] } as never);
+    const firstContent = (Array.isArray(first) ? first[0] : first)?.content;
+    const continuationContent = (Array.isArray(continuation) ? continuation[0] : continuation)?.content;
+
+    expect(firstContent).toEqual([
+      { type: "text", text: expect.stringContaining("[CURRENT_MESSAGE]") },
+      { type: "image", image: new Uint8Array([1, 2, 3]), mediaType: "image/png" },
+      { type: "text", text: expect.stringContaining("[/CURRENT_MESSAGE]") },
+    ]);
+    expect(continuationContent).toEqual([
+      { type: "text", text: expect.stringContaining('id="image-1"') },
+      { type: "image", image: new Uint8Array([1, 2, 3]), mediaType: "image/png" },
+    ]);
+    expect(resolveImage).toHaveBeenCalledTimes(2);
   });
 
   it("drops delivered transcripts and merges adjacent user turns only in Gemini mode", async () => {
@@ -1982,6 +2049,17 @@ describe("Runtimes identity", () => {
       expect(read?.description).toContain("自动调用视觉模型");
       expect(read?.description).toContain("主模型不会接收原始图片字节");
       expect(read?.description).not.toContain("图片字节将随结果返回");
+
+      const assetId = await channel.resources.assets.put(PNG_BYTES);
+      const modelInput = (agentConfig?.plugins ?? []).find((plugin) => plugin.name === "core.model-input");
+      const current = createMessage({ ...message("direct-image", "user", 3), elements: [h("img", { id: assetId })] });
+      const projected = await modelInput?.toModelMessages?.(current, { history: [], current: [current], live: [current] } as never);
+      const content = (Array.isArray(projected) ? projected[0] : projected)?.content;
+      expect(content).toEqual(expect.arrayContaining([expect.objectContaining({ type: "image", mediaType: "image/png" })]));
+
+      const missing = createMessage({ ...message("missing-image", "user", 4), elements: [h("img", { id: "44444444444444444444444444444444" })] });
+      const failedProjection = await modelInput?.toModelMessages?.(missing, { history: [], current: [missing], live: [missing] } as never);
+      expect(String((Array.isArray(failedProjection) ? failedProjection[0] : failedProjection)?.content)).toContain("[图片：资源不存在]");
 
       await runtime.stop();
       await runtimes.stop();

@@ -83,6 +83,16 @@ export function renderCompressionRecords(entry: AgentEntry): CompressionRecord[]
   return records;
 }
 
+/** User-visible text for source pages; preserve indentation and omit all media payloads. */
+export function renderVisibleUserRecords(entry: AgentEntry): CompressionRecord[] {
+  if (entry.type !== "message" || entry.data.role !== "user") return renderCompressionRecords(entry).filter((record) => record.role === "user");
+  const text =
+    typeof entry.data.content === "string"
+      ? entry.data.content
+      : entry.data.content.map((part) => (part.type === "text" ? part.text : part.type === "image" ? "[图片]" : part.type === "file" ? "[文件]" : "")).join("");
+  return text.trim() ? [{ entryId: entry.id, timestamp: compactSourceTimestamp(entry), role: "user", text }] : [];
+}
+
 /**
  * Uniform `Asia/Shanghai` minute precision for both the compaction prompt and recalled-fragment
  * headers. Compaction must show the model when each fact happened; a summary without any time

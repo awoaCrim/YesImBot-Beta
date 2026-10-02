@@ -1,6 +1,14 @@
-import { createMessageEntry, type AgentAssistantMessage, type AgentEntry, type AgentPlugin, type AgentToolMessage } from "@yesimbot/agent-runtime";
+import {
+  createMessageEntry,
+  type AgentAssistantMessage,
+  type AgentEntry,
+  type AgentPlugin,
+  type AgentToolMessage,
+  type AgentRequestProjection,
+} from "@yesimbot/agent-runtime";
 
 import type { HistoryProjectionMode } from "../models/index.js";
+import { compactSourceTimestamp, type CompressionRecord } from "./compact.js";
 import { createDeliveredTranscriptMessage, isDeliveredTranscript, type DeliveredTranscriptData } from "./delivered-transcript.js";
 
 /**
@@ -29,15 +37,19 @@ interface LegacyMarkerProjection {
   readonly transcripts: readonly DeliveredTranscriptData[];
 }
 
-export function createInternalHistoryProjectionPlugin(mode: HistoryProjectionMode = "default"): AgentPlugin {
+export function createInternalHistoryProjectionPlugin(mode: HistoryProjectionMode = "default", projection?: AgentRequestProjection): AgentPlugin {
   return {
     name: "core.internal-history-projection",
     enforce: "pre",
-    transformEntries: (entries) => stripInternalAssistantInputs(entries, mode),
+    transformEntries: (entries) => stripInternalAssistantInputs(entries, mode, projection),
   };
 }
 
-export function stripInternalAssistantInputs(entries: readonly AgentEntry[], mode: HistoryProjectionMode = "default"): AgentEntry[] {
+export function stripInternalAssistantInputs(
+  entries: readonly AgentEntry[],
+  mode: HistoryProjectionMode = "default",
+  projection?: AgentRequestProjection,
+): AgentEntry[] {
   const sendResults = collectHistoricalSendResults(entries);
   const geminiSendCalls = mode === "gemini-native" ? collectSafeGeminiSendCalls(entries, sendResults) : new Map<string, readonly string[]>();
   const removedToolCallIds = new Set(
@@ -65,17 +77,23 @@ export function stripInternalAssistantInputs(entries: readonly AgentEntry[], mod
     }
 
     if (entry.data.role === "assistant") {
-      appendProjectedEntries(
-        projected,
-        transcripts,
-        stripAssistantEntry(entry as Extract<AgentEntry, { type: "message" }> & { data: AgentAssistantMessage }, sendResults, mode, geminiSendCalls),
+      const replacements = stripAssistantEntry(
+        entry as Extract<AgentEntry, { type: "message" }> & { data: AgentAssistantMessage },
+        sendResults,
+        mode,
+        geminiSendCalls,
       );
+      for (const replacement of replacements) if (replacement.type === "message") projection?.inherit(replacement.data, [entry.data]);
+      appendProjectedEntries(projected, transcripts, replacements);
       continue;
     }
 
     if (entry.data.role === "tool") {
       const data = stripToolContent(entry.data, removedToolCallIds, mode, geminiSendCalls);
-      if (data) projected.push(data === entry.data ? entry : { ...entry, data });
+      if (data) {
+        if (data !== entry.data) projection?.inherit(data, [entry.data]);
+        projected.push(data === entry.data ? entry : { ...entry, data });
+      }
       continue;
     }
 
@@ -91,6 +109,60 @@ export function stripInternalAssistantInputs(entries: readonly AgentEntry[], mod
     else dialogue.push(entry);
   }
   return [...systemEntries, ...transcripts, ...dialogue];
+}
+
+/** Public-output evidence used by block loading. No internal assistant text or failed send is exposed. */
+export function collectDeliveredSourceRecords(entries: readonly AgentEntry[]): ReadonlyMap<string, readonly CompressionRecord[]> {
+  const results = collectHistoricalSendResults(entries, true);
+  const counts = new Map<string, number>();
+  const resultPositions = new Map<string, number>();
+  for (const [index, entry] of entries.entries()) {
+    if (entry.type !== "message" || entry.data.role !== "tool" || !Array.isArray(entry.data.content)) continue;
+    for (const part of entry.data.content) {
+      if (part.type === "tool-result") {
+        counts.set(part.toolCallId, (counts.get(part.toolCallId) ?? 0) + 1);
+        resultPositions.set(part.toolCallId, index);
+      }
+    }
+  }
+  const callCounts = new Map<string, number>();
+  for (const entry of entries) {
+    if (entry.type !== "message" || entry.data.role !== "assistant" || !Array.isArray(entry.data.content)) continue;
+    for (const part of entry.data.content) if (part.type === "tool-call") callCounts.set(part.toolCallId, (callCounts.get(part.toolCallId) ?? 0) + 1);
+  }
+  const records = new Map<string, readonly CompressionRecord[]>();
+  for (const [index, entry] of entries.entries()) {
+    if (entry.type !== "message" || entry.data.role !== "assistant" || !Array.isArray(entry.data.content)) continue;
+    const output: CompressionRecord[] = [];
+    for (const part of entry.data.content) {
+      if (
+        part.type !== "tool-call" ||
+        part.toolName !== HISTORICAL_OUTPUT_TOOL_NAME ||
+        counts.get(part.toolCallId) !== 1 ||
+        callCounts.get(part.toolCallId) !== 1 ||
+        (resultPositions.get(part.toolCallId) ?? -1) <= index
+      )
+        continue;
+      const result = results.get(part.toolCallId);
+      if (!result || result.sentCount <= 0 || (!result.ok && (result.failedAt ?? 0) <= 0)) continue;
+      const messages = readHistoricalSendMessages(part.input);
+      if (!messages) continue;
+      // sent IDs count platform segments, not input messages. A partial receipt proves
+      // only inputs strictly before failedAt; even partially sent failed input is excluded.
+      const count = result.ok ? result.sentCount : result.failedAt!;
+      if ((result.ok && count !== messages.length) || (!result.ok && count >= messages.length)) continue;
+      for (const message of messages.slice(0, count)) {
+        // Unbalanced control markup cannot prove where private text ends. The old
+        // history projection stays unchanged; block loading fails closed for this row.
+        if (/<\/?inner_thought\b/i.test(message.replace(/<inner_thought\b[^>]*>[\s\S]*?<\/inner_thought\s*>/gi, ""))) continue;
+        const text = sanitizeDeliveredMessage(message);
+        if (text)
+          output.push({ entryId: entry.id, timestamp: compactSourceTimestamp(entry), role: "assistant", speaker: "assistant (already delivered)", text });
+      }
+    }
+    if (output.length) records.set(entry.id, output);
+  }
+  return records;
 }
 
 function appendProjectedEntries(target: AgentEntry[], transcripts: AgentEntry[], entries: readonly AgentEntry[]): void {
@@ -225,24 +297,31 @@ function stripToolContent(
   return content.length === 0 ? null : { ...message, content: content as AgentToolMessage["content"] };
 }
 
-function collectHistoricalSendResults(entries: readonly AgentEntry[]): ReadonlyMap<string, HistoricalSendResult> {
+function collectHistoricalSendResults(entries: readonly AgentEntry[], strict = false): ReadonlyMap<string, HistoricalSendResult> {
   const results = new Map<string, HistoricalSendResult>();
   for (const entry of entries) {
     if (entry.type !== "message" || entry.data.role !== "tool" || !Array.isArray(entry.data.content)) continue;
     for (const sourcePart of entry.data.content as readonly unknown[]) {
       if (!isRecord(sourcePart) || sourcePart.type !== "tool-result" || sourcePart.toolName !== HISTORICAL_OUTPUT_TOOL_NAME) continue;
       if (typeof sourcePart.toolCallId !== "string") continue;
-      results.set(sourcePart.toolCallId, decodeHistoricalSendResult(sourcePart));
+      results.set(sourcePart.toolCallId, decodeHistoricalSendResult(sourcePart, strict));
     }
   }
   return results;
 }
 
-function decodeHistoricalSendResult(part: Record<string, unknown>): HistoricalSendResult {
+function decodeHistoricalSendResult(part: Record<string, unknown>, strict = false): HistoricalSendResult {
   const rawOutput = part.output;
   const rawValue = isRecord(rawOutput) && "value" in rawOutput ? rawOutput.value : rawOutput;
   const value = parseJsonValue(rawValue);
   if (!isRecord(value)) return { ok: false, sentCount: 0 };
+  if (strict) {
+    const ids = value.ok === true ? value.messageIds : value.sent;
+    const invalidIds = ids !== undefined && (!Array.isArray(ids) || !ids.every((id) => typeof id === "string" && id.length > 0));
+    const invalidCount = value.count !== undefined && (typeof value.count !== "number" || !Number.isSafeInteger(value.count) || value.count < 0);
+    const explicitNoDelivery = Array.isArray(ids) && ids.length === 0;
+    if (invalidIds || invalidCount || explicitNoDelivery || (value.ok !== true && value.ok !== false)) return { ok: false, sentCount: 0 };
+  }
   if (value.ok === true) {
     const count = typeof value.count === "number" && Number.isInteger(value.count) && value.count >= 0 ? value.count : undefined;
     const messageIds = Array.isArray(value.messageIds) ? value.messageIds.length : undefined;
