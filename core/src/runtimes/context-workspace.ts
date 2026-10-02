@@ -176,9 +176,10 @@ export class ContextWorkspace {
         const fallbackHistory = fallback.estimatedHistoryTokens;
         if (fallbackEstimate <= this.budget.inputTokens && fallbackHistory <= this.budget.historyTokens) {
           plan = fallback;
-        } else {
-          throw new ContextSourceError("ContextContinuityUnavailable");
         }
+        // Keep the original preview plan when the raw fallback is too large. The
+        // canonical source remains available through the explicit context tools,
+        // while a failed continuity bridge must not block the current turn.
       }
 
       if (continuity) {
@@ -209,7 +210,8 @@ export class ContextWorkspace {
           const fallbackMessages = this.options.mergeMessages ? this.options.mergeMessages(fallback.messages) : [...fallback.messages];
           const fallbackEstimate = Math.ceil((base + fallbackMessages.reduce((sum, message) => sum + estimateContextMessage(message), 0)) * this.multiplier);
           if (fallbackEstimate <= this.budget.inputTokens && fallback.estimatedHistoryTokens <= this.budget.historyTokens) plan = fallback;
-          else throw new ContextSourceError("ContextContinuityUnavailable");
+          // Otherwise retain the original preview plan and let the provider decide
+          // whether its actual context limit can accept the protected request.
         }
       }
     }
