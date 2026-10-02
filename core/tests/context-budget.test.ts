@@ -142,10 +142,16 @@ describe("request budget", () => {
       clone,
     ]);
   });
-  it("refuses mandatory overflow rather than truncating current input", () => {
+  it("refuses mandatory overflow rather than truncating current input in strict mode", () => {
     expect(() => planContextRequest({ messages: [{ role: "user", content: "x".repeat(30_000) }] }, budget(), 128)).toThrow("ContextBudgetExceeded");
   });
-  it("calibration only increases estimated costs", () => {
+  it("can report local estimate overflow without rejecting the provider request", () => {
+    const message: ModelMessage = { role: "user", content: "x".repeat(30_000) };
+    const plan = planContextRequest({ messages: [message], projection: undefined }, budget(), 128, 1, { enforceBudget: false });
+    expect(plan.messages).toEqual([message]);
+    expect(plan.estimatedInputTokens).toBeGreaterThan(budget().inputTokens);
+  });
+  it("calibration only increases estimated costs in strict planning mode", () => {
     const projection = new AgentRequestProjection();
     const messages = [optional(projection, "x".repeat(2000), "old")];
     const plan = planContextRequest({ messages, projection }, budget(), 128, 3);

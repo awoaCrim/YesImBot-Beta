@@ -5,14 +5,7 @@ import type { MagicContextConfig } from "../config.js";
 import { ContextBlockStore, ContextSourceError, type ContextBlockPage } from "../conversations/context-blocks.js";
 import { escapeXmlText } from "../conversations/fragment-store.js";
 import type { Conversation } from "../conversations/index.js";
-import {
-  ContextBudgetError,
-  estimateContextBase,
-  estimateContextMessage,
-  planContextRequest,
-  resolveContextBudget,
-  type ContextBudget,
-} from "./context-budget.js";
+import { estimateContextBase, estimateContextMessage, planContextRequest, resolveContextBudget, type ContextBudget } from "./context-budget.js";
 
 export type ContextBlocksInput = { query?: string; cursor?: string; limit?: number };
 
@@ -91,6 +84,12 @@ export class ContextWorkspace {
   public capture(entries: readonly AgentEntry[]): void {
     this.syncSession();
     this.historyIds = new Set(entries.filter((entry) => entry.type === "message").map((entry) => entry.id));
+    const measured = entries.reduce<number | undefined>((latest, entry) => {
+      if (entry.type !== "message" || entry.data.role !== "assistant") return latest;
+      const inputTokens = entry.data.usage?.inputTokens;
+      return typeof inputTokens === "number" && Number.isFinite(inputTokens) && inputTokens > 0 ? inputTokens : latest;
+    }, undefined);
+    if (measured !== undefined) this.providerInputTokens = measured;
   }
 
   public async guard(context: AgentModelRequestContext): Promise<readonly ModelMessage[]> {
@@ -131,7 +130,12 @@ export class ContextWorkspace {
     const candidate = [...system, ...(this.eventOnly ? [] : [notice]), ...pageMessages, ...dialogue];
     const base = await estimateContextBase(context, this.budget.mediaReserveTokens);
     this.checkGeneration(generation);
-    const plan = planContextRequest({ messages: candidate, projection: this.projection }, this.budget, base, this.multiplier);
+    const plan = planContextRequest({ messages: candidate, projection: this.projection }, this.budget, base, this.multiplier, {
+      // Provider-reported inputTokens is authoritative after a request. The local estimate still
+      // removes optional history, but it must not reject a request solely because it overestimates
+      // protected content before the provider has measured the final prompt.
+      enforceBudget: false,
+    });
     for (const id of plan.evictedBlockIds) this.remove(id, "evicted");
     const final = this.options.mergeMessages ? this.options.mergeMessages(plan.messages) : [...plan.messages];
     const rawEstimate = base + final.reduce((sum, message) => sum + estimateContextMessage(message, this.budget.mediaReserveTokens), 0);
@@ -139,7 +143,6 @@ export class ContextWorkspace {
     this.lastMandatory = plan.mandatoryInputTokens;
     this.lastMandatoryHistory = plan.mandatoryHistoryTokens;
     this.lastHistoryEstimate = plan.estimatedHistoryTokens;
-    if (this.lastEstimate > this.budget.inputTokens) throw new ContextBudgetError("ContextBudgetExceeded");
     this.pendingEstimate = { turnId: context.turnId, step: context.stepNumber, raw: rawEstimate };
     this.options.onDiagnostic?.({
       turnId: context.turnId,
@@ -158,7 +161,10 @@ export class ContextWorkspace {
       return;
     this.pendingEstimate = undefined;
     this.providerInputTokens = inputTokens;
-    if (pending.raw > 0) this.multiplier = Math.max(this.multiplier, inputTokens / pending.raw);
+    if (pending.raw > 0) {
+      const multiplier = inputTokens / pending.raw;
+      if (Number.isFinite(multiplier) && multiplier > 0) this.multiplier = multiplier;
+    }
   }
 
   public async blocks(input: ContextBlocksInput) {
@@ -291,6 +297,8 @@ export class ContextWorkspace {
     this.sessionId = id;
     this.clear();
     this.historyIds.clear();
+    this.providerInputTokens = undefined;
+    this.multiplier = 1;
   }
 
   private ready(): number {

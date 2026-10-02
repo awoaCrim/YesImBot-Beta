@@ -167,17 +167,38 @@ describe("context workspace", () => {
     await f.workspace.guard(context(f, "turn", 1, [extra]));
     expect(f.workspace.status().loadedBlocks).toBeLessThan(4);
   });
-  it("calibrates only matching provider usage, upward, without using helper usage", async () => {
+  it("uses matching provider usage as the calibration source in either direction", async () => {
     const f = await fixture();
     await f.workspace.guard(context(f));
     const raw = f.workspace.status().estimatedInputTokens;
     f.workspace.observeUsage("other", 0, raw * 3);
     expect(f.workspace.status().estimateMultiplier).toBe(1);
-    f.workspace.observeUsage("turn", 0, raw * 2);
-    expect(f.workspace.status().estimateMultiplier).toBe(2);
-    await f.workspace.guard(context(f, "turn", 1));
-    f.workspace.observeUsage("turn", 1, 1);
-    expect(f.workspace.status().estimateMultiplier).toBe(2);
+    f.workspace.observeUsage("turn", 0, raw / 2);
+    expect(f.workspace.status().estimateMultiplier).toBeCloseTo(0.5);
+    expect(f.workspace.status().providerInputTokens).toBe(raw / 2);
+  });
+  it("restores the latest provider usage from persisted assistant history", async () => {
+    const f = await fixture();
+    const measured = createEntry(
+      "message",
+      {
+        id: "measured",
+        timestamp: 10,
+        role: "assistant",
+        content: "measured response",
+        usage: { inputTokens: 1234 },
+      } as never,
+      { id: "measured", timestamp: 10 },
+    );
+    f.workspace.capture([...f.entries, measured]);
+    expect(f.workspace.status().providerInputTokens).toBe(1234);
+  });
+  it("does not reject a provider request solely because the local estimate overflows", async () => {
+    const f = await fixture();
+    const oversized: ModelMessage = { role: "assistant", content: "x".repeat(60_000) };
+    const messages = await f.workspace.guard(context(f, "turn", 0, [oversized]));
+    expect(messages).toContain(oversized);
+    expect(f.workspace.status().estimatedInputTokens).toBeGreaterThan(f.workspace.status().inputBudget);
   });
   it("restart rebuilds the catalogue but not bodies; empty archive and failures clear residency", async () => {
     const f = await fixture();
@@ -461,7 +482,7 @@ describe("real AgentRuntime provider boundary", () => {
     expect(JSON.stringify(results)).not.toContain("context_block");
     expect(f.workspace.status().estimatedInputTokens).toBeLessThanOrEqual(f.workspace.status().inputBudget);
   });
-  it.each(["current", "plugin", "schema", "media"])("refuses %s overflow before doStream with a clear failed turn", async (source) => {
+  it.each(["current", "plugin", "schema"])("lets the provider measure %s estimate overflow", async (source) => {
     const f = await fixture();
     const agent = createAgent({
       model: f.model,
@@ -484,13 +505,22 @@ describe("real AgentRuntime provider boundary", () => {
             ]
           : [],
     });
-    const input =
-      source === "media"
-        ? createUserMessage([{ type: "image", image: new Uint8Array([1]), mediaType: "image/png" }])
-        : createUserMessage(source === "current" ? "x".repeat(50_000) : "current");
-    const events = await Array.fromAsync(agent.run(input));
+    const events = await Array.fromAsync(agent.run(createUserMessage(source === "current" ? "x".repeat(50_000) : "current")));
+    expect(f.calls).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ type: "turn.done" });
+    expect(JSON.stringify(events)).not.toContain("ContextBudgetExceeded");
+  });
+  it("still rejects media whose provider token cost cannot be measured locally", async () => {
+    const f = await fixture();
+    const agent = createAgent({
+      model: f.model,
+      storage: f.conversation.storage,
+      requestProjection: f.projection,
+      beforeModelRequest: (request) => f.workspace.guard(request),
+    });
+    const events = await Array.fromAsync(agent.run(createUserMessage([{ type: "image", image: new Uint8Array([1]), mediaType: "image/png" }])));
     expect(f.calls).toHaveLength(0);
-    expect(events.at(-1)).toMatchObject({ type: "turn.failed", error: { message: source === "media" ? "UnsupportedBudgetMedia" : "ContextBudgetExceeded" } });
+    expect(events.at(-1)).toMatchObject({ type: "turn.failed", error: { message: "UnsupportedBudgetMedia" } });
   });
   it("applies Gemini merge only after selection, preserving the current input and system prefix", async () => {
     const f = await fixture(

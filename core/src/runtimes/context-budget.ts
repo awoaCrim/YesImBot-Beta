@@ -27,6 +27,14 @@ export interface ContextBudgetPlan {
   readonly removedMessages: number;
 }
 
+export interface ContextBudgetPlanOptions {
+  /**
+   * Enforce the local estimate as a hard pre-provider limit. Core's Magic Context path leaves
+   * this disabled because provider-reported usage is authoritative for completed requests.
+   */
+  readonly enforceBudget?: boolean;
+}
+
 interface RequestUnit {
   readonly indices: number[];
   mandatory: boolean;
@@ -138,8 +146,10 @@ export function planContextRequest(
   budget: ContextBudget,
   baseTokens: number,
   multiplier = 1,
+  options: ContextBudgetPlanOptions = {},
 ): ContextBudgetPlan {
   const messages = context.messages;
+  const enforceBudget = options.enforceBudget ?? true;
   const units = requestUnits(messages, context.projection?.describe(messages) ?? messages.map(() => undefined));
   const costs = messages.map((message) => estimateContextMessage(message, budget.mediaReserveTokens));
   const removed = new Set<number>();
@@ -155,8 +165,9 @@ export function planContextRequest(
   const mandatoryHistoryCost = units
     .filter((unit) => unit.mandatory)
     .reduce((sum, unit) => sum + unit.indices.reduce((total, index) => total + contextToolHistoryCost(messages[index]!, budget.mediaReserveTokens), 0), 0);
-  if (Math.ceil(mandatoryHistoryCost * multiplier) > budget.historyTokens) throw new ContextBudgetError("ContextBudgetExceeded");
-  const optionalHistoryBudget = budget.historyTokens - Math.ceil(mandatoryHistoryCost * multiplier);
+  const measuredMandatoryHistory = Math.ceil(mandatoryHistoryCost * multiplier);
+  if (enforceBudget && measuredMandatoryHistory > budget.historyTokens) throw new ContextBudgetError("ContextBudgetExceeded");
+  const optionalHistoryBudget = Math.max(0, budget.historyTokens - measuredMandatoryHistory);
   // The recent-history ring is a soft working set, not an unbounded claimant on H.
   // Reserve space for explicitly loaded pages/summaries before selecting the ring;
   // otherwise a large ring would immediately evict every successful ctx_load.
@@ -175,7 +186,8 @@ export function planContextRequest(
     }
   }
   const mandatoryCost = units.filter((unit) => unit.mandatory).reduce((sum, unit) => sum + cost(unit), 0);
-  if (Math.ceil((baseTokens + mandatoryCost) * multiplier) > budget.inputTokens) throw new ContextBudgetError("ContextBudgetExceeded");
+  const measuredMandatoryInput = Math.ceil((baseTokens + mandatoryCost) * multiplier);
+  if (enforceBudget && measuredMandatoryInput > budget.inputTokens) throw new ContextBudgetError("ContextBudgetExceeded");
   const optional = units.filter((unit) => !unit.mandatory).sort((a, b) => rank(a.kind) - rank(b.kind) || a.timestamp - b.timestamp);
   let optionalCost = optional.filter((unit) => !removed.has(unit.indices[0]!)).reduce((sum, unit) => sum + cost(unit), 0);
   for (const unit of optional) {
@@ -189,7 +201,7 @@ export function planContextRequest(
     optionalCost -= cost(unit);
   }
   const estimatedInputTokens = Math.ceil((baseTokens + mandatoryCost + optionalCost) * multiplier);
-  if (estimatedInputTokens > budget.inputTokens || Math.ceil(optionalCost * multiplier) > optionalHistoryBudget)
+  if (enforceBudget && (estimatedInputTokens > budget.inputTokens || Math.ceil(optionalCost * multiplier) > optionalHistoryBudget))
     throw new ContextBudgetError("ContextBudgetExceeded");
   return {
     messages: messages.filter((_, index) => !removed.has(index)),
