@@ -145,6 +145,21 @@ export async function estimateContextBase(context: Pick<AgentModelRequestContext
   return 128 + estimateContextValue(context.system) + estimateContextValue(tools) + estimateContextValue(context.toolChoice);
 }
 
+/** Loaded-page replacement must use the same atomic units as budget eviction. */
+export function deduplicateContextHistory(
+  context: Pick<AgentModelRequestContext, "messages" | "projection">,
+  coveredSourceEntryIds: ReadonlySet<string>,
+): ModelMessage[] {
+  if (coveredSourceEntryIds.size === 0) return [...context.messages];
+  const units = requestUnits(context.messages, context.projection?.describe(context.messages) ?? context.messages.map(() => undefined));
+  const removed = new Set<number>();
+  for (const unit of units) {
+    if (unit.mandatory || unit.kind !== "history" || ![...unit.sourceEntryIds].some((id) => coveredSourceEntryIds.has(id))) continue;
+    for (const index of unit.indices) removed.add(index);
+  }
+  return context.messages.filter((_, index) => !removed.has(index));
+}
+
 /** Operates only on proven optional history. Protocol-linked messages form one removal unit. */
 export function planContextRequest(
   context: Pick<AgentModelRequestContext, "messages" | "projection">,

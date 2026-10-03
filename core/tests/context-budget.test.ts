@@ -2,7 +2,14 @@ import { AgentRequestProjection } from "@yesimbot/agent-runtime";
 import { jsonSchema, type ModelMessage } from "ai";
 import { describe, expect, it } from "vitest";
 
-import { estimateContextBase, estimateContextMessage, estimateContextValue, planContextRequest, resolveContextBudget } from "../src/runtimes/context-budget.js";
+import {
+  deduplicateContextHistory,
+  estimateContextBase,
+  estimateContextMessage,
+  estimateContextValue,
+  planContextRequest,
+  resolveContextBudget,
+} from "../src/runtimes/context-budget.js";
 
 const budget = () => resolveContextBudget({ contextWindow: 20_000, outputReserveTokens: 1000, pageTokenBudget: 1024 }, "compartment");
 function optional(
@@ -127,6 +134,29 @@ describe("request budget", () => {
       fanout,
       result,
     ]);
+  });
+  it("deduplicates loaded history atomically without touching live, unknown or malformed tool chains", () => {
+    const projection = new AgentRequestProjection();
+    const call: ModelMessage = { role: "assistant", content: [{ type: "tool-call", toolCallId: "send", toolName: "send_message", input: {} }] };
+    const result: ModelMessage = {
+      role: "tool",
+      content: [{ type: "tool-result", toolCallId: "send", toolName: "send_message", output: { type: "json", value: { ok: true } } }],
+    };
+    projection.register(call, { kind: "history", sourceEntryIds: ["call-source"] });
+    projection.register(result, { kind: "history", sourceEntryIds: ["result-source"] });
+    const fanout = optional(projection, "same source", "call-source");
+    const unrelated = optional(projection, "unrelated", "other-source");
+    const covered = new Set(["call-source"]);
+    const messages = [call, fanout, result, unrelated];
+    expect(deduplicateContextHistory({ messages, projection }, covered)).toEqual([unrelated]);
+    expect(deduplicateContextHistory({ messages: [call, fanout, unrelated], projection }, covered)).toEqual([call, fanout, unrelated]);
+    expect(deduplicateContextHistory({ messages: [call, fanout, result, result], projection }, covered)).toEqual([call, fanout, result, result]);
+    projection.register(result, { kind: "live", sourceEntryIds: ["result-source"] });
+    expect(deduplicateContextHistory({ messages, projection }, covered)).toEqual(messages);
+    expect(deduplicateContextHistory({ messages: [call, fanout, { ...result }], projection }, covered)).toEqual([call, fanout, result]);
+    call.content = "rewritten by a plugin";
+    expect(deduplicateContextHistory({ messages: [call], projection }, covered)).toEqual([call]);
+    expect(deduplicateContextHistory({ messages }, covered)).toEqual(messages);
   });
   it("protects malformed tool pairs, in-place mutations and unknown clones", () => {
     const projection = new AgentRequestProjection();

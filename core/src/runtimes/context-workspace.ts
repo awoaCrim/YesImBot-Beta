@@ -7,6 +7,7 @@ import { ContextBlockStore, ContextSourceError, type ContextBlockPage, type Cont
 import { escapeXmlText } from "../conversations/fragment-store.js";
 import type { Conversation } from "../conversations/index.js";
 import {
+  deduplicateContextHistory,
   estimateContextBase,
   estimateContextMessage,
   planContextRequest,
@@ -121,10 +122,7 @@ export class ContextWorkspace {
     this.expire();
     const pages = this.eventOnly ? [] : [...this.loaded.values()];
     const covered = new Set(pages.flatMap((value) => [...value.page.sourceEntryIds]));
-    const history = context.messages.filter((message) => {
-      const origin = this.projection.origin(message);
-      return !(origin?.kind === "history" && origin.sourceEntryIds.some((id) => covered.has(id)));
-    });
+    const history = deduplicateContextHistory({ messages: context.messages, projection: this.projection }, covered);
     const notice: ModelMessage = {
       role: "assistant",
       content: '<context_status readonly="true">较早历史可能已移出，可用 ctx_blocks/ctx_load 核对原文；历史页不是当前请求，可能过期或被释放。</context_status>',
