@@ -72,23 +72,30 @@ current model call; history is never re-requested from a platform API. Set
 
 ## Prompt composition
 
-Core composes its stable system prompt inline in Chinese from `runtime/prompt.ts`:
-an identity-neutral constitution, optional `AGENTS.md` operator policy, exactly one
-`<persona>` (user `PERSONA.md`, or the inline default persona when missing or
-empty), then `<runtime_context>` from `ChannelScope` and the current Bot `selfId`.
-On first start `YesImBotService.start()` atomically creates `PERSONA.md` under the
-resolved `basePath` with the inline default content only when the file is absent;
-user-authored and empty files are never touched. No package prompt resources are
-published or loaded, and there is no constitution version constant.
+Core composes its stable system prompt in Chinese from `src/runtimes/prompt.ts`:
+runtime contract, one continuous role section, interaction policy, then
+capability/evidence/security boundaries. Optional `AGENTS.md` operator policy and
+`<runtime_context>` remain separate blocks. Enabled plugins append their own
+capability rules; history and dynamic reference data remain in the message pipeline.
 
-`customInnerThought` (default `false`) controls whether the Core-owned inner
-monologue section is included in the constitution. When explicitly enabled,
-`send_message` gains an optional `inner_thought` field; the monologue is a tool
-argument rather than an output format, so the model never has to emit a bare
-`<inner_thought>` block to record a judgement. Provider-native reasoning parts
-are preserved by `@yesimbot/agent-runtime` either way. Existing history is not
-rewritten. Message element syntax documentation lives in the `send_message`
-tool description, not in a separate system message.
+A custom nonempty `PERSONA.md` is the primary role document. An opted-in character
+provider supplies card material to the same Core role section, rather than adding
+a second per-step character prefix. Card-only setups do not also receive default
+Athena. Missing/empty Persona without a card uses the inline default; a legacy
+file exactly matching that default is treated as fallback when a card is present.
+Existing files are never rewritten. New Persona files are created as empty editable
+templates, keeping the default in memory. Multiple nonempty role providers for one
+channel are rejected rather than silently combined.
+
+`customInnerThought` (default `false`) exposes an optional `send_message.inner_thought`
+field for a concise internal judgment. It is not an externally visible monologue
+or a required output tag. Its detailed contract lives in the tool definition;
+provider-native reasoning and existing history remain unchanged. Message splitting,
+`continue`, element syntax and escaping also belong to `send_message`, not Persona.
+
+Prompts are frozen for each runtime, not reloaded from disk every turn. See
+[main-Agent prompt ownership](../docs/prompt-architecture.md) for precedence,
+standalone/delegated compatibility and an opt-in Anon reference draft.
 
 ## Output and delivery
 
@@ -96,7 +103,8 @@ Model text output is never delivered. It is recorded in history and logged as th
 model's internal working space, which removes the whole class of `保持沉默` /
 `无需回复` literals reaching a channel.
 
-`send_message` is the only path to a platform and owns delivery end to end:
+`send_message` owns text/message-element delivery end to end. Plugin-owned sending
+tools may deliver their own supported content:
 
 - `messages` is a list; each item becomes one platform message.
 - `channel` defaults to the current channel and may target any other channel.
@@ -110,7 +118,8 @@ model's internal working space, which removes the whole class of `保持沉默` 
   was delivered.
 
 `finish` ends a turn without sending anything. Because delivery requires an
-explicit tool call, a turn that calls neither tool is simply silent.
+explicit tool call, plain model text is not a delivered reply. Core requires a
+terminal tool to finish a turn; the runtime may repair a missing terminal call.
 
 Silent scheduled posts (`delivery: "silent"`) block `send_message` for that
 turn, so a background task cannot leak its working notes into the channel.

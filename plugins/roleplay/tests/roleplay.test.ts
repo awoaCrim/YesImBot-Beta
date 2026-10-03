@@ -70,6 +70,31 @@ describe("roleplay agent plugin", () => {
     ]);
   });
 
+  it("preserves an already-persisted greeting when the role is replaced", async () => {
+    const storage = createMemoryStorage();
+    const channel = createAgentChannel();
+    const state = createStateManager({ storage });
+    const runtime = { id: "channel", channel, state, storage };
+    const first = createPluginHost({
+      plugins: [createRoleplayPlugin({ card: createCard(), greeting: "OLD_GREETING", userName: "user" })],
+      runtime,
+    });
+    await first.init();
+    await first.stop();
+    const replacementCard = createCard();
+    replacementCard.data.name = "Replacement";
+    const replacement = createPluginHost({
+      plugins: [createRoleplayPlugin({ card: replacementCard, greeting: "NEW_GREETING", userName: "user" })],
+      runtime,
+    });
+    await replacement.init();
+    expect(JSON.stringify(replacement.stablePromptBlocks)).toContain("Name: Replacement");
+    const entries = await storage.read();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ type: "message", data: { role: "assistant", content: "OLD_GREETING" } });
+    await replacement.stop();
+  });
+
   it("uses the card nickname for {{char}} substitutions", async () => {
     const card = createCard();
     card.data.nickname = "Nyx";
@@ -117,12 +142,17 @@ describe("roleplay agent plugin", () => {
     ]);
     expect(JSON.stringify(host.stablePromptBlocks)).toContain("<example_dialogues>");
     expect(JSON.stringify(host.stablePromptBlocks)).toContain("Answer direct-user last.");
-    expect(first).toEqual([
-      { role: "system", content: "Name: Athena\n\nA dark character.\n\nPersonality:\nMood: kind.\n\nScenario:\nRoll: 5." },
-      { role: "user", content: "hello" },
-    ]);
+    expect(JSON.stringify(host.stablePromptBlocks)).toContain("Name: Athena\\n\\nA dark character.");
+    expect(JSON.stringify(host.stablePromptBlocks)).toContain("Mood: kind.");
+    expect(JSON.stringify(host.stablePromptBlocks)).toContain("Roll: 5.");
+    expect(first).toEqual([{ role: "user", content: "hello" }]);
     const firstNonSystem = first.findIndex((message) => message.role !== "system");
     expect(first.slice(firstNonSystem + 1)).not.toContainEqual(expect.objectContaining({ role: "system" }));
     expect(second).toEqual(first);
+    expect(host.stablePromptBlocks).toHaveLength(1);
+    const block = String(host.stablePromptBlocks[0]!.content);
+    expect(block.indexOf("Name: Athena")).toBeLessThan(block.indexOf("Protect direct-user."));
+    expect(block.indexOf("Protect direct-user.")).toBeLessThan(block.indexOf("<example_dialogues>"));
+    expect(block.indexOf("<example_dialogues>")).toBeLessThan(block.indexOf("Answer direct-user last."));
   });
 });

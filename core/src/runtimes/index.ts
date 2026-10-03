@@ -127,11 +127,32 @@ export class Runtimes {
               }),
               context: channel.context,
             });
+      const roleProfile = polisher === undefined ? await this.agents.resolveRoleProfile(channel.context) : undefined;
+      if (this.agents.revision !== agentRevision) {
+        retry = true;
+        return;
+      }
       const willContext: ChannelContext = channel.context.type === "direct" ? channel.context : { ...channel.context, selfId: bot.selfId };
+      const will = await this.agents.setupWill(willContext, session);
+      const plugins = await this.agents.setup(channel.context, bot, {
+        imageProjection,
+        polisherActive: polisher !== undefined,
+        rolePromptsManaged: polisher === undefined,
+      });
+      // Setup may await while plugins are replaced. Retire before init can seed a greeting.
+      if (this.agents.revision !== agentRevision) {
+        for (const plugin of plugins.reverse()) {
+          try {
+            await plugin.stop?.();
+          } catch {}
+        }
+        retry = true;
+        return;
+      }
       const runtime = new ChannelRuntime(this.ctx, {
         channel,
         bot,
-        will: await this.agents.setupWill(willContext, session),
+        will,
         model: chat.model,
         contextModelLimit: chat.entry.limit,
         resolveContextModelLimit: (model) => this.model.contextLimit(model),
@@ -144,7 +165,8 @@ export class Runtimes {
         readImagePolicy: resolveReadImagePolicy(chat, vision, this.config.imageInput),
         imageProjection,
         config: this.config,
-        plugins: await this.agents.setup(channel.context, bot, { imageProjection, polisherActive: polisher !== undefined }),
+        plugins,
+        roleProfile,
         polisher,
         polish,
         messageBatch: this.messageBatches.select(channel.context),
@@ -156,6 +178,13 @@ export class Runtimes {
       } catch (cause) {
         await runtime.stop().catch(() => undefined);
         throw cause;
+      }
+      // Already-persisted greeting/history is canonical; retrying never rolls it back.
+      if (this.agents.revision !== agentRevision) {
+        this.logger.warn("runtimes.get.agent_revision_changed", { key, selectedRevision: agentRevision, latestRevision: this.agents.revision });
+        await runtime.stop();
+        retry = true;
+        return;
       }
       const latestMessageRevision = this.messageBatches.revision;
       if (latestMessageRevision !== messageRevision) {

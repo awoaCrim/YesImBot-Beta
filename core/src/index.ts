@@ -11,6 +11,8 @@ export default YesImBotService;
 export type {
   ChannelPlugin,
   ChannelPluginSetupContext,
+  MainAgentRoleProfile,
+  MainAgentRoleProvider,
   MessagePolisherCapability,
   PolisherPromptProfile,
   PolisherRequest,

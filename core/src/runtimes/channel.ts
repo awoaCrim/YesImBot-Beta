@@ -18,6 +18,7 @@ import {
 import type { AssistantContent, LanguageModel, ModelMessage, ToolSet } from "ai";
 import { Universal, type Bot, type Context, type Logger } from "koishi";
 
+import type { MainAgentRoleProfile } from "../agents/index.js";
 import type { MessagePolisherCapability } from "../agents/polisher.js";
 import {
   createDescribeImageTool,
@@ -111,6 +112,8 @@ export interface ChannelRuntimeOptions {
   readonly imageProjection?: EphemeralImageProjectionStore;
   readonly config: Config;
   readonly plugins: readonly AgentPlugin[];
+  /** Resolved once before plugin setup; Core owns its stable prompt placement. */
+  readonly roleProfile?: MainAgentRoleProfile;
   readonly messageBatch?: MessageBatchPlugin;
   readonly compactModel?: LanguageModel;
   readonly archiveMaxBytes?: number;
@@ -238,6 +241,7 @@ export class ChannelRuntime {
           selfId: this.selfId,
           customInnerThought: options.config.customInnerThought,
           delegated: options.polisher !== undefined,
+          roleProfile: options.roleProfile,
           logger: this.logger,
         }),
       tools,
