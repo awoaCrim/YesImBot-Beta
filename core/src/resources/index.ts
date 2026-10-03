@@ -163,7 +163,7 @@ export class ChannelResources {
 
   /** Persists inbound image and restricted text-file elements while the Session is live. */
   public async persistElements(ctx: Context, elements: readonly Element[]): Promise<Element[]> {
-    return persistInboundElements(ctx, elements, this);
+    return persistInboundElements(ctx, elements, this, this.readTimeoutMs);
   }
 }
 

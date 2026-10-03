@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import type { AgentTool } from "@yesimbot/agent-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -65,6 +66,8 @@ describe("session-live input resources", () => {
   it("persists an inbound image through the resolved ChannelResources owner", async () => {
     const http = Object.assign(
       vi.fn(async () => ({
+        headers: new Headers({ "content-type": "image/png", "content-length": "4" }),
+        status: 200,
         data: new ReadableStream({
           start(controller) {
             controller.enqueue(new Uint8Array([0x89, 0x50, 0x4e, 0x47]));
@@ -79,8 +82,161 @@ describe("session-live input resources", () => {
     const ctx = { http, logger: vi.fn(() => ({ debug: vi.fn() })) };
     const elements = await persistElements(ctx as never, [h("img", { src: "https://example.test/image.png" })], resources as never);
 
+    expect(http.head).not.toHaveBeenCalled();
     expect(resources.assets.put).toHaveBeenCalledWith(new Uint8Array([0x89, 0x50, 0x4e, 0x47]));
     expect(elements).toEqual([h("img", { id: "0123456789abcdef0123456789abcdef" })]);
+  });
+
+  it("downloads without HEAD and honors the owner timeout beyond the former 10 second cutoff", async () => {
+    const resources = await createResources({ readTimeoutMs: 30_000 });
+    const put = vi.spyOn(resources.assets, "put").mockResolvedValue("0123456789abcdef0123456789abcdef");
+    vi.useFakeTimers();
+    const http = Object.assign(
+      vi.fn(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 12_000));
+        return {
+          status: 200,
+          headers: new Headers(),
+          data: new ReadableStream({
+            start(c) {
+              c.enqueue(PNG_BYTES);
+              c.close();
+            },
+          }),
+        };
+      }),
+      { head: vi.fn(() => new Promise(() => {})) },
+    );
+    const ctx = { http, logger: () => ({ debug: vi.fn(), warn: vi.fn() }) };
+    const pending = resources.persistElements(ctx as never, [h("img", { src: "https://example.test/image" })]);
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(await pending).toEqual([h("img", { id: "0123456789abcdef0123456789abcdef" })]);
+    expect(http.head).not.toHaveBeenCalled();
+    expect(http).toHaveBeenCalledOnce();
+    expect(http.mock.calls[0]).toEqual(["https://example.test/image", expect.objectContaining({ timeout: 30_000, responseType: "stream" })]);
+    expect(put).toHaveBeenCalledWith(PNG_BYTES);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("times out while waiting for headers and cancels a late response without saving it", async () => {
+    const resources = await createResources({ readTimeoutMs: 50 });
+    const put = vi.spyOn(resources.assets, "put");
+    const warn = vi.fn();
+    const cancel = vi.fn();
+    vi.useFakeTimers();
+    const http = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return { status: 200, headers: new Headers(), data: new ReadableStream({ cancel }) };
+    });
+    const ctx = { http, logger: () => ({ debug: vi.fn(), warn }) };
+    const pending = resources.persistElements(ctx as never, [h("img", { src: "https://private.example/image?token=secret" })]);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(await pending).toEqual([h("img", { yesimbotFailure: "timeout" })]);
+    expect(warn).toHaveBeenCalledWith("resources.input.failed", { kind: "image", stage: "headers", code: "timeout", elapsedMs: 50, timeoutMs: 50 });
+    expect(JSON.stringify(warn.mock.calls)).not.toMatch(/private|secret|token/);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(put).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not persist partial bytes when timeout cancels a pending body read as done", async () => {
+    const resources = await createResources({ readTimeoutMs: 50 });
+    const put = vi.spyOn(resources.assets, "put");
+    const warn = vi.fn();
+    const cancel = vi.fn(() => Promise.reject(new Error("private cancel failure")));
+    vi.useFakeTimers();
+    const http = vi.fn(async () => ({
+      status: 200,
+      headers: new Headers(),
+      data: new ReadableStream({
+        start(c) {
+          c.enqueue(PNG_BYTES);
+        },
+        cancel,
+      }),
+    }));
+    const pending = resources.persistElements({ http, logger: () => ({ debug: vi.fn(), warn }) } as never, [h("img", { src: "https://example.test/image" })]);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(await pending).toEqual([h("img", { yesimbotFailure: "timeout" })]);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(put).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith("resources.input.failed", expect.objectContaining({ stage: "body", code: "timeout" }));
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    [200, { "content-length": String(RESOURCE_MAX_BYTES + 1) }, "too_large"],
+    [200, { "content-type": "text/html" }, "not_image"],
+    [403, {}, "download_failed"],
+  ] as const)("cancels rejected GET bodies for status %s and headers %j", async (status, headers, code) => {
+    const resources = await createResources();
+    const put = vi.spyOn(resources.assets, "put");
+    const cancel = vi.fn();
+    const http = vi.fn(async () => ({ status, headers: new Headers(headers), data: new ReadableStream({ cancel }) }));
+    const ctx = { http, logger: () => ({ debug: vi.fn(), warn: vi.fn() }) };
+    expect(await resources.persistElements(ctx as never, [h("img", { src: "https://example.test/image" })])).toEqual([h("img", { yesimbotFailure: code })]);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("bounds an unadvertised body and cancels overflow even when cancellation fails", async () => {
+    const resources = await createResources();
+    const put = vi.spyOn(resources.assets, "put");
+    const cancel = vi.fn(() => Promise.reject(new Error("cancel failed")));
+    const http = vi.fn(async () => ({
+      status: 200,
+      headers: new Headers(),
+      data: new ReadableStream({
+        start(c) {
+          c.enqueue(new Uint8Array(RESOURCE_MAX_BYTES + 1));
+        },
+        cancel,
+      }),
+    }));
+    const ctx = { http, logger: () => ({ debug: vi.fn(), warn: vi.fn() }) };
+    expect(await resources.persistElements(ctx as never, [h("img", { src: "https://example.test/image" })])).toEqual([
+      h("img", { yesimbotFailure: "too_large" }),
+    ]);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("preserves count and total-byte limits across concurrent GETs", async () => {
+    const resources = await createResources();
+    const put = vi.spyOn(resources.assets, "put").mockResolvedValue("0123456789abcdef0123456789abcdef");
+    const http = vi.fn(async () => ({
+      status: 200,
+      headers: new Headers(),
+      data: new ReadableStream({
+        start(c) {
+          c.enqueue(new Uint8Array(RESOURCE_MAX_BYTES));
+          c.close();
+        },
+      }),
+    }));
+    const ctx = { http, logger: () => ({ debug: vi.fn(), warn: vi.fn() }) };
+    const results = await resources.persistElements(
+      ctx as never,
+      Array.from({ length: 5 }, () => h("img", { src: "https://example.test/image" })),
+    );
+    expect(results.map((element) => element.attrs.yesimbotFailure)).toEqual([undefined, undefined, "total_size_limit", "total_size_limit", "image_limit"]);
+    expect(put).toHaveBeenCalledTimes(2);
+    expect(http).toHaveBeenCalledTimes(4);
+  });
+
+  it("keeps data and local file ingestion independent of HTTP", async () => {
+    const resources = await createResources();
+    const path = join(resources.path, "image.png");
+    await writeFile(path, PNG_BYTES);
+    const http = vi.fn();
+    const ctx = { http, logger: () => ({ debug: vi.fn(), warn: vi.fn() }) };
+    for (const src of [pathToFileURL(path).href, `data:image/png;base64,${Buffer.from(PNG_BYTES).toString("base64")}`]) {
+      const [element] = await resources.persistElements(ctx as never, [h("img", { src })]);
+      expect(element!.attrs.yesimbotFailure).toBeUndefined();
+      expect(await resources.assets.get(element!.attrs.id)).toEqual(PNG_BYTES);
+    }
+    expect(http).not.toHaveBeenCalled();
   });
 
   it("records a bounded reason when an inbound image has no source", async () => {
@@ -97,6 +253,8 @@ describe("session-live input resources", () => {
     const script = new TextEncoder().encode("print('ok')\n");
     const http = Object.assign(
       vi.fn(async () => ({
+        headers: new Headers({ "content-type": "text/plain", "content-length": String(script.byteLength) }),
+        status: 200,
         data: new ReadableStream({
           start(controller) {
             controller.enqueue(script);
