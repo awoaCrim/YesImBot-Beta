@@ -1801,7 +1801,8 @@ describe("Runtimes identity", () => {
       };
       const agents = new Agents(ctx);
       const oldSetup = vi.fn(async () => ({ name: "old-image-tools" }));
-      const disposeOld = agents.use({ setup: oldSetup });
+      const resolveOld = vi.fn(() => ({ characterDefinition: "OLD_ROLE" }));
+      const disposeOld = agents.use({ setup: oldSetup, roleProfile: { resolve: resolveOld } });
       const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root }, agents);
       const scope = { type: "direct", platform: "test", selfId: "bot", userId: "user", channelId: "room" } as const;
       const channel = await channels.resolve(scope);
@@ -1809,16 +1810,88 @@ describe("Runtimes identity", () => {
 
       const first = await runtimes.get(channel, bot as never);
       expect(oldSetup).toHaveBeenCalledOnce();
+      expect(resolveOld).toHaveBeenCalledBefore(oldSetup);
+      expect(oldSetup.mock.calls[0]?.[2]).toMatchObject({ rolePromptsManaged: true, polisherActive: false });
+      const firstConfig = vi.mocked(createAgent).mock.calls.at(-1)![0];
+      const firstPrompt = (await (firstConfig.systemPrompt as () => Promise<Array<{ content: unknown }>>)()).map((block) => String(block.content)).join("\n");
+      expect(firstPrompt).toContain("OLD_ROLE");
+      expect(firstPrompt).not.toContain("Athena");
+      expect(firstPrompt.indexOf("OLD_ROLE")).toBeLessThan(firstPrompt.indexOf("# 互动策略"));
 
       disposeOld();
       const newSetup = vi.fn(async () => ({ name: "new-image-tools" }));
-      agents.use({ setup: newSetup });
+      agents.use({ setup: newSetup, roleProfile: { resolve: () => ({ characterDefinition: "NEW_ROLE" }) } });
       const replacement = await runtimes.get(channel, bot as never);
 
       expect(replacement).not.toBe(first);
       expect(newSetup).toHaveBeenCalledOnce();
+      const nextConfig = vi.mocked(createAgent).mock.calls.at(-1)![0];
+      const nextPrompt = (await (nextConfig.systemPrompt as () => Promise<Array<{ content: unknown }>>)()).map((block) => String(block.content)).join("\n");
+      expect(nextPrompt).toContain("NEW_ROLE");
+      expect(nextPrompt).not.toContain("OLD_ROLE");
       await runtimes.stop();
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["resolve", "setup"] as const)("retries a role replaced during %s before initializing stale plugins", async (phase) => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-role-replacement-"));
+    const ctx = new Context();
+    const channels = new Channels(ctx, { basePath: root });
+    const model = {
+      resolveChatModel: vi.fn(() => ({ model: {} as never, entry: {} })),
+      resolveAuxiliaryModel: vi.fn(() => {
+        throw new Error("auxiliary unavailable");
+      }),
+    };
+    const agents = new Agents(ctx);
+    const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root }, agents);
+    let release!: () => void;
+    let entered!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const pause = async () => {
+      entered();
+      await pending;
+    };
+    const stop = vi.fn();
+    const oldSetup = vi.fn(async () => {
+      if (phase === "setup") await pause();
+      return { name: "old-role", stop };
+    });
+    const dispose = agents.use({
+      roleProfile: {
+        resolve: async () => {
+          if (phase === "resolve") await pause();
+          return { characterDefinition: "STALE_ROLE" };
+        },
+      },
+      setup: oldSetup,
+    });
+    try {
+      const channel = await channels.resolve({ type: "direct", platform: "test", selfId: "bot", channelId: "user" });
+      const request = runtimes.get(channel, { platform: "test", selfId: "bot" } as never);
+      await started;
+      dispose();
+      const setup = vi.fn(() => ({ name: "replacement-role" }));
+      agents.use({ roleProfile: { resolve: () => ({ characterDefinition: "REPLACEMENT_ROLE" }) }, setup });
+      release();
+      await request;
+      expect(setup).toHaveBeenCalledOnce();
+      if (phase === "resolve") expect(oldSetup).not.toHaveBeenCalled();
+      else expect(stop).toHaveBeenCalledOnce();
+      const options = vi.mocked(createAgent).mock.calls.at(-1)![0];
+      const prompt = await (options.systemPrompt as () => Promise<unknown>)();
+      expect(JSON.stringify(prompt)).toContain("REPLACEMENT_ROLE");
+      expect(JSON.stringify(prompt)).not.toContain("STALE_ROLE");
+    } finally {
+      release();
+      await runtimes.stop();
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -2463,8 +2536,8 @@ describe("ChannelRuntime polisher wiring", () => {
       const send = agentConfig.tools?.find((tool) => tool.name === "send_message");
       if (!send) throw new Error("send_message tool was not captured");
       expect((send.inputSchema as { jsonSchema: { required?: string[] } }).jsonSchema.required).toEqual(["messages"]);
-      expect(send.description).toContain("用当前 persona");
-      expect(send.description).toContain("语域");
+      expect(all).toContain("保持同一说话身份、语域和叙述距离");
+      expect(send.description).not.toMatch(/persona|emoji|语域|说话身份/);
     } finally {
       await value.stop();
       await rm(root, { recursive: true, force: true });

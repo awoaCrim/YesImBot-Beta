@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import type { CharacterCardV3 } from "@risuai/ccardlib";
 import type { AgentPlugin } from "@yesimbot/agent-runtime";
 import { Context, Logger, Schema, type Bot } from "koishi";
-import type { ChannelContext, ChannelPluginSetupContext, PolisherPromptProfile } from "koishi-plugin-yesimbot";
+import type { ChannelContext, ChannelPluginSetupContext, MainAgentRoleProvider, PolisherPromptProfile } from "koishi-plugin-yesimbot";
 
 import { loadCharacterCard } from "./card.js";
 import type { CBSContext } from "./cbs.js";
@@ -31,7 +31,9 @@ export default class RoleplayPlugin {
   public readonly config: RoleplayPluginConfig;
   public readonly logger: Logger;
   public readonly name = RoleplayPlugin.name;
+  public readonly roleProfile: MainAgentRoleProvider = { resolve: (scope) => this.resolve(scope) };
 
+  private loadGeneration = 0;
   private card?: CharacterCardV3;
   private greeting?: string;
   private disposeAgentPlugin: (() => void) | undefined;
@@ -48,12 +50,14 @@ export default class RoleplayPlugin {
   }
 
   public async start(): Promise<void> {
+    const generation = ++this.loadGeneration;
     this.disposeAgentPlugin?.();
     this.disposeAgentPlugin = undefined;
     this.disposePolisherProfile?.();
     this.disposePolisherProfile = undefined;
 
     const card = await loadCharacterCard(resolve(this.ctx.baseDir, this.config.characterCard));
+    if (generation !== this.loadGeneration) return;
     const greeting = selectGreeting(card, this.config.useRandomGreeting ?? false);
     this.card = card;
     this.greeting = greeting;
@@ -85,10 +89,12 @@ export default class RoleplayPlugin {
       userName: scope.type === "direct" ? scope.channelId : "User",
       context: this.promptContext(scope),
       delegatePrompts: runtime?.polisherActive === true,
+      managedPrompts: runtime?.rolePromptsManaged === true,
     });
   }
 
   public async stop(): Promise<void> {
+    this.loadGeneration += 1;
     this.disposeAgentPlugin?.();
     this.disposeAgentPlugin = undefined;
     this.disposePolisherProfile?.();

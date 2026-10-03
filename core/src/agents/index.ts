@@ -6,13 +6,26 @@ import { defaultWillEngine, type WillEngine, type WillPlugin } from "./will.js";
 
 type Disposer = () => void;
 
+/** Stable character material for the main Agent; independent of send-message polishing. */
+export interface MainAgentRoleProfile {
+  readonly characterDefinition?: string;
+  readonly roleInstructions?: string;
+}
+
+export interface MainAgentRoleProvider {
+  resolve(context: ChannelContext): Awaitable<MainAgentRoleProfile | undefined>;
+}
+
 export interface ChannelPluginSetupContext {
   readonly imageProjection: EphemeralImageProjectionStore;
   /** True when an active polisher owns style rendering, so role prompts must not reach the main Agent. */
   readonly polisherActive: boolean;
+  /** Core assembles this opted-in provider's role material in its frozen role section. */
+  readonly rolePromptsManaged?: boolean;
 }
 
 export interface ChannelPlugin {
+  readonly roleProfile?: MainAgentRoleProvider;
   setup(context: ChannelContext, bot: Bot, runtime?: ChannelPluginSetupContext): Awaitable<AgentPlugin | null>;
 }
 
@@ -54,11 +67,28 @@ export class Agents {
     };
   }
 
+  /** Resolve before setup so shared placeholder choices also reach greetings. Never blend identities. */
+  public async resolveRoleProfile(context: ChannelContext): Promise<MainAgentRoleProfile | undefined> {
+    let selected: MainAgentRoleProfile | undefined;
+    // Registration changes belong to the next snapshot, not the middle of an async resolution.
+    for (const plugin of [...this.plugins]) {
+      const profile = await plugin.roleProfile?.resolve(context);
+      if (!profile?.characterDefinition?.trim() && !profile?.roleInstructions?.trim()) continue;
+      if (selected) throw new Error("Multiple main-Agent role providers resolved non-empty profiles for this channel");
+      selected = profile;
+    }
+    return selected;
+  }
+
   public async setup(context: ChannelContext, bot: Bot, runtime?: ChannelPluginSetupContext): Promise<AgentPlugin[]> {
     const initialized: AgentPlugin[] = [];
     try {
-      for (const plugin of this.plugins) {
-        const result = await plugin.setup(context, bot, runtime);
+      for (const plugin of [...this.plugins]) {
+        const result = await plugin.setup(
+          context,
+          bot,
+          runtime ? { ...runtime, rolePromptsManaged: runtime.rolePromptsManaged === true && plugin.roleProfile !== undefined } : undefined,
+        );
         if (result) initialized.push(result);
       }
       return initialized;

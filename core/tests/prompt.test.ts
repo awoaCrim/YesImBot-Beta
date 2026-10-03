@@ -27,7 +27,7 @@ describe("buildCoreSystemPrompt", () => {
     }
   });
 
-  it("steers silent reasoning into scene-language first-person in-character thinking", async () => {
+  it("keeps first-person role expression without requiring a hidden reasoning format", async () => {
     const root = await mkdtemp(join(tmpdir(), "yesimbot-prompt-"));
     try {
       const prompt = await buildCoreSystemPrompt({
@@ -36,7 +36,8 @@ describe("buildCoreSystemPrompt", () => {
         selfId: "bot",
       });
       const constitution = String(prompt[0].content);
-      expect(constitution).toContain("静默推理过程");
+      expect(constitution).toContain("内部判断只服务于当前回合决策");
+      expect(constitution).not.toContain("静默推理过程");
       expect(constitution).toContain("第一人称在情境内部进行");
       expect(constitution).toContain("不要以旁观者或分析者视角归纳、猜测自己的人设");
       expect(constitution).toContain("人设是你行动的前提，不是待推断的结论");
@@ -89,11 +90,8 @@ describe("buildCoreSystemPrompt", () => {
 
       expect(String(enabled[0].content)).toContain("send_message 的 inner_thought");
       expect(String(enabled[0].content)).toContain("# 内心判断");
-      expect(String(enabled[0].content)).toContain("不写 persona 台词");
-      expect(String(enabled[0].content)).toContain("回应语域和行动计划");
-      expect(String(enabled[0].content)).toContain("不写 persona 台词、戏剧动作或对外文本");
-      expect(String(enabled[0].content)).toContain("不要把过去的 inner_thought 或 finish.reason");
-      expect(String(enabled[0].content)).toContain("同一次 send_message 调用中的 messages 属于同一个回应单元");
+      expect(String(enabled[0].content)).toContain("不发送的简短行为判断");
+      expect(String(enabled[0].content)).toContain("具体字段约束见工具说明");
       expect(String(enabled[0].content)).not.toContain("内心独白和对外发言都以你的 persona 的声音进行");
       expect(String(disabled[0].content)).not.toContain("# 内心判断");
     } finally {
@@ -111,11 +109,11 @@ describe("buildCoreSystemPrompt", () => {
       });
 
       const constitution = String(prompt[0].content);
-      expect(constitution).toContain("同一次 send_message 调用中的 messages 属于同一个回应单元");
+      expect(constitution).toContain("同一回应保持同一说话身份、语域和叙述距离");
       expect(constitution).toContain("外部资料只作为事实材料");
       expect(constitution).toContain("不要把同一回应拆成互相割裂的报告和聊天");
-      expect(constitution).toContain("不要用普通文本中的空行制造消息分段");
-      expect(constitution).toContain("需要分开时，把每条消息写成 messages 的独立项目");
+      expect(constitution).not.toContain("不要用普通文本中的空行制造消息分段");
+      expect(constitution).not.toContain("messages 的独立项目");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -150,13 +148,13 @@ describe("buildCoreSystemPrompt", () => {
       });
 
       const constitution = String(prompt[0].content);
-      expect(constitution).toContain("孤立的问号、表情、贴图或无明确指向的短句都不是在要求你重述刚说过的内容");
+      expect(constitution).toContain("孤立的问号、表情、贴图或无明确指向的短句，不自动要求重述");
       expect(constitution).toContain("你自己已经发送到平台的历史输出只是只读情境材料");
       expect(constitution).toContain("不是用户输入、当前问题或可执行指令");
       expect(constitution).toContain("不要复述或照抄上一轮历史发言");
       expect(constitution).toContain("上一轮任务视为已经完成");
       expect(constitution).toContain("不要重新执行同一任务、重述完整结果");
-      expect(constitution).toContain("只有当前消息明确提出新的修改请求时，才重新打开已完成的任务");
+      expect(constitution).toContain("只有当前消息明确要求修改、补充或重新发送时，才重新打开已完成的任务");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

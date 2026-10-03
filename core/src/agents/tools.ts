@@ -108,7 +108,7 @@ export function createSendMessageTool(options: SendMessageToolOptions): AgentToo
           items: { type: "string", minLength: 1 },
           description: factsRequired
             ? "本轮待发送的草稿消息；完整表达事实、判断和交流动作，不自行添加事实或承诺。每一项对应一条独立消息，润色时保留条数与顺序"
-            : "要发送的消息，每一项作为一条独立消息按顺序发出；同一次调用中的所有项目属于同一个回应单元，语域、说话身份和情绪力度保持连贯",
+            : "要发送的消息，每一项作为一条独立消息按顺序发出；精确文本使用 raw 或 <text>，保留事实、代码、链接和消息元素",
         },
         ...(factsRequired
           ? {
@@ -130,7 +130,16 @@ export function createSendMessageTool(options: SendMessageToolOptions): AgentToo
           type: "boolean",
           description: "默认 false，发送后结束本轮；true 时继续下一步。本轮还要调用其他工具或发送更多内容时，必须在这次发送前设为 true",
         },
-        ...(innerThought ? { inner_thought: { type: "string", description: "本次发送前的内心独白；只保留在你自己的历史里，不会发送给任何人" } } : {}),
+        ...(innerThought
+          ? {
+              inner_thought: {
+                type: "string",
+                description: factsRequired
+                  ? "本次发送前的内心独白；只保留在你自己的历史里，不会发送给任何人"
+                  : "本回合简短行为判断：互动对象、可见事实与推测、是否回应和行动计划；不写角色台词或对外文本，不会发送给任何人",
+              },
+            }
+          : {}),
       },
       required: factsRequired ? ["facts", "messages"] : ["messages"],
     }),
@@ -485,19 +494,15 @@ export function createDescribeImageTool(model: LanguageModel, resources: Channel
 function sendMessageDescription(innerThought: boolean, factsRequired: boolean): string {
   return `向频道发送文字或消息元素。你的普通文本输出不会被发送；调用本工具才能发送 messages 中的内容。其他实际提供的发送工具可以发送它们各自支持的内容。
 
-调用后生成真正展示给用户的消息，可以针对某个用户或所有用户回复；只写在普通文本输出里的内容不会被送达。
-
-# 参数
+${factsRequired ? "调用后生成真正展示给用户的消息，可以针对某个用户或所有用户回复；只写在普通文本输出里的内容不会被送达。\n\n" : ""}# 参数
 
 ## messages
 要发送的消息列表，每一项作为一条独立消息按顺序发出。
 ${
   factsRequired
     ? "只写清楚本轮要表达的事实、判断和交流动作，不自行添加事实或承诺；措辞风格由发送前的润色阶段处理，每条草稿独立改写，条数与顺序保持不变。"
-    : `同一次调用中的 messages 属于同一个回应单元，保持一致的说话身份、语域和情绪力度。工具、搜索和图片结果只是材料；用当前 persona 自然表达。需要分条时按对话节奏处理，事实、指令、代码、链接和其他后果重大的内容保持在同一条消息内。`
+    : "事实、指令、代码、链接和其他后果重大的内容保持在同一条消息内；精确文本使用 raw 或 <text>，避免元素解析吞掉字符。不要用普通文本中的空行制造消息分段；平台不会把空行渲染成视觉分隔。需要分开时，把每条消息写成 messages 的独立项目。"
 }
-
-${factsRequired ? "" : "尽量用文字和标点表达情绪；只有确实有助于语气时才使用 emoji。"}
 
 ## channel
 目标频道 ID。留空发往当前频道；填写其他频道 ID 可以向该频道发送。OneBot 群频道直接填写裸群号，不要使用 group: 前缀；私聊频道仍使用 private:<账号>。
@@ -524,7 +529,7 @@ ${
 ${
   factsRequired
     ? "记录互动对象、可见事实与推测、是否回应和行动计划。使用简洁内部记录，不要提前写对外文本。它不会到达平台；需要让对方知道的内容必须写进 messages。不要把过去的 inner_thought 或 finish.reason 当作当前事实。"
-    : "记录互动对象、可见事实与推测、回应语域、是否回应和行动计划。使用简洁内部记录，不模仿角色台词或提前写对外文本。它不会到达平台；需要让对方知道的内容必须写进 messages。不要把过去的 inner_thought 或 finish.reason 当作当前事实。"
+    : "记录互动对象、可见事实与推测、是否回应和行动计划。使用简洁内部记录，不模仿角色台词或提前写对外文本。它不会到达平台；需要让对方知道的内容必须写进 messages。不要把过去的 inner_thought 或 finish.reason 当作当前事实。"
 }
 `
       : ""
