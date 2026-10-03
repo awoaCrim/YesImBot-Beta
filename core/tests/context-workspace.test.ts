@@ -13,6 +13,7 @@ import { createContextWorkspaceTools, createFinishTool } from "../src/agents/too
 import { Channel } from "../src/channels/index.js";
 import { Config } from "../src/config.js";
 import { Conversation } from "../src/conversations/index.js";
+import { createInternalHistoryProjectionPlugin } from "../src/conversations/internal-history.js";
 import { ChannelRuntime, mergeAdjacentUserMessages } from "../src/runtimes/channel.js";
 import { ContextWorkspace } from "../src/runtimes/context-workspace.js";
 
@@ -445,6 +446,81 @@ describe("context workspace", () => {
 });
 
 describe("real AgentRuntime provider boundary", () => {
+  it("keeps Gemini call/result pairs balanced when a loaded raw page replaces delivered history", async () => {
+    const f = await fixture(["older question"]);
+    const historical = [
+      createEntry(
+        "message",
+        {
+          id: "sent-call",
+          timestamp: 2,
+          role: "assistant",
+          content: [{ type: "tool-call", toolCallId: "old-send", toolName: "send_message", input: { messages: ["older delivered reply"] } }],
+        },
+        { id: "sent-call", timestamp: 2 },
+      ),
+      createEntry(
+        "message",
+        {
+          id: "sent-result",
+          timestamp: 3,
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "old-send",
+              toolName: "send_message",
+              output: { type: "json", value: { ok: true, count: 1, messageIds: ["platform-id"] } },
+            },
+          ],
+        },
+        { id: "sent-result", timestamp: 3 },
+      ),
+    ];
+    await f.conversation.storage.append(...historical);
+    f.workspace.capture([...f.entries, ...historical]);
+    await f.workspace.guard(context(f));
+    const blockId = (await f.workspace.blocks({})).blocks[0]!.id;
+    const scripted = modelWithScript([
+      { toolName: "ctx_load", input: () => JSON.stringify({ blockId }) },
+      { toolName: "finish", input: () => "{}" },
+    ]);
+    const agent = createAgent({
+      model: scripted.model,
+      storage: f.conversation.storage,
+      requestProjection: f.projection,
+      beforeModelRequest: (request) => f.workspace.guard(request),
+      tools: [...createContextWorkspaceTools(f.workspace), createFinishTool()],
+      requireTerminalTool: true,
+      plugins: [
+        {
+          name: "capture",
+          enforce: "pre",
+          transformEntries(entries) {
+            f.workspace.capture(entries);
+            return entries;
+          },
+        },
+        createInternalHistoryProjectionPlugin("gemini-native", f.projection),
+      ],
+    });
+    const events = await Array.fromAsync(agent.run(createUserMessage("current question")));
+    expect(events.at(-1)).toMatchObject({ type: "turn.done" });
+    expect(scripted.calls).toHaveLength(2);
+    expect(JSON.stringify(scripted.calls[0]!.prompt)).toContain("old-send");
+    const continuation = scripted.calls[1]!.prompt;
+    expect(JSON.stringify(continuation)).toContain("context_block");
+    expect(JSON.stringify(continuation)).toContain("older delivered reply");
+    const calls = continuation.flatMap((message) =>
+      message.role === "assistant" ? message.content.filter((part) => part.type === "tool-call").map((part) => part.toolCallId) : [],
+    );
+    const results = continuation.flatMap((message) =>
+      message.role === "tool" ? message.content.filter((part) => part.type === "tool-result").map((part) => part.toolCallId) : [],
+    );
+    expect(results).toEqual(calls);
+    expect(calls).toEqual(["call_1"]);
+    expect(JSON.stringify(await agent.storage.read())).toContain("old-send");
+  });
   it("runs the actual Core capture/summary/internal/Gemini pipeline with all system content before dialogue", async () => {
     const f = await fixture(Array.from({ length: 100 }, (_, i) => `历史${i}:` + "x".repeat(600)));
     const channel = new Channel({ type: "guild", platform: "mock", channelId: "room", guildId: "room" }, f.conversation.root, false, 10_000, {
