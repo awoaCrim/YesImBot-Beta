@@ -252,6 +252,7 @@ export class Runtimes {
     if (!runtime) throw new Error("No active Runtime is available to compact this conversation");
     const result = (await runtime.compact("manual")) as { compacted: boolean; reason?: string };
     if (result.compacted) return "已压缩当前会话。";
+    if (result.reason === "magic_context_managed") return "Magic Context 按实际用量异步整理局部历史，不执行整会话压缩。";
     if (result.reason === "minimum_messages") return "消息不足，未压缩。";
     if (result.reason === "failure_limit") return "连续压缩失败已达上限，未继续尝试。";
     if (result.reason === "cancelled") return "会话整理已取消。";
@@ -272,13 +273,14 @@ export class Runtimes {
       this.modelRevisions.delete(key);
       this.polisherRevisions.delete(key);
       const channel = await this.channels.resolve(ctx);
-      const chat = noSummary ? undefined : this.model.resolveChatModel(this.config.chatModel, channel.context);
+      const magic = this.config.session.magicContext?.enabled === true;
+      const chat = noSummary || magic ? undefined : this.model.resolveChatModel(this.config.chatModel, channel.context);
       const input = chat
         ? {
             model: this.resolveCompactModel(chat.model, channel.context),
           }
         : undefined;
-      const archiveWithoutSeed = noSummary || !input;
+      const archiveWithoutSeed = noSummary || (!magic && !input);
       await channel.conversation.archive(archiveWithoutSeed, input);
     });
     return "已归档当前会话。";

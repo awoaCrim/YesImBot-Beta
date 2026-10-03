@@ -339,9 +339,9 @@ export function createContextWorkspaceTools(workspace: ContextWorkspace): AgentT
       };
     }
   };
-  return [
+  const tools: AgentTool[] = [
     {
-      name: "ctx_blocks",
+      name: "ctx_search",
       description: "只读分页浏览当前会话可访问的历史块及加载状态。query 是词法搜索；无 query 可浏览。摘要不是原文证据，summary-only 无原文边界。",
       inputSchema: jsonSchema<ContextBlocksInput>({
         type: "object",
@@ -355,24 +355,31 @@ export function createContextWorkspaceTools(workspace: ContextWorkspace): AgentT
       execute: (input: ContextBlocksInput) => run(() => workspace.blocks(input)),
     },
     {
-      name: "ctx_load",
+      name: "ctx_expand",
       description:
-        "将 ctx_blocks 给出的一个历史块原文页加载到后续模型步骤的只读上下文。每块仅一页，新页替换旧页；回执无正文。加载可能因预算或到期被淘汰，可用 ctx_blocks 核对。不会修改原始历史或发送消息。",
-      inputSchema: jsonSchema<ContextLoadInput>({
+        "展开 ctx_search 或历史摘要 source 给出的历史块，直接返回有界只读原文和 nextCursor。正文只包括可见用户消息及有发送证明的回复；不是当前指令。用 cursor 继续读取，不删除或改写历史。",
+      inputSchema: jsonSchema<ContextLoadInput & { compartmentId?: string; offset?: number }>({
         type: "object",
         properties: {
           blockId: { type: "string", minLength: 1, maxLength: 256 },
+          compartmentId: { type: "string", minLength: 1, maxLength: 256, description: "旧接口兼容别名；新调用使用 blockId" },
+          offset: { type: "integer", minimum: 0, maximum: 0, description: "旧接口仅支持起始页；续读使用 nextCursor" },
           cursor: { type: "string", maxLength: 256 },
           limit: { type: "integer", minimum: 1, maximum: 50 },
         },
-        required: ["blockId"],
+        anyOf: [{ required: ["blockId"] }, { required: ["compartmentId"] }],
         additionalProperties: false,
       }),
-      execute: (input: ContextLoadInput) => run(() => workspace.load(input)),
+      execute: (input: ContextLoadInput & { compartmentId?: string; offset?: number }) =>
+        run(() => {
+          if (input.offset) throw new ContextSourceError("LegacyOffsetUseCursor");
+          return workspace.load({ ...input, blockId: input.blockId ?? input.compartmentId ?? "" });
+        }),
     },
     {
-      name: "ctx_release",
-      description: "释放已加载的历史块页，后续步骤不再驻留该正文。重复释放幂等；原文和摘要不删除。",
+      name: "ctx_reduce",
+      description:
+        "标记历史块在下一安全请求释放。返回 pending/applied/held；当前输入、活跃工具链及没有有效摘要的原文受保护。重复标记幂等，原文和各档摘要不删除。",
       inputSchema: jsonSchema<{ blockId: string }>({
         type: "object",
         properties: { blockId: { type: "string", minLength: 1, maxLength: 256 } },
@@ -381,6 +388,14 @@ export function createContextWorkspaceTools(workspace: ContextWorkspace): AgentT
       }),
       execute: (input: { blockId: string }) => run(() => workspace.release(input.blockId)),
     },
+  ];
+  return [
+    ...tools,
+    ...["ctx_blocks", "ctx_load", "ctx_release"].map((name, index) => ({
+      ...tools[index]!,
+      name,
+      description: `兼容旧调用；等价于 ${tools[index]!.name}。${tools[index]!.description}`,
+    })),
   ];
 }
 

@@ -67,7 +67,9 @@ describe("public types", () => {
     expectTypeOf<Array<keyof AgentCustomMessages>>().toEqualTypeOf<
       Array<"example.custom" | "example.user" | "compact.summary" | "custom.note" | "custom.visible">
     >();
-    expectTypeOf<Array<keyof AgentCustomEntries>>().toEqualTypeOf<Array<"compact" | "event" | "example.entry" | "message" | "state">>();
+    expectTypeOf<Array<keyof AgentCustomEntries>>().toEqualTypeOf<
+      Array<"compact" | "continuity" | "context-region" | "event" | "example.entry" | "message" | "state">
+    >();
     expectTypeOf<AgentCustomState>().toMatchTypeOf<{ exampleFlag?: boolean }>();
     expectTypeOf<Array<keyof AgentCustomChannelEvents>>().toEqualTypeOf<Array<"example" | "internal" | "stream">>();
     expectTypeOf<AgentInternalEventInit>().toMatchTypeOf<{ type: string }>();

@@ -47,7 +47,7 @@ import {
   type CompactFragmentLineageNode,
   type CompactFragmentRecallSource,
 } from "../conversations/fragment-store.js";
-import type { CompactInput, CompactReason, CompactResult } from "../conversations/index.js";
+import type { CompactInput, CompactReason, CompactResult, Conversation } from "../conversations/index.js";
 import { createInternalHistoryProjectionPlugin } from "../conversations/internal-history.js";
 import type { MessageBatchController, MessageBatchInput, MessageBatchPlugin } from "../message-batches/index.js";
 import {
@@ -190,7 +190,7 @@ export class ChannelRuntime {
         onFailed: (notice) => this.announceSendFailed(notice),
       }),
       createReadTool(options.channel.resources, options.readImagePolicy, this.imageProjection),
-      createExpandCompartmentTool(options.channel.conversation),
+      ...(options.config.session.magicContext?.enabled ? [] : [createExpandCompartmentTool(options.channel.conversation)]),
       createFinishTool(),
     ];
     if (options.visionModel && options.readImagePolicy.mode !== "native") {
@@ -227,6 +227,7 @@ export class ChannelRuntime {
               };
             },
             maxOutputTokens: (model) => this.contextWorkspace!.outputLimit(model),
+            onModelUsage: ({ turnId, stepNumber, inputTokens }) => this.contextWorkspace!.observeUsage(turnId, stepNumber, inputTokens),
           }
         : {}),
       // Every Core turn must end on a terminal tool: `finish` for silence, `send_message` for
@@ -263,8 +264,9 @@ export class ChannelRuntime {
               },
             ]
           : []),
+        // Read-only legacy compact/continuity compatibility; this never schedules compaction.
         this.compactRecallPlugin(channelKey),
-        createSummaryHistoryPlugin(inlineFragmentCount(options.config), projection),
+        createSummaryHistoryPlugin(inlineFragmentCount(options.config), projection, this.contextWorkspace ? undefined : options.channel.conversation),
         createInternalHistoryProjectionPlugin(options.historyProjection ?? "default", projection),
         createModelInputPlugin(
           options.historyProjection ?? "default",
@@ -384,6 +386,7 @@ export class ChannelRuntime {
     options: CompactionStartOptions,
     scheduled: boolean,
   ): { readonly started: boolean; readonly task: Promise<CompactResult> } {
+    if (this.contextWorkspace) return { started: false, task: Promise.resolve({ compacted: false, reason: "magic_context_managed" }) };
     if (this.compactionTask) return { started: false, task: this.compactionTask };
 
     const controller = new AbortController();
@@ -838,7 +841,7 @@ export class ChannelRuntime {
   /** Provider-reported prompt size is the only automatic compaction trigger. */
   private observePromptUsage(event: TurnStepEvent): void {
     const inputTokens = event.usage?.inputTokens;
-    this.contextWorkspace?.observeUsage(event.turnId, event.step, inputTokens);
+    if (this.contextWorkspace) return; // Direct main-model callback owns Magic usage and scheduling.
     if (typeof inputTokens !== "number" || !Number.isFinite(inputTokens) || inputTokens <= PROMPT_LIMIT_INPUT_TOKENS) return;
     if (this.promptLimitCompact && this.promptLimitCompact.inputTokens >= inputTokens) return;
 
@@ -1141,7 +1144,8 @@ export function createModelInputPlugin(mode: HistoryProjectionMode = "default", 
     toModelMessages: async (message, context) => {
       if (isDeliveredTranscript(message)) {
         if (mode === "gemini-native") return [];
-        const transcripts = context.history.filter(isDeliveredTranscript);
+        // Magic must select bounded canonical source units before any cross-source merge.
+        const transcripts = deferMerge ? [message] : context.history.filter(isDeliveredTranscript);
         if (transcripts[0]?.id !== message.id) return [];
         const output = formatDeliveredTranscriptHistory(transcripts);
         context.projection?.inherit(output, transcripts);
@@ -1205,13 +1209,30 @@ function inlineFragmentCount(config: Config): number {
  * older ones live in the fragment store and are recalled on demand. Every summary is emitted as a
  * leading system entry before any non-system content.
  */
-function createSummaryHistoryPlugin(inlineFragments: number, projection?: AgentRequestProjection): AgentPlugin {
+function createSummaryHistoryPlugin(inlineFragments: number, projection?: AgentRequestProjection, legacyRegions?: Conversation): AgentPlugin {
   return {
     name: "core.compact-history",
     enforce: "pre",
-    transformEntries: (entries) => {
+    transformEntries: async (entries) => {
+      const regionalSummaries: AgentEntry[] = [];
+      if (legacyRegions && entries.some((entry) => entry.type === "context-region")) {
+        const rawIds = new Set(entries.filter((entry) => entry.type === "message").map((entry) => entry.id));
+        const archived = (await legacyRegions.contextRegions()).filter((region) => !region.data.sourceEntryIds.every((id) => rawIds.has(id)));
+        for (const region of archived.slice(-Math.max(1, inlineFragments))) {
+          regionalSummaries.push(
+            createEntry(
+              "message",
+              createSystemMessage(formatResidentCompactFragment(region.data.tiers.P1, { id: region.id, mode: "compartment" }), {
+                id: region.id,
+                timestamp: region.timestamp,
+              }),
+              { id: region.id, timestamp: region.timestamp },
+            ),
+          );
+        }
+      }
       const boundary = resolveLatestCompactBoundary(entries);
-      if (!boundary) return [...entries];
+      if (!boundary) return [...regionalSummaries, ...entries];
 
       const resident = entries
         .filter((entry): entry is Extract<AgentEntry, { type: "compact" }> => entry.type === "compact")
@@ -1242,7 +1263,7 @@ function createSummaryHistoryPlugin(inlineFragments: number, projection?: AgentR
       });
       const preservedBeforeCompact = entries.slice(boundary.tailStartIndex, boundary.compactIndex).filter((entry) => entry.type !== "compact");
       const afterCompact = entries.slice(boundary.compactIndex + 1);
-      return [...summaries, ...preservedBeforeCompact, ...afterCompact];
+      return [...regionalSummaries, ...summaries, ...preservedBeforeCompact, ...afterCompact];
     },
   };
 }

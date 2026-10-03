@@ -13,6 +13,7 @@ import {
 import type { LanguageModel } from "ai";
 
 import type { MessageRecord } from "../messages/index.js";
+import { requestUnits } from "../runtimes/context-budget.js";
 import { resolveLatestCompactBoundary } from "./boundary.js";
 import {
   compactSourceTimestamp,
@@ -27,14 +28,27 @@ import {
   type CompressionRecord,
 } from "./compact.js";
 import {
+  contextRegionLineage,
+  contextRegionSource,
   normalizedSessionId,
   rangeFingerprint,
+  resolveCompactAlias,
   resolveCompactSource,
+  resolveContextRegionSource,
+  validatedContextRegions,
   type CompactEntry,
   type ContextSourceSnapshot,
   type ContinuityEntry,
 } from "./context-blocks.js";
 import { recallTerms, type CompactFragmentInput, type CompactFragmentWriter } from "./fragment-store.js";
+import {
+  CONTEXT_REGION_PROMPT_VERSION,
+  validateContextRegionData,
+  validateContextRegionDraft,
+  type ContextRegionDraft,
+  type ContextRegionEntry,
+  type FrozenContextRegion,
+} from "./historian.js";
 
 const DEFAULT_COMPARTMENT_MESSAGES = 20;
 const DEFAULT_COMPARTMENT_CHARS = 12_000;
@@ -105,6 +119,8 @@ export interface CompartmentExpansionResult {
 }
 
 export interface ConversationOptions {
+  /** Magic archives carry verified local regions and uncovered raw history without whole compaction. */
+  readonly magicContext?: boolean;
   /** Channel scope key used to isolate persisted fragments. */
   readonly channelKey?: string;
   /** Persistent overflow index; absent disables persistence and leaves JSONL as the only source. */
@@ -147,8 +163,14 @@ export class Conversation {
   private storagePathValue: string | undefined;
   private fileStorageValue: AgentStorage<AgentEntry> | undefined;
   private storageTail: Promise<void> = Promise.resolve();
+  private initializing: Promise<void> | undefined;
+  private storageGenerationValue = 0;
+  private readonly frozenRegions = new WeakSet<FrozenContextRegion>();
   private failures = 0;
-  private readonly compactSourceIndex = new Map<string, { stamp: string; compacts: readonly CompactEntry[]; continuities: readonly ContinuityEntry[] }>();
+  private readonly compactSourceIndex = new Map<
+    string,
+    { stamp: string; compacts: readonly CompactEntry[]; continuities: readonly ContinuityEntry[]; regions: readonly ContextRegionEntry[] }
+  >();
 
   public constructor(root: string, compactConfig: ConversationCompactConfig = { minMessages: 15, maxFailures: 3 }, options: ConversationOptions = {}) {
     this.root = root;
@@ -162,14 +184,118 @@ export class Conversation {
     return {
       append: (...entries) => this.mutateStorage(() => Promise.resolve(this.currentStorage().append(...entries))),
       read: () => this.readStorage(),
-      clear: () => this.mutateStorage(() => Promise.resolve(this.currentStorage().clear())),
+      clear: () =>
+        this.mutateStorage(async () => {
+          this.storageGenerationValue += 1;
+          await this.currentStorage().clear();
+        }),
     };
   }
 
   public async init(): Promise<void> {
+    if (this.initializing) return this.initializing;
     if (this.storagePathValue) return;
-    this.setStorage(await this.createOrResolve());
-    await this.rebuildCompactFragments();
+    this.initializing = (async () => {
+      this.setStorage(await this.createOrResolve());
+      await this.rebuildCompactFragments();
+    })();
+    try {
+      await this.initializing;
+    } finally {
+      this.initializing = undefined;
+    }
+  }
+
+  public get storageGeneration(): number {
+    return this.storageGenerationValue;
+  }
+
+  /** A short canonical read; auxiliary generation happens after this mutation queue is released. */
+  public async freezeContextRegion(sourceEntryIds: readonly string[]): Promise<FrozenContextRegion> {
+    const sourceIds = [...sourceEntryIds];
+    await this.init();
+    return this.mutateStorage(async () => {
+      const entries = await this.currentStorage().read();
+      const sessionId = this.currentSessionId();
+      const source = contextRegionSource(entries, sourceIds);
+      const frozen: FrozenContextRegion = Object.freeze({
+        ...source,
+        sessionId,
+        sourceSession: sessionId,
+        storageGeneration: this.storageGenerationValue,
+        lineageId: contextRegionLineage(entries, sessionId),
+        promptVersion: CONTEXT_REGION_PROMPT_VERSION,
+        sourceEntryIds: Object.freeze(source.sourceEntryIds),
+        records: Object.freeze(source.records.map((record) => Object.freeze(record))),
+      });
+      this.frozenRegions.add(frozen);
+      return frozen;
+    });
+  }
+
+  /** A complete, validated region is appended in one JSONL entry, never as partial tier records. */
+  public async commitContextRegion(frozen: FrozenContextRegion, draft: ContextRegionDraft, signal?: AbortSignal): Promise<ContextRegionEntry> {
+    const semantic = validateContextRegionDraft(draft);
+    return this.mutateStorage(async () => {
+      signal?.throwIfAborted();
+      if (!this.frozenRegions.has(frozen) || frozen.sessionId !== this.currentSessionId() || frozen.storageGeneration !== this.storageGenerationValue)
+        throw new Error("StaleContextRegion");
+      const entries = await this.currentStorage().read();
+      const source = contextRegionSource(entries, frozen.sourceEntryIds);
+      if (
+        contextRegionLineage(entries, frozen.sessionId) !== frozen.lineageId ||
+        source.sourceFingerprint !== frozen.sourceFingerprint ||
+        source.sourceProjectionFingerprint !== frozen.sourceProjectionFingerprint ||
+        source.sourceStartAt !== frozen.sourceStartAt ||
+        source.sourceEndAt !== frozen.sourceEndAt
+      )
+        throw new Error("ContextRegionSourceConflict");
+      const snapshot = await this.regionSourceSnapshot(entries);
+      let reused: ContextRegionEntry | undefined;
+      for (const existing of entries) {
+        if (existing.type !== "context-region") continue;
+        let data;
+        try {
+          data = validateContextRegionData(existing.data);
+        } catch {
+          continue;
+        }
+        if (!data.sourceEntryIds.some((id) => frozen.sourceEntryIds.includes(id))) continue;
+        if (
+          data.sourceSession !== frozen.sourceSession ||
+          data.lineageId !== frozen.lineageId ||
+          data.sourceFingerprint !== frozen.sourceFingerprint ||
+          JSON.stringify(data.sourceEntryIds) !== JSON.stringify(frozen.sourceEntryIds)
+        )
+          throw new Error("ContextRegionSourceConflict");
+        await resolveContextRegionSource(snapshot, existing);
+        if (reused && JSON.stringify(reused.data) !== JSON.stringify(existing.data)) throw new Error("ContextRegionSourceConflict");
+        reused = existing;
+      }
+      signal?.throwIfAborted();
+      if (reused) return reused;
+      const data = validateContextRegionData({
+        version: 1,
+        lineageId: frozen.lineageId,
+        sourceSession: frozen.sourceSession,
+        sourceEntryIds: [...frozen.sourceEntryIds],
+        sourceFingerprint: frozen.sourceFingerprint,
+        sourceStartAt: frozen.sourceStartAt,
+        sourceEndAt: frozen.sourceEndAt,
+        promptVersion: frozen.promptVersion,
+        ...semantic,
+      });
+      const entry = createEntry("context-region", data);
+      signal?.throwIfAborted();
+      await this.currentStorage().append(entry);
+      return entry;
+    });
+  }
+
+  /** Only current reachable roots are recovered; archived originals are verified, not re-summarized. */
+  public async contextRegions(): Promise<readonly ContextRegionEntry[]> {
+    await this.init();
+    return this.mutateStorage(async () => validatedContextRegions(await this.regionSourceSnapshot(await this.currentStorage().read())));
   }
 
   public currentSessionId(): string {
@@ -215,40 +341,54 @@ export class Conversation {
 
   public async switch(id: string): Promise<void> {
     await this.init();
-    await this.storageTail;
     const filename = id.endsWith(".jsonl") ? id : `${id}.jsonl`;
     if (!/^[0-9A-Za-zTZ_-]+\.jsonl$/.test(filename)) throw new Error("Invalid session id");
-    const path = join(this.sessionsPath(), filename);
-    await stat(path);
-    this.setStorage(path);
+    await this.mutateStorage(async () => {
+      const path = join(this.sessionsPath(), filename);
+      await stat(path);
+      this.setStorage(path);
+    });
     await this.rebuildCompactFragments();
   }
 
   public async archive(noSummary = false, input?: CompactInput): Promise<void> {
     await this.init();
+    if (this.options.magicContext) {
+      await this.mutateStorage(() => this.archiveMagic(noSummary));
+      await this.rebuildCompactFragments();
+      return;
+    }
     if ((await this.readStorage()).length === 0) throw new Error("Cannot archive an empty session");
     if (!noSummary && input) {
       const result = await this.compact("manual", input);
       const entries = await this.readStorage();
       const resident = this.archiveSeed(entries);
       if (result.compacted || resident.some((entry) => entry.type === "compact" || entry.type === "continuity")) {
-        this.setStorage(await this.createSession(resident));
+        await this.mutateStorage(async () => this.setStorage(await this.createSession(this.archiveSeed(await this.currentStorage().read()))));
         await this.rebuildCompactFragments();
         return;
       }
     }
-    this.setStorage(await this.createSession());
+    await this.mutateStorage(async () => this.setStorage(await this.createSession()));
     await this.rebuildCompactFragments();
   }
 
   public async archiveIfOversize(maxBytes: number, input?: CompactInput): Promise<boolean> {
     await this.init();
     if (maxBytes <= 0) return false;
+    if (this.options.magicContext) {
+      const archived = await this.mutateStorage(async () => {
+        if ((await stat(this.storagePathValue!)).size <= maxBytes) return false;
+        return this.archiveMagic(false, true);
+      });
+      if (archived) await this.rebuildCompactFragments();
+      return archived;
+    }
     const active = (await this.status()).active;
     if (!active || active.size <= maxBytes) return false;
     const resident = this.archiveSeed(await this.readStorage());
     if (resident.some((entry) => entry.type === "compact" || entry.type === "continuity")) {
-      this.setStorage(await this.createSession(resident));
+      await this.mutateStorage(async () => this.setStorage(await this.createSession(this.archiveSeed(await this.currentStorage().read()))));
       await this.rebuildCompactFragments();
     } else {
       await this.archive(!input, input);
@@ -292,18 +432,23 @@ export class Conversation {
   /** Rebuildable archive metadata index; never caches a second copy of archived raw bodies. */
   public async contextSources(): Promise<ContextSourceSnapshot> {
     if (!this.storagePathValue) throw new Error("Conversation has not been initialized");
-    await this.storageTail;
+    return this.mutateStorage(() => this.contextSourcesNow());
+  }
+
+  private async contextSourcesNow(): Promise<ContextSourceSnapshot> {
     const sessionId = this.currentSessionId();
-    const entries = await this.readStorage();
+    const entries = await this.currentStorage().read();
     const filenames = (await this.files()).filter((name) => /^[0-9A-Za-zTZ_-]+\.jsonl$/.test(name));
     const sessionIds = filenames.map(normalizedSessionId);
     const compacts: CompactEntry[] = [];
     const continuities: ContinuityEntry[] = [];
+    const regions: ContextRegionEntry[] = [];
     for (const filename of filenames) {
       const id = normalizedSessionId(filename);
       if (id === sessionId) {
         compacts.push(...entries.filter((entry): entry is CompactEntry => entry.type === "compact"));
         continuities.push(...entries.filter((entry): entry is ContinuityEntry => entry.type === "continuity"));
+        regions.push(...entries.filter((entry): entry is ContextRegionEntry => entry.type === "context-region"));
         continue;
       }
       const info = await stat(join(this.sessionsPath(), filename));
@@ -312,21 +457,26 @@ export class Conversation {
       if (cached?.stamp === stamp) {
         compacts.push(...cached.compacts);
         continuities.push(...cached.continuities);
+        regions.push(...cached.regions);
         continue;
       }
       const historical = await createJsonlStorage(join(this.sessionsPath(), filename)).read();
       const indexed = historical.filter((entry): entry is CompactEntry => entry.type === "compact");
       const indexedContinuities = historical.filter((entry): entry is ContinuityEntry => entry.type === "continuity");
-      this.compactSourceIndex.set(id, { stamp, compacts: indexed, continuities: indexedContinuities });
+      const indexedRegions = historical.filter((entry): entry is ContextRegionEntry => entry.type === "context-region");
+      this.compactSourceIndex.set(id, { stamp, compacts: indexed, continuities: indexedContinuities, regions: indexedRegions });
       compacts.push(...indexed);
       continuities.push(...indexedContinuities);
+      regions.push(...indexedRegions);
     }
     for (const id of this.compactSourceIndex.keys()) if (!sessionIds.includes(id)) this.compactSourceIndex.delete(id);
     return {
       sessionId,
+      lineageId: contextRegionLineage(entries, sessionId),
       entries,
       compacts,
       continuities,
+      regions,
       sessionIds,
       readSession: async (input) => {
         const id = normalizedSessionId(input);
@@ -501,7 +651,22 @@ export class Conversation {
     if (!Number.isInteger(requestedLimit) || requestedLimit <= 0) throw new Error("Compartment expansion limit must be a positive integer");
     const limit = Math.min(requestedLimit, MAX_EXPANSION_PAGE_SIZE);
 
-    const source = await resolveCompactSource(await this.contextSources(), compartmentId);
+    const snapshot = await this.contextSources();
+    const region = (await validatedContextRegions(snapshot)).find((entry) => entry.id === compartmentId);
+    if (region) {
+      const source = await resolveContextRegionSource(snapshot, region);
+      const entries = source.records.slice(offset, offset + limit);
+      return {
+        compartmentId: region.id,
+        label: "historical region",
+        offset,
+        limit,
+        total: source.records.length,
+        entries,
+        ...(offset + entries.length < source.records.length ? { nextOffset: offset + entries.length } : {}),
+      };
+    }
+    const source = await resolveCompactSource(snapshot, compartmentId);
     const records = source.range.flatMap(renderCompressionRecords);
     const entries = records.slice(offset, offset + limit);
     const nextOffset = offset + entries.length < records.length ? offset + entries.length : undefined;
@@ -653,6 +818,7 @@ export class Conversation {
   }
 
   private setStorage(path: string): void {
+    this.storageGenerationValue += 1;
     this.storagePathValue = path;
     this.fileStorageValue = createJsonlStorage(path);
   }
@@ -673,6 +839,85 @@ export class Conversation {
 
   private readStorage(): Promise<Readonly<AgentEntry[]>> {
     return this.storageTail.then(() => this.currentStorage().read());
+  }
+
+  /** Minimal source snapshot for short freeze/commit/recovery operations; no archive-corpus scan. */
+  private async regionSourceSnapshot(entries: readonly AgentEntry[]): Promise<ContextSourceSnapshot> {
+    const sessionId = this.currentSessionId();
+    const sessionIds = (await this.files()).map(normalizedSessionId);
+    const reads = new Map<string, Promise<readonly AgentEntry[]>>();
+    return {
+      sessionId,
+      lineageId: contextRegionLineage(entries, sessionId),
+      entries,
+      compacts: entries.filter((entry): entry is CompactEntry => entry.type === "compact"),
+      regions: entries.filter((entry): entry is ContextRegionEntry => entry.type === "context-region"),
+      sessionIds,
+      readSession: async (input) => {
+        const id = normalizedSessionId(input);
+        if (!sessionIds.includes(id)) throw new Error("ContextRegionSourceUnavailable");
+        if (id === sessionId) return entries;
+        let read = reads.get(id);
+        if (!read) {
+          read = Promise.resolve(createJsonlStorage(join(this.sessionsPath(), `${id}.jsonl`)).read());
+          reads.set(id, read);
+        }
+        return read;
+      },
+    };
+  }
+
+  /** Magic archive never invokes a model and carries every uncovered record, even without summaries. */
+  private async archiveMagic(noSummary: boolean, onlyIfSmaller = false): Promise<boolean> {
+    const entries = await this.currentStorage().read();
+    if (!entries.length) throw new Error("Cannot archive an empty session");
+    let seed: readonly AgentEntry[] = [];
+    if (!noSummary) {
+      const snapshot = await this.regionSourceSnapshot(entries);
+      const regions = await validatedContextRegions(snapshot);
+      const regionIds = new Set(regions.map((entry) => entry.id));
+      const covered = new Set(regions.flatMap((entry) => entry.data.sourceEntryIds));
+      const legacyIds = new Set<string>();
+      for (const entry of entries) {
+        try {
+          if (entry.type === "continuity") {
+            const data = validateContinuityEntryData(entry.data);
+            if (data.lineageId === snapshot.lineageId && (await continuitySourceAvailable(snapshot, data))) legacyIds.add(entry.id);
+          } else if (entry.type === "compact") {
+            const canonical = resolveCompactAlias(snapshot.compacts, entry.id);
+            if (typeof canonical.data.summary !== "string" || !canonical.data.summary.trim()) continue;
+            if (canonical.data.firstEntryId && canonical.data.lastEntryId) {
+              const source = await resolveCompactSource(snapshot, entry.id);
+              for (const sourceEntry of source.range) covered.add(sourceEntry.id);
+            }
+            legacyIds.add(entry.id);
+          }
+        } catch {
+          /* Invalid derived metadata must not become an archive seed. Raw remains intact. */
+        }
+      }
+      const messages = entries.filter((entry) => entry.type === "message");
+      const units = requestUnits(
+        messages.map((entry) => ({ content: "content" in entry.data ? entry.data.content : [] })),
+        messages.map((entry) => ({ kind: "history" as const, sourceEntryIds: [entry.id] })),
+      );
+      const removable = new Set<string>();
+      for (const unit of units) {
+        if (!unit.mandatory && [...unit.sourceEntryIds].every((id) => covered.has(id))) for (const id of unit.sourceEntryIds) removable.add(id);
+      }
+      // Original files remain untouched. Carry only verified semantic regions and uncovered
+      // protocol units; the non-Magic history adapter can render regions after a mode switch.
+      seed = entries.filter((entry) => {
+        if (entry.type === "context-region") return regionIds.has(entry.id);
+        if (entry.type === "compact" || entry.type === "continuity") return legacyIds.has(entry.id);
+        return !removable.has(entry.id);
+      });
+    }
+    // An automatic archive with an identical seed would make another oversized file on every
+    // inbound message. Wait for useful committed coverage instead; manual archive still rotates.
+    if (onlyIfSmaller && seed.length >= entries.length) return false;
+    this.setStorage(await this.createSession(seed));
+    return true;
   }
 
   /** The newest `inlineFragments` compact entries stay resident and are projected into context. */
@@ -966,3 +1211,5 @@ function formatTimestamp(date: Date): string {
     .replace(/[-:]/g, "")
     .replace(/\.\d{3}/, "");
 }
+
+export type { ContextRegionDraft, ContextRegionEntry, FrozenContextRegion } from "./historian.js";

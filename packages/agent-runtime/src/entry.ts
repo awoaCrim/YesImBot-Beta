@@ -63,7 +63,23 @@ export interface ContinuityEntryData {
   parentStateId?: string;
 }
 
+/** Opaque, atomic historical region commit. Core owns source validation and request rendering. */
+export interface ContextRegionEntryData {
+  version: 1;
+  lineageId: string;
+  sourceSession: string;
+  sourceEntryIds: string[];
+  /** Binds both the canonical source entries and their delivery-safe readable projection. */
+  sourceFingerprint: string;
+  sourceStartAt: number;
+  sourceEndAt: number;
+  tiers: { P1: string; P2: string; P3: string; P4: string };
+  importance: number;
+  promptVersion: string;
+}
+
 export interface AgentCustomEntries {
+  "context-region": ContextRegionEntryData;
   compact: CompactEntryData;
   continuity: ContinuityEntryData;
   event: AgentInternalEvent;

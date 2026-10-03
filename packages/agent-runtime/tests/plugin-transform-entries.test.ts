@@ -235,6 +235,43 @@ describe("transformEntries hook", () => {
     expect(JSON.stringify(modelRequests)).not.toContain("OLD_HISTORY_SENTINEL");
   });
 
+  it("does not collect deferred ordinary appends into an active event continuation", async () => {
+    const modelRequests: LanguageModelV3Message[][] = [];
+    let entered!: () => void;
+    let release!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const agent = createAgent({
+      model: createSendMessageContinuationModel(modelRequests),
+      tools: [
+        {
+          name: "send_message",
+          inputSchema: z.object({ messages: z.array(z.string()), continue: z.boolean().optional() }),
+          execute: async () => {
+            entered();
+            await gate;
+            return { ok: true, count: 1 };
+          },
+        },
+      ],
+    });
+    const event = Array.fromAsync(agent.run(createUserMessage("isolated event"), { historyMode: "event" }));
+    await ready;
+    const ordinary = createUserMessage("DEFERRED ordinary input");
+    await agent.append(ordinary);
+    agent.send(ordinary, { ifBusy: "defer" });
+    release();
+    await event;
+    await agent.wait();
+    expect(JSON.stringify(modelRequests[1])).toContain("isolated event");
+    expect(JSON.stringify(modelRequests[1])).not.toContain("DEFERRED ordinary input");
+    expect(JSON.stringify(modelRequests[2])).toContain("DEFERRED ordinary input");
+  });
+
   it("keeps projected compact summaries before raw current-turn continuation entries", async () => {
     const modelRequests: LanguageModelV3Message[][] = [];
     const storage = createMemoryStorage<AgentEntry>([createEntry("message", createUserMessage("old request"), { id: "old-user", timestamp: 1 })]);

@@ -46,7 +46,7 @@ export interface ContextBudgetPlanOptions {
   readonly preserveSourceEntryIds?: ReadonlySet<string>;
 }
 
-interface RequestUnit {
+export interface RequestUnit {
   readonly indices: number[];
   mandatory: boolean;
   kind: AgentRequestOrigin["kind"];
@@ -255,17 +255,7 @@ export function planContextRequest(
   };
 }
 
-function contextToolHistoryCost(message: ModelMessage): number {
-  if (message.role !== "tool") return 0;
-  return message.content.reduce(
-    (sum, part) =>
-      sum +
-      (part.type === "tool-result" && ["ctx_blocks", "ctx_load", "ctx_release", "ctx_expand"].includes(part.toolName) ? 32 + estimateContextValue(part) : 0),
-    0,
-  );
-}
-
-function requestUnits(messages: readonly ModelMessage[], origins: readonly (AgentRequestOrigin | undefined)[]): RequestUnit[] {
+export function requestUnits(messages: readonly { readonly content: unknown }[], origins: readonly (AgentRequestOrigin | undefined)[]): RequestUnit[] {
   const parents = messages.map((_, index) => index);
   const find = (index: number): number => {
     while (parents[index] !== index) index = parents[index]!;
@@ -325,6 +315,16 @@ function requestUnits(messages: readonly ModelMessage[], origins: readonly (Agen
     byRoot.set(root, unit);
   });
   return [...byRoot.values()];
+}
+
+function contextToolHistoryCost(message: ModelMessage): number {
+  if (message.role !== "tool") return 0;
+  return message.content.reduce(
+    (sum, part) =>
+      sum +
+      (part.type === "tool-result" && ["ctx_blocks", "ctx_load", "ctx_release", "ctx_expand"].includes(part.toolName) ? 32 + estimateContextValue(part) : 0),
+    0,
+  );
 }
 
 async function contextToolDefinitions(tools: ToolSet): Promise<unknown[]> {
