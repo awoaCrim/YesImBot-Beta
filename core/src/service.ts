@@ -56,6 +56,7 @@ export default class YesImBotService extends Service<Config> {
       imageInput: config.imageInput,
       readTimeoutMs: config.resourceReadTimeout * 1000,
       compactConfig: config.session.compact,
+      magicContext: config.session.magicContext?.enabled,
     });
     const agentsLogger = ctx.logger("yesimbot.agents");
     agentsLogger.level = config.logLevel ?? 2;

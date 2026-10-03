@@ -108,6 +108,8 @@ export interface AgentConfig {
    * replaces the request for this step; throwing prevents the provider request.
    */
   beforeModelRequest?: AgentModelRequestGuard;
+  /** Synchronous main-model observation before the next request; stepNumber is turn-global. */
+  onModelUsage?: (context: { turnId: string; stepNumber: number; inputTokens: number | undefined }) => void;
   /** Optional request-only provenance for guards; no metadata is added to provider messages. */
   requestProjection?: AgentRequestProjection;
   /** Optional output cap. Absent preserves the provider's existing default. */
@@ -523,7 +525,9 @@ export function createAgent(config: AgentConfig): Agent {
         if (entry.type === "message") liveTurnEntries.set(entry.id, entry);
       }
     };
-    activeTurnEntryCollector = rememberLiveEntries;
+    // Event turns admit only their explicit current/joined inputs and step outputs below.
+    // Unscoped appends may belong to a deferred conversation turn, not this isolated event.
+    activeTurnEntryCollector = request.historyMode === "event" ? undefined : rememberLiveEntries;
     let turnUsage: Partial<LanguageModelUsage> | undefined;
     let latestStepUsage: Partial<LanguageModelUsage> | undefined;
     let currentBatch = request.messages.splice(0, request.messages.length);
@@ -623,7 +627,7 @@ export function createAgent(config: AgentConfig): Agent {
               currentMessageIds: [...liveTurnEntries.keys()],
               ...(config.requestProjection ? { projection: config.requestProjection, historyMode: request.historyMode } : {}),
               turnId: request.turnId,
-              stepNumber,
+              stepNumber: nextTurnStepNumber,
               signal: abortSignal,
               rebuildMessages: async () => {
                 const rebuilt = await buildBoundaryModelMessages(
@@ -660,6 +664,7 @@ export function createAgent(config: AgentConfig): Agent {
             );
             turnUsage = mergeUsage(turnUsage, step.usage);
             latestStepUsage = step.usage;
+            config.onModelUsage?.({ turnId: request.turnId, stepNumber: nextTurnStepNumber, inputTokens: step.usage.inputTokens });
 
             for (const call of step.toolCalls ?? []) {
               if (isTerminalToolCall(call)) {

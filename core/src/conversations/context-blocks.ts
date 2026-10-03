@@ -3,8 +3,9 @@ import { createHash, randomUUID } from "node:crypto";
 import type { AgentEntry } from "@yesimbot/agent-runtime";
 
 import { resolveLatestCompactBoundary } from "./boundary.js";
-import { compactSourceTimestamp, renderVisibleUserRecords, type CompressionRecord } from "./compact.js";
+import { compactSourceTimestamp, renderVisibleUserRecords, validateContinuityEntryData, type CompressionRecord } from "./compact.js";
 import { recallTerms } from "./fragment-store.js";
+import { MAX_CONTEXT_REGION_SOURCE_BYTES, renderContextRegionSource, validateContextRegionData, type ContextRegionEntry } from "./historian.js";
 import { collectDeliveredSourceRecords } from "./internal-history.js";
 
 export type CompactEntry = Extract<AgentEntry, { type: "compact" }>;
@@ -18,9 +19,11 @@ type Cursor =
 /** Archive bodies are read on demand; the persistent-source cache holds compact/continuity metadata only. */
 export interface ContextSourceSnapshot {
   readonly sessionId: string;
+  readonly lineageId?: string;
   readonly entries: readonly AgentEntry[];
   readonly compacts: readonly CompactEntry[];
   readonly continuities?: readonly ContinuityEntry[];
+  readonly regions?: readonly ContextRegionEntry[];
   readonly sessionIds: readonly string[];
   readSession(sessionId: string): Promise<readonly AgentEntry[]>;
 }
@@ -34,7 +37,7 @@ export interface ResolvedCompactSource {
 
 export interface ContextBlockDescriptor {
   readonly id: string;
-  readonly kind: "compact" | "raw";
+  readonly kind: "compact" | "raw" | "context-region";
   readonly sourceState: "raw" | "summary-only" | "unavailable";
   readonly summary?: string;
   readonly startAt?: number;
@@ -90,11 +93,17 @@ export class ContextBlockStore {
     const query = input.query ?? "";
     if (query.length > 1024) throw new ContextSourceError("QueryTooLong");
     const limit = boundedLimit(input.limit, 10, 20);
-    const descriptors = this.catalogue(snapshot, excludeIds);
+    const sourceEpoch = this.epoch;
+    const descriptors = await this.catalogue(snapshot, excludeIds);
+    this.checkEpoch(sourceEpoch);
     const terms = recallTerms(query);
     const candidates = query
       ? descriptors.filter((entry) => {
-          const words = new Set(recallTerms(entry.summary ?? entry.id));
+          const region =
+            entry.kind === "context-region"
+              ? snapshot.entries.find((candidate): candidate is ContextRegionEntry => candidate.type === "context-region" && candidate.id === entry.id)
+              : undefined;
+          const words = new Set(recallTerms(region ? Object.values(region.data.tiers).join(" ") : (entry.summary ?? entry.id)));
           return terms.some((term) => words.has(term));
         })
       : descriptors;
@@ -121,14 +130,22 @@ export class ContextBlockStore {
     this.checkEpoch(pendingEpoch);
     this.syncSession(snapshot.sessionId);
     const sourceEpoch = this.epoch;
-    const catalogue = this.catalogue(snapshot, excludeIds);
+    const catalogue = await this.catalogue(snapshot, excludeIds);
+    this.checkEpoch(sourceEpoch);
     const block = catalogue.find((entry) => entry.id === input.blockId) ?? this.rawDescriptors.get(input.blockId);
     if (!block) throw new ContextSourceError("BlockNotAccessible");
     if (block.sourceState !== "raw") throw new ContextSourceError("RawSourceUnavailable");
     const limit = boundedLimit(input.limit, 50, 50);
     let entries: readonly AgentEntry[];
     let range: readonly AgentEntry[];
-    if (block.kind === "compact") {
+    if (block.kind === "context-region") {
+      const region = snapshot.entries.find((entry): entry is ContextRegionEntry => entry.type === "context-region" && entry.id === block.id);
+      if (!region) throw new ContextSourceError("BlockNotAccessible");
+      const source = await resolveContextRegionSource(snapshot, region);
+      this.checkEpoch(sourceEpoch);
+      entries = source.entries;
+      range = source.range;
+    } else if (block.kind === "compact") {
       const source = await resolveCompactSource(snapshot, block.id);
       this.checkEpoch(sourceEpoch);
       entries = source.entries;
@@ -216,8 +233,26 @@ export class ContextBlockStore {
     this.sessionId = id;
   }
 
-  private catalogue(snapshot: ContextSourceSnapshot, excludeIds: ReadonlySet<string>): ContextBlockDescriptor[] {
+  private async catalogue(snapshot: ContextSourceSnapshot, excludeIds: ReadonlySet<string>): Promise<ContextBlockDescriptor[]> {
     const result: ContextBlockDescriptor[] = [];
+    const regions = await validatedContextRegions(snapshot);
+    const covered = new Set<string>();
+    for (const region of regions) {
+      const data = region.data;
+      if (data.sourceEntryIds.some((id) => excludeIds.has(id))) continue;
+      data.sourceEntryIds.forEach((id) => covered.add(id));
+      result.push({
+        id: region.id,
+        kind: "context-region",
+        sourceState: "raw",
+        summary: preview(data.tiers.P1),
+        sourceSession: data.sourceSession,
+        firstEntryId: data.sourceEntryIds[0],
+        lastEntryId: data.sourceEntryIds.at(-1),
+        startAt: data.sourceStartAt,
+        endAt: data.sourceEndAt,
+      });
+    }
     const boundary = resolveLatestCompactBoundary(snapshot.entries);
     const seen = new Set<string>();
     let compact = boundary?.compact;
@@ -246,7 +281,7 @@ export class ContextBlockStore {
       compact = snapshot.compacts.find((entry) => entry.id === data.parentCompactId);
     }
     const tail = snapshot.entries.slice(boundary?.tailStartIndex ?? 0);
-    for (const group of rawGroups(tail, excludeIds)) {
+    for (const group of rawGroups(tail, new Set([...excludeIds, ...covered]))) {
       const first = group[0]!;
       const last = group.at(-1)!;
       validateSourceIds([first.id, last.id]);
@@ -329,8 +364,111 @@ export function safeSourceRecords(entries: readonly AgentEntry[]): CompressionRe
   });
 }
 
-export function rangeFingerprint(entries: readonly AgentEntry[]): string {
+export function rangeFingerprint(entries: readonly unknown[]): string {
   return hash(JSON.stringify(entries));
+}
+
+/** Exact canonical order, including complete proof context outside the selected range. */
+export function contextRegionSource(entries: readonly AgentEntry[], ids: readonly string[]) {
+  if (!ids.length || new Set(ids).size !== ids.length || Buffer.byteLength(JSON.stringify(ids), "utf8") > MAX_CONTEXT_REGION_SOURCE_BYTES)
+    throw new Error("ContextRegionSourceUnavailable");
+  const wanted = new Set(ids);
+  const selected = entries.filter((entry) => wanted.has(entry.id));
+  if (selected.length !== ids.length || new Set(selected.map((entry) => entry.id)).size !== ids.length || selected.some((entry) => entry.type !== "message"))
+    throw new Error("ContextRegionSourceConflict");
+  const sourceEntryIds = selected.map((entry) => entry.id);
+  const records = safeSourceRecords(entries).filter((record) => wanted.has(record.entryId));
+  renderContextRegionSource(records);
+  const sourceProjectionFingerprint = rangeFingerprint(records);
+  const sourceFingerprint = rangeFingerprint([rangeFingerprint(selected), sourceProjectionFingerprint]);
+  const timestamps = selected.map((entry) => compactSourceTimestamp(entry as Extract<AgentEntry, { type: "message" }>));
+  return {
+    sourceEntryIds,
+    records,
+    sourceFingerprint,
+    sourceProjectionFingerprint,
+    sourceStartAt: Math.min(...timestamps),
+    sourceEndAt: Math.max(...timestamps),
+  };
+}
+
+/** Carried commits are the only archive roots; unrelated same-lineage archive metadata is not imported. */
+export function contextRegionLineage(entries: readonly AgentEntry[], sessionId: string): string {
+  const compact = [...entries].reverse().find((entry) => entry.type === "compact");
+  if (compact?.type === "compact") return compact.data.lineageId ?? compact.id;
+  for (const entry of entries) {
+    if (entry.type !== "context-region" && entry.type !== "continuity") continue;
+    try {
+      const data = entry.type === "context-region" ? validateContextRegionData(entry.data) : validateContinuityEntryData(entry.data);
+      if (typeof data.lineageId === "string" && data.lineageId.length) return data.lineageId;
+    } catch {
+      /* Invalid commits cannot establish lineage. */
+    }
+  }
+  return sessionId;
+}
+
+export async function resolveContextRegionSource(snapshot: ContextSourceSnapshot, entry: ContextRegionEntry) {
+  const data = validateContextRegionData(entry.data);
+  if (data.lineageId !== (snapshot.lineageId ?? contextRegionLineage(snapshot.entries, snapshot.sessionId))) throw new Error("ContextRegionSourceConflict");
+  if (!snapshot.sessionIds.includes(data.sourceSession)) throw new Error("ContextRegionSourceUnavailable");
+  const entries = data.sourceSession === snapshot.sessionId ? snapshot.entries : await snapshot.readSession(data.sourceSession);
+  if (contextRegionLineage(entries, data.sourceSession) !== data.lineageId) throw new Error("ContextRegionSourceConflict");
+  const aliases = entries.filter((candidate) => candidate.id === entry.id);
+  if (aliases.some((candidate) => candidate.type !== "context-region" || JSON.stringify(validateContextRegionData(candidate.data)) !== JSON.stringify(data)))
+    throw new Error("ContextRegionSourceConflict");
+  const source = contextRegionSource(entries, data.sourceEntryIds);
+  if (
+    JSON.stringify(source.sourceEntryIds) !== JSON.stringify(data.sourceEntryIds) ||
+    source.sourceFingerprint !== data.sourceFingerprint ||
+    source.sourceStartAt !== data.sourceStartAt ||
+    source.sourceEndAt !== data.sourceEndAt
+  )
+    throw new Error("ContextRegionSourceConflict");
+  const ids = new Set(data.sourceEntryIds);
+  return { entry, entries, range: entries.filter((candidate) => ids.has(candidate.id)), records: source.records };
+}
+
+/** Restart recovery is fail-closed for malformed, conflicting, overlapping or unavailable commits. */
+export async function validatedContextRegions(snapshot: ContextSourceSnapshot): Promise<readonly ContextRegionEntry[]> {
+  const candidates = snapshot.entries.filter((entry): entry is ContextRegionEntry => entry.type === "context-region");
+  const reachable = new Set(candidates.map((entry) => entry.id));
+  const byId = new Map<string, ContextRegionEntry>();
+  const bad = new Set<string>();
+  for (const entry of [...candidates, ...(snapshot.regions ?? []).filter((region) => reachable.has(region.id))]) {
+    try {
+      const data = validateContextRegionData(entry.data);
+      const previous = byId.get(entry.id);
+      if (previous && JSON.stringify(validateContextRegionData(previous.data)) !== JSON.stringify(data)) throw new Error("ContextRegionSourceConflict");
+      byId.set(entry.id, { ...entry, data });
+    } catch {
+      bad.add(entry.id);
+    }
+  }
+  const valid: ContextRegionEntry[] = [];
+  for (const entry of byId.values()) {
+    if (bad.has(entry.id)) continue;
+    try {
+      await resolveContextRegionSource(snapshot, entry);
+      valid.push(entry);
+    } catch {
+      /* Preserve raw, ignore invalid coverage. */
+    }
+  }
+  const duplicates = new Set<string>();
+  for (let i = 0; i < valid.length; i++) {
+    for (let j = i + 1; j < valid.length; j++) {
+      const left = valid[i]!;
+      const right = valid[j]!;
+      if (!left.data.sourceEntryIds.some((id) => right.data.sourceEntryIds.includes(id))) continue;
+      if (JSON.stringify(left.data) === JSON.stringify(right.data)) duplicates.add(right.id);
+      else {
+        bad.add(left.id);
+        bad.add(right.id);
+      }
+    }
+  }
+  return valid.filter((entry) => !bad.has(entry.id) && !duplicates.has(entry.id));
 }
 
 function rawGroups(entries: readonly AgentEntry[], excluded: ReadonlySet<string>): AgentEntry[][] {

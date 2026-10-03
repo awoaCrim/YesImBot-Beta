@@ -123,6 +123,32 @@ describe("request-only projection", () => {
     }
     expect(JSON.stringify(await agent.storage.read())).not.toContain("sourceEntryIds");
   });
+  it("correlates synchronous main usage with turn-global request IDs across terminal recovery", async () => {
+    const { model, requests } = modelWithCalls(1);
+    const boundaries: number[] = [];
+    const usages: number[] = [];
+    const agent = createAgent({
+      model,
+      requireTerminalTool: true,
+      tools: [
+        { name: "inspect", inputSchema: jsonSchema({ type: "object", properties: {} }), execute: () => ({ ok: true }) },
+        { name: "finish", terminal: true, inputSchema: jsonSchema({ type: "object", properties: {} }), execute: () => ({ ok: true }) },
+      ],
+      beforeModelRequest: async (context) => {
+        expect(usages.length).toBe(boundaries.length);
+        boundaries.push(context.stepNumber);
+      },
+      onModelUsage: (context) => {
+        expect(context.inputTokens).toBe(1);
+        expect(context.stepNumber).toBe(boundaries.at(-1));
+        usages.push(context.stepNumber);
+      },
+    });
+    await Array.fromAsync(agent.run(createUserMessage("current")));
+    expect(requests).toHaveLength(3);
+    expect(boundaries).toEqual([0, 1, 2]);
+    expect(usages).toEqual(boundaries);
+  });
   it("inherits provenance for custom one-to-many model projections but not unknown prepareStep clones", async () => {
     const projection = new AgentRequestProjection();
     const { model } = modelWithCalls();
