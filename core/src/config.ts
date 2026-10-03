@@ -30,7 +30,7 @@ export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     imageInput: Schema.boolean().default(true).description("允许支持图片输入的模型直接接收当前消息图片，并通过 read 工具读取图片"),
     modelRetries: Schema.number().min(0).max(5).default(3).description("主聊天模型遇到可重试 HTTP 429 时的最大重试次数"),
-    resourceReadTimeout: Schema.number().min(1).default(30).description("资源读取超时时间（秒）"),
+    resourceReadTimeout: Schema.number().min(1).default(30).description("上传图片/文件下载及资源读取的超时时间（秒）"),
   }).description("模型输入与资源读取"),
   Schema.object({
     pacing: Schema.object({

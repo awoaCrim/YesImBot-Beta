@@ -33,11 +33,12 @@ interface ResourceBudget {
   images: number;
   files: number;
   bytes: number;
+  timeoutMs: number;
 }
 
-interface ResourceProbe {
-  length: number | null;
-  type: string | null;
+interface DownloadState {
+  stage: "source" | "headers" | "body";
+  timeoutMs: number;
 }
 
 class InputResourceError extends Error {
@@ -47,8 +48,13 @@ class InputResourceError extends Error {
 }
 
 /** Persists inbound image and restricted text-file elements while the Session is live. */
-export async function persistElements(ctx: Context, elements: readonly Element[], resources: ChannelResources): Promise<Element[]> {
-  const budget: ResourceBudget = { images: 0, files: 0, bytes: 0 };
+export async function persistElements(
+  ctx: Context,
+  elements: readonly Element[],
+  resources: ChannelResources,
+  timeoutMs = RESOURCE_TIMEOUT_MS,
+): Promise<Element[]> {
+  const budget: ResourceBudget = { images: 0, files: 0, bytes: 0, timeoutMs };
   const prepared = await Promise.all(elements.map((element) => persistElement(ctx, element, resources.assets, budget)));
   const logger = ctx.logger("yesimbot.resources");
   const imageCount = countElements(prepared, "img");
@@ -78,7 +84,7 @@ async function storeImage(ctx: Context, element: Element, store: AssetStore, bud
 
   let data: Uint8Array;
   try {
-    data = await loadResource(ctx, source, "image", Math.min(MAX_BYTES_PER_IMAGE, remaining));
+    data = await loadResource(ctx, source, "image", Math.min(MAX_BYTES_PER_IMAGE, remaining), budget.timeoutMs);
   } catch (cause) {
     return failedImage(cause instanceof InputResourceError ? cause.code : "download_failed");
   }
@@ -111,7 +117,7 @@ async function storeTextFile(ctx: Context, element: Element, store: AssetStore, 
   if (!filename || !hasTextFileExtension(filename)) return element;
   budget.files += 1;
   try {
-    const data = await loadResource(ctx, element.attrs.src, "text", Math.min(MAX_BYTES_PER_FILE, MAX_TOTAL_BYTES - budget.bytes));
+    const data = await loadResource(ctx, element.attrs.src, "text", Math.min(MAX_BYTES_PER_FILE, MAX_TOTAL_BYTES - budget.bytes), budget.timeoutMs);
     if (budget.bytes + data.byteLength > MAX_TOTAL_BYTES || !isUtf8Text(data)) return element;
     budget.bytes += data.byteLength;
     return h("file", { id: await store.put(data), title: filename });
@@ -142,56 +148,75 @@ function isUtf8Text(bytes: Uint8Array): boolean {
   }
 }
 
-async function loadResource(ctx: Context, src: string, kind: ResourceKind, maxBytes: number): Promise<Uint8Array> {
+async function loadResource(ctx: Context, src: string, kind: ResourceKind, maxBytes: number, timeoutMs: number): Promise<Uint8Array> {
   const controller = new AbortController();
-  let timedOut = false;
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    controller.abort(new Error("Resource download timed out"));
-  }, RESOURCE_TIMEOUT_MS);
+  const startedAt = Date.now();
+  const state: DownloadState = { stage: "source", timeoutMs };
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => {
+      const error = new InputResourceError("timeout");
+      controller.abort(error);
+      reject(error);
+    }, timeoutMs);
+  });
   try {
-    return await loadResourceBytes(ctx, src, kind, controller.signal, maxBytes);
+    const data = await Promise.race([loadResourceBytes(ctx, src, kind, controller.signal, maxBytes, state), deadline]);
+    controller.signal.throwIfAborted();
+    return data;
   } catch (cause) {
-    if (cause instanceof InputResourceError) throw cause;
-    if (timedOut || (cause instanceof Error && /timed out|timeout/i.test(cause.message))) throw new InputResourceError("timeout");
-    if (cause instanceof Error && /exceeds byte limit/i.test(cause.message)) throw new InputResourceError("too_large");
-    throw new InputResourceError("download_failed");
+    const code: ImageFailureCode = controller.signal.aborted
+      ? "timeout"
+      : cause instanceof InputResourceError
+        ? cause.code
+        : cause instanceof Error && /timed out|timeout/i.test(cause.message)
+          ? "timeout"
+          : cause instanceof Error && /exceeds byte limit/i.test(cause.message)
+            ? "too_large"
+            : "download_failed";
+    ctx.logger("yesimbot.resources").warn("resources.input.failed", { kind, stage: state.stage, code, elapsedMs: Date.now() - startedAt, timeoutMs });
+    throw new InputResourceError(code);
   } finally {
     clearTimeout(timeout);
   }
 }
 
-async function loadResourceBytes(ctx: Context, src: string, kind: ResourceKind, signal: AbortSignal, maxBytes: number): Promise<Uint8Array> {
+async function loadResourceBytes(
+  ctx: Context,
+  src: string,
+  kind: ResourceKind,
+  signal: AbortSignal,
+  maxBytes: number,
+  state: DownloadState,
+): Promise<Uint8Array> {
   const data = decodeDataUrl(src, maxBytes);
   if (data) return data;
   const base64 = decodeBase64Url(src, maxBytes);
   if (base64) return base64;
   signal.throwIfAborted();
   if (src.startsWith("file:")) return loadLocalFile(src, signal, maxBytes);
-  return loadRemote(ctx, src, kind, signal, maxBytes);
+  return loadRemote(ctx, src, kind, signal, maxBytes, state);
 }
 
-async function loadRemote(ctx: Context, src: string, kind: ResourceKind, signal: AbortSignal, maxBytes: number): Promise<Uint8Array> {
-  const probe = await headProbe(ctx, src);
-  if (probe !== null && probe.length !== null && probe.length > maxBytes) throw new InputResourceError("too_large");
-  if (probe !== null && !matchesKind(probe.type, kind)) throw new InputResourceError(kind === "image" ? "not_image" : "download_failed");
-  const response = await ctx.http(src, { responseType: "stream", signal });
-  return readBoundedStream(response.data, signal, maxBytes);
-}
-
-async function headProbe(ctx: Context, url: string): Promise<ResourceProbe | null> {
-  let headers: Headers;
+async function loadRemote(ctx: Context, src: string, kind: ResourceKind, signal: AbortSignal, maxBytes: number, state: DownloadState): Promise<Uint8Array> {
+  state.stage = "headers";
+  // HEAD can consume the entire deadline. Validate the streamed GET itself instead.
+  // Handle bad statuses here: Koishi's default rejection decodes the entire error body.
+  const response = await ctx.http(src, { responseType: "stream", signal, timeout: state.timeoutMs, validateStatus: () => true });
   try {
-    headers = await ctx.http.head(url, { timeout: RESOURCE_TIMEOUT_MS });
-  } catch {
-    return null;
+    signal.throwIfAborted();
+    if (response.status >= 400) throw new InputResourceError("download_failed");
+    const rawLength = response.headers.get("content-length");
+    const rawType = response.headers.get("content-type");
+    if (rawLength !== null && /^\d+$/.test(rawLength) && Number(rawLength) > maxBytes) throw new InputResourceError("too_large");
+    const type = rawType === null ? null : rawType.split(";")[0]!.trim().toLowerCase();
+    if (!matchesKind(type, kind)) throw new InputResourceError(kind === "image" ? "not_image" : "download_failed");
+  } catch (cause) {
+    void response.data.cancel().catch(() => undefined);
+    throw cause;
   }
-  const rawLength = headers.get("content-length");
-  const rawType = headers.get("content-type");
-  return {
-    length: rawLength !== null && /^\d+$/.test(rawLength) ? Number(rawLength) : null,
-    type: rawType === null ? null : rawType.split(";")[0]!.trim().toLowerCase(),
-  };
+  state.stage = "body";
+  return readBoundedStream(response.data, signal, maxBytes);
 }
 
 function matchesKind(type: string | null, kind: ResourceKind): boolean {
@@ -214,16 +239,19 @@ async function readBoundedStream(stream: ReadableStream<Uint8Array>, signal: Abo
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let length = 0;
-  const abort = () => void reader.cancel(signal.reason);
+  const abort = () => void reader.cancel(signal.reason).catch(() => undefined);
   signal.addEventListener("abort", abort, { once: true });
   try {
+    if (signal.aborted) abort();
     while (true) {
       signal.throwIfAborted();
       const { done, value } = await reader.read();
+      // cancel() can resolve a pending read as done; that is not a successful EOF.
+      signal.throwIfAborted();
       if (done) break;
       length += value.byteLength;
       if (length > maxBytes) {
-        await reader.cancel(new Error("Resource exceeds byte limit"));
+        void reader.cancel(new Error("Resource exceeds byte limit")).catch(() => undefined);
         throw new Error("Resource exceeds byte limit");
       }
       chunks.push(value);
