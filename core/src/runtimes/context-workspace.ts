@@ -4,7 +4,15 @@ import type { LanguageModel, ModelMessage } from "ai";
 import type { MagicContextConfig } from "../config.js";
 import { ContextBlockStore, ContextSourceError, safeSourceRecords, type ContextBlockPage } from "../conversations/context-blocks.js";
 import { escapeXmlText } from "../conversations/fragment-store.js";
-import { generateContextRegionDraft, renderContextRegionSource, type ContextRegionEntry } from "../conversations/historian.js";
+import {
+  classifyContextRegionFailure,
+  generateContextRegionDraft,
+  renderContextRegionSource,
+  type ContextRegionDraft,
+  type ContextRegionEntry,
+  type ContextRegionFailure,
+  type ContextRegionFailurePhase,
+} from "../conversations/historian.js";
 import type { Conversation } from "../conversations/index.js";
 import {
   ContextBudgetError,
@@ -16,6 +24,9 @@ import {
   type ContextBudget,
 } from "./context-budget.js";
 import { contextCandidates, contextPressure, selectContextTiers, CONTEXT_SAFETY_WAIT_MS } from "./context-policy.js";
+
+const HISTORIAN_MAX_GENERATION_ATTEMPTS = 2;
+const HISTORIAN_RETRY_DELAY_MS = 1000;
 
 export type ContextBlocksInput = { query?: string; cursor?: string; limit?: number };
 
@@ -46,9 +57,13 @@ interface HistorianPlan {
   readonly desiredSavings: number;
 }
 
-interface HistorianProgress {
+interface HistorianProgress extends Partial<{ -readonly [Key in keyof ContextRegionFailure]: ContextRegionFailure[Key] }> {
   mode: HistorianPlan["mode"];
-  reason: "generating" | "safe" | "target" | "exhausted" | "batch-limit" | "no-progress" | "failed";
+  reason: "generating" | "retrying" | "safe" | "target" | "exhausted" | "batch-limit" | "no-progress" | "retry-exhausted" | "non-retryable" | "cancelled";
+  generationAttempts: number;
+  retriedBatches: number;
+  attempt: number;
+  maxAttempts: number;
   plannedBatches: number;
   plannedSources: number;
   attemptedBatches: number;
@@ -376,6 +391,10 @@ export class ContextWorkspace {
     const metadata: HistorianProgress = {
       mode: plan.mode,
       reason: "generating",
+      generationAttempts: 0,
+      retriedBatches: 0,
+      attempt: 0,
+      maxAttempts: HISTORIAN_MAX_GENERATION_ATTEMPTS,
       plannedBatches: plan.batches.length,
       plannedSources: plan.batches.reduce((sum, ids) => sum + ids.length, 0),
       attemptedBatches: 0,
@@ -409,6 +428,16 @@ export class ContextWorkspace {
     let regions = [...this.regions];
     const diagnose = (event: string) => this.diagnose({ event, generation: job.generation, ...metadata });
     diagnose("historian.started");
+    let phase: ContextRegionFailurePhase = "source";
+    let activeSourceKey: string | undefined;
+    const resetFailure = () => {
+      delete metadata.phase;
+      delete metadata.code;
+      delete metadata.retryable;
+      delete metadata.httpStatus;
+      delete metadata.finishReason;
+      delete metadata.outputBytes;
+    };
     const run = async () => {
       for (;;) {
         this.checkGeneration(job.generation);
@@ -431,10 +460,15 @@ export class ContextWorkspace {
           metadata.reason = current.mode === "ordinary" && current.batches.length === 8 ? "batch-limit" : "exhausted";
           break;
         }
+        // Claim the in-flight batch for promotion deduplication, but retry the very
+        // same frozen source here before recording a settled exact-source backoff.
         for (const id of ids) job.attemptedSources.add(id);
         metadata.attemptedBatches += 1;
         metadata.attemptedSources += ids.length;
-        this.attempted.set(JSON.stringify(ids), Date.now());
+        metadata.attempt = 0;
+        phase = "source";
+        activeSourceKey = JSON.stringify(ids);
+        resetFailure();
         let frozen;
         try {
           frozen = await this.conversation.freezeContextRegion(ids);
@@ -444,14 +478,52 @@ export class ContextWorkspace {
           // An unavailable public source is local to this fixed batch. No retry, no raw
           // eviction, and no private-tool fallback; other admitted sources can still help.
           metadata.unavailableBatches += 1;
+          this.attempted.set(activeSourceKey, Date.now());
+          Object.assign(metadata, classifyContextRegionFailure(cause, phase, job.controller.signal));
           diagnose("historian.source_unavailable");
           continue;
         }
+        let draft: ContextRegionDraft;
+        metadata.attempt = 1;
+        for (;;) {
+          this.checkGeneration(job.generation);
+          job.controller.signal.throwIfAborted();
+          phase = "model";
+          metadata.reason = "generating";
+          resetFailure();
+          metadata.generationAttempts += 1;
+          try {
+            draft = await generateContextRegionDraft({
+              model: this.options.continuityModel!,
+              records: frozen.records,
+              signal: job.controller.signal,
+              onOutput: (output) => {
+                Object.assign(metadata, output);
+                diagnose("historian.output");
+              },
+            });
+            break;
+          } catch (cause) {
+            this.checkGeneration(job.generation);
+            job.controller.signal.throwIfAborted();
+            const failure = classifyContextRegionFailure(cause, phase, job.controller.signal);
+            Object.assign(metadata, failure);
+            phase = failure.phase;
+            if (!failure.retryable || metadata.attempt >= HISTORIAN_MAX_GENERATION_ATTEMPTS) throw cause;
+            metadata.reason = "retrying";
+            metadata.retriedBatches += 1;
+            diagnose("historian.retry");
+            // This belongs to the background job, not the foreground safety timer.
+            await waitForHistorianRetry(job.controller.signal);
+            this.checkGeneration(job.generation);
+            metadata.attempt += 1;
+          }
+        }
         this.checkGeneration(job.generation);
-        const draft = await generateContextRegionDraft({ model: this.options.continuityModel!, records: frozen.records, signal: job.controller.signal });
-        this.checkGeneration(job.generation);
+        phase = "commit";
         const entry = await this.conversation.commitContextRegion(frozen, draft, job.controller.signal);
         this.checkGeneration(job.generation);
+        this.attempted.set(activeSourceKey, Date.now());
         // The plan may have been promoted once while the auxiliary call was in flight.
         const before = this.historianEstimate(job.plan, regions);
         if (!regions.some((region) => region.id === entry.id)) regions = [...regions, entry];
@@ -469,13 +541,22 @@ export class ContextWorkspace {
       }
     };
     job.task = run()
-      .catch(() => {
-        if (job.generation !== this.generation) return;
+      .catch((cause: unknown) => {
+        this.syncSession();
+        const failure = classifyContextRegionFailure(cause, phase, job.controller.signal);
+        Object.assign(metadata, failure);
+        if (job.generation !== this.generation) {
+          metadata.reason = "cancelled";
+          diagnose("historian.cancelled");
+          return;
+        }
         this.jobState = "failed";
-        // A model/output/storage failure is systemic, not a reason to try every
-        // different source batch during the same sixty-second safety wait.
+        // Exhausted/permanent failures stop the cohort; never probe every other
+        // source batch during the same safety episode or schedule an unbounded restart.
+        if (activeSourceKey) this.attempted.set(activeSourceKey, Date.now());
         this.historianRetryAfter = Date.now() + 30_000;
-        metadata.reason = "failed";
+        metadata.reason =
+          failure.code === "cancelled" || failure.code === "stale-context" ? "cancelled" : failure.retryable ? "retry-exhausted" : "non-retryable";
         diagnose("historian.failed");
       })
       .finally(() => {
@@ -754,6 +835,25 @@ function modelIdentity(model: LanguageModel): string {
 
 function validateBlockId(id: string): void {
   if (typeof id !== "string" || id.length < 1 || id.length > 256) throw new ContextSourceError("InvalidBlockId");
+}
+
+function waitForHistorianRetry(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+    };
+    const abort = () => {
+      cleanup();
+      reject(new ContextSourceError("ContextStopped"));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, HISTORIAN_RETRY_DELAY_MS);
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+  });
 }
 
 async function joinUntil(job: Promise<void>, deadline: number, signal: AbortSignal): Promise<boolean> {

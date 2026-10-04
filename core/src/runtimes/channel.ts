@@ -210,6 +210,7 @@ export class ChannelRuntime {
         onDiagnostic: (metadata) => {
           const failed =
             metadata.event === "historian.failed" ||
+            metadata.event === "historian.retry" ||
             metadata.event === "maintenance.failed" ||
             (metadata.event === "guard.estimate" && ["safety-deadline", "unresolved-unsafe", "mandatory-overflow"].includes(String(metadata.reason)));
           if (failed) this.logger.warn("runtime.context_budget", metadata);
