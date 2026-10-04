@@ -36,6 +36,7 @@ export function contextCandidates(
   capacity: number,
   multiplier: number,
   baseTokens = 0,
+  sourceCosts?: ReadonlyMap<string, number>,
 ): string[][] {
   const current = new Set(context.currentMessageIds);
   const units = requestUnits(context.messages, context.projection?.describe(context.messages) ?? context.messages.map(() => undefined));
@@ -69,9 +70,16 @@ export function contextCandidates(
   let bytes = 0;
   for (const unit of historical) {
     if (!eligible.has(unit)) continue;
-    const cost = unit.indices.reduce((sum, index) => sum + estimateContextMessage(context.messages[index]!), 0);
-    // Oversized indivisible units remain raw; never split a protocol chain to fit the historian.
-    if (cost > CONTEXT_REGION_SOURCE_BYTES) continue;
+    // The historian reads public source records, not the full projected tool transcript.
+    // Size that input when it is available: complete private tool pairs have zero public
+    // body cost and can accompany nearby dialogue without producing empty-only jobs.
+    // Manifest overhead still bounds large groups of otherwise zero-cost source IDs.
+    const cost = sourceCosts
+      ? [...unit.sourceEntryIds].reduce((sum, id) => sum + (sourceCosts.get(id) ?? Infinity), 0) +
+        Buffer.byteLength(JSON.stringify([...unit.sourceEntryIds]), "utf8")
+      : unit.indices.reduce((sum, index) => sum + estimateContextMessage(context.messages[index]!), 0);
+    // Oversized indivisible public sources remain raw; never split a protocol chain.
+    if (!Number.isFinite(cost) || cost > CONTEXT_REGION_SOURCE_BYTES) continue;
     if (bytes + cost > CONTEXT_REGION_SOURCE_BYTES && batch.length) {
       batches.push(batch);
       batch = [];

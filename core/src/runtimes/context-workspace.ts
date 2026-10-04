@@ -2,9 +2,9 @@ import { type AgentEntry, type AgentModelRequestContext, type AgentRequestProjec
 import type { LanguageModel, ModelMessage } from "ai";
 
 import type { MagicContextConfig } from "../config.js";
-import { ContextBlockStore, ContextSourceError, type ContextBlockPage } from "../conversations/context-blocks.js";
+import { ContextBlockStore, ContextSourceError, safeSourceRecords, type ContextBlockPage } from "../conversations/context-blocks.js";
 import { escapeXmlText } from "../conversations/fragment-store.js";
-import { generateContextRegionDraft, type ContextRegionEntry } from "../conversations/historian.js";
+import { generateContextRegionDraft, renderContextRegionSource, type ContextRegionEntry } from "../conversations/historian.js";
 import type { Conversation } from "../conversations/index.js";
 import {
   ContextBudgetError,
@@ -30,6 +30,45 @@ export interface ContextWorkspaceOptions {
   readonly resolveModelLimit?: (model: LanguageModel) => { context: number; output: number } | undefined;
   readonly mergeMessages?: (messages: readonly ModelMessage[]) => ModelMessage[];
   readonly onDiagnostic?: (metadata: Record<string, number | string>) => void;
+  /** Recheck deferred maintenance only; must never start a main-model turn. */
+  readonly onBackgroundSettled?: () => void;
+}
+
+interface HistorianPlan {
+  readonly mode: "ordinary" | "emergency";
+  readonly batches: readonly (readonly string[])[];
+  readonly units: readonly { readonly ids: readonly string[]; readonly removable: boolean; readonly bytes: number }[];
+  readonly protectedIds: ReadonlySet<string>;
+  readonly reducedIds: ReadonlySet<string>;
+  readonly base: number;
+  readonly multiplier: number;
+  readonly inputBudget: number;
+  readonly desiredSavings: number;
+}
+
+interface HistorianProgress {
+  mode: HistorianPlan["mode"];
+  reason: "generating" | "safe" | "target" | "exhausted" | "batch-limit" | "no-progress" | "failed";
+  plannedBatches: number;
+  plannedSources: number;
+  attemptedBatches: number;
+  committedBatches: number;
+  unavailableBatches: number;
+  attemptedSources: number;
+  committedSources: number;
+  initialEstimatedInputTokens: number;
+  remainingEstimatedInputTokens: number;
+}
+
+interface HistorianJob {
+  readonly generation: number;
+  readonly controller: AbortController;
+  readonly attemptedSources: Set<string>;
+  readonly metadata: HistorianProgress;
+  plan: HistorianPlan;
+  task: Promise<void>;
+  progress: Promise<void>;
+  wakeProgress?: () => void;
 }
 
 /** One Magic controller per session. Background work never holds the inbound or storage FIFO. */
@@ -38,6 +77,7 @@ export class ContextWorkspace {
   private historyIds = new Set<string>();
   private readonly canonicalUnits = new Map<string, { readonly ids: readonly string[]; readonly mandatory: boolean }>();
   private protectedIds = new Set<string>();
+  private readonly sourceCosts = new Map<string, number>();
   private generation = 0;
   private sessionId: string;
   private storageGeneration: number;
@@ -61,10 +101,9 @@ export class ContextWorkspace {
   private usageSample: string | undefined;
   private consumedSample: string | undefined;
   private regions: readonly ContextRegionEntry[] = [];
-  private job: Promise<void> | undefined;
-  private progress: Promise<void> = Promise.resolve();
-  private wakeProgress: (() => void) | undefined;
-  private controller: AbortController | undefined;
+  private job: HistorianJob | undefined;
+  private historianProgress: HistorianProgress | undefined;
+  private historianRetryAfter = 0;
   private jobState: "idle" | "generating" | "ready" | "failed" = "idle";
   private readonly attempted = new Map<string, number>();
   private readonly reductions = new Map<string, "pending" | "applied" | "held">();
@@ -110,6 +149,22 @@ export class ContextWorkspace {
       const ids = [...unit.sourceEntryIds];
       for (const id of ids) this.canonicalUnits.set(id, { ids, mandatory: unit.mandatory });
     }
+    this.sourceCosts.clear();
+    for (const entry of raw) this.sourceCosts.set(entry.id, 0);
+    for (const record of safeSourceRecords(entries)) {
+      let bytes = Infinity;
+      try {
+        bytes = Buffer.byteLength(renderContextRegionSource([record]), "utf8");
+      } catch {
+        // An indivisible public record that cannot fit remains raw.
+      }
+      this.sourceCosts.set(record.entryId, (this.sourceCosts.get(record.entryId) ?? 0) + bytes);
+    }
+    for (const [id, cost] of this.sourceCosts) {
+      // Default projection hides delivery proof partners. Reserve their manifest bytes
+      // on each visible public source without treating private tool bodies as source.
+      if (cost > 0) this.sourceCosts.set(id, cost + Buffer.byteLength(JSON.stringify(this.canonicalUnits.get(id)!.ids), "utf8"));
+    }
     const latest = [...entries]
       .reverse()
       .find((entry) => entry.type === "message" && entry.data.role === "assistant" && validUsage(entry.data.usage?.inputTokens));
@@ -134,6 +189,7 @@ export class ContextWorkspace {
     const generation = this.generation;
     this.turnId = context.turnId;
     this.expansionTokens = 0;
+    this.pendingEstimate = undefined;
     this.eventOnly = context.historyMode === "event";
     this.protectedIds = new Set(context.currentMessageIds);
     const base = await estimateContextBase(context);
@@ -143,25 +199,40 @@ export class ContextWorkspace {
     const mandatory = requestUnits(context.messages, this.projection.describe(context.messages))
       .filter((unit) => unit.mandatory || [...unit.sourceEntryIds].some((id) => this.protectedIds.has(id)))
       .flatMap((unit) => unit.indices.map((index) => context.messages[index]!));
-    if (this.estimate(mandatory, base) > budget.inputTokens) throw new ContextBudgetError("ContextBudgetExceeded");
+    let attemptedEstimate = this.estimate(context.messages, base);
+    this.recordAttempt(context, attemptedEstimate, "prepared");
+    if (this.estimate(mandatory, base) > budget.inputTokens) {
+      this.recordAttempt(context, attemptedEstimate, "mandatory-overflow");
+      throw new ContextBudgetError("ContextBudgetExceeded");
+    }
     const deadline = Date.now() + CONTEXT_SAFETY_WAIT_MS;
-    for (;;) {
-      this.regions = await beforeDeadline(this.conversation.contextRegions(), deadline, context.signal);
-      this.checkGeneration(generation);
-      const covered = new Set(this.regions.flatMap((entry) => entry.data.sourceEntryIds));
-      this.candidateContext = context;
-      this.candidateBaseTokens = base;
-      this.candidates = contextCandidates(context, covered, budget.inputTokens, this.multiplier, base);
-      const messages = this.project(context, base);
-      const estimate = this.estimate(messages, base);
-      const pressure = contextPressure(this.usageViewVersion === this.viewVersion ? this.providerInputTokens : undefined, estimate, budget.inputTokens);
-      if (pressure.ordinary || pressure.emergency) this.scheduleHistorian(pressure.unsafe, estimate);
-      if (!pressure.unsafe) return this.recordRequest(context, messages, base);
-      // Join only for safety, never for the 80k soft target. One deadline for all batches.
-      if (!this.job || Date.now() >= deadline) throw new ContextBudgetError("ContextBudgetExceeded");
-      const completed = await joinUntil(Promise.race([this.job, this.progress]), deadline, context.signal);
-      this.checkGeneration(generation);
-      if (!completed) throw new ContextBudgetError("ContextBudgetExceeded");
+    try {
+      for (;;) {
+        this.regions = await beforeDeadline(this.conversation.contextRegions(), deadline, context.signal);
+        this.checkGeneration(generation);
+        const covered = new Set(this.regions.flatMap((entry) => entry.data.sourceEntryIds));
+        this.candidateContext = context;
+        this.candidateBaseTokens = base;
+        this.candidates = contextCandidates(context, covered, budget.inputTokens, this.multiplier, base, this.sourceCosts);
+        const messages = this.project(context, base);
+        attemptedEstimate = this.estimate(messages, base);
+        const pressure = contextPressure(
+          this.usageViewVersion === this.viewVersion ? this.providerInputTokens : undefined,
+          attemptedEstimate,
+          budget.inputTokens,
+        );
+        this.recordAttempt(context, attemptedEstimate, pressure.unsafe ? "unsafe" : "safe");
+        if (pressure.ordinary || pressure.emergency) this.scheduleHistorian(pressure.unsafe, attemptedEstimate);
+        if (!pressure.unsafe) return this.recordRequest(context, messages, base);
+        // Join only for safety, never for the 80k soft target. One deadline for all batches.
+        if (!this.job || Date.now() >= deadline) throw new ContextBudgetError("ContextBudgetExceeded");
+        const completed = await joinUntil(Promise.race([this.job.task, this.job.progress]), deadline, context.signal);
+        this.checkGeneration(generation);
+        if (!completed) throw new ContextBudgetError("ContextBudgetExceeded");
+      }
+    } catch (cause) {
+      if (cause instanceof ContextBudgetError) this.recordAttempt(context, attemptedEstimate, Date.now() >= deadline ? "safety-deadline" : "unresolved-unsafe");
+      throw cause;
     }
   }
 
@@ -174,17 +245,50 @@ export class ContextWorkspace {
       if ([...unit.sourceEntryIds].every((id) => covered.has(id) && !this.protectedIds.has(id))) for (const index of unit.indices) removed.add(index);
     }
     const retained = context.messages.filter((_, index) => !removed.has(index));
-    const target = contextPressure(undefined, 0, this.budget.inputTokens).target;
-    const summaryAllowance = Math.min(target * 0.2, Math.max(0, this.budget.inputTokens - this.estimate(retained, base)));
-    const tiers = selectContextTiers(this.regions, summaryAllowance, this.multiplier);
-    const summaries: ModelMessage[] = [];
+    const retainedBytes = base + retained.reduce((sum, message) => sum + estimateContextMessage(message), 0);
+    const { summaries, tiers } = this.summaryView(
+      this.regions,
+      this.protectedIds,
+      new Set(this.reductions.keys()),
+      retainedBytes,
+      this.budget.inputTokens,
+      this.multiplier,
+    );
     for (const region of this.regions) {
-      const blocked = region.data.sourceEntryIds.some((id) => this.protectedIds.has(id));
-      if (blocked) continue;
-      if (this.reductions.has(region.id)) {
-        this.reductions.set(region.id, "applied");
-        continue;
-      }
+      if (this.reductions.has(region.id) && !region.data.sourceEntryIds.some((id) => this.protectedIds.has(id))) this.reductions.set(region.id, "applied");
+    }
+    for (const { region, message } of summaries) {
+      this.projection.register(message, { kind: "summary", sourceEntryIds: [region.id], timestamp: region.timestamp, blockId: region.id });
+    }
+    const summaryMessages = summaries.map(({ message }) => message);
+    this.viewVersion = JSON.stringify([
+      this.regions.map((region) => [region.id, region.data.sourceFingerprint]),
+      summaryMessages.map((message) => {
+        const id = this.projection.origin(message)!.blockId!;
+        return [id, tiers.get(id)];
+      }),
+    ]);
+    this.lastHistoryEstimate = Math.ceil(summaryMessages.reduce((sum, message) => sum + estimateContextMessage(message), 0) * this.multiplier);
+    const firstDialogue = retained.findIndex((message) => message.role !== "system");
+    const insertion = firstDialogue < 0 ? retained.length : firstDialogue;
+    return [...retained.slice(0, insertion), ...summaryMessages, ...retained.slice(insertion)];
+  }
+
+  /** Shared projection arithmetic; background estimates never mutate the latest guard/view. */
+  private summaryView(
+    regions: readonly ContextRegionEntry[],
+    protectedIds: ReadonlySet<string>,
+    reducedIds: ReadonlySet<string>,
+    retainedBytes: number,
+    inputBudget: number,
+    multiplier: number,
+  ) {
+    const target = contextPressure(undefined, 0, inputBudget).target;
+    const allowance = Math.min(target * 0.2, Math.max(0, inputBudget - Math.ceil(retainedBytes * multiplier)));
+    const tiers = selectContextTiers(regions, allowance, multiplier);
+    const summaries: { region: ContextRegionEntry; message: ModelMessage }[] = [];
+    for (const region of regions) {
+      if (region.data.sourceEntryIds.some((id) => protectedIds.has(id)) || reducedIds.has(region.id)) continue;
       const tier = tiers.get(region.id);
       if (!tier) continue;
       const signature = `${region.id}:${tier}:${region.data.sourceFingerprint}`;
@@ -196,98 +300,219 @@ export class ContextWorkspace {
         };
         this.rendered.set(signature, message);
       }
-      this.projection.register(message, { kind: "summary", sourceEntryIds: [region.id], timestamp: region.timestamp, blockId: region.id });
-      summaries.push(message);
+      summaries.push({ region, message });
     }
     while (this.rendered.size > 512) this.rendered.delete(this.rendered.keys().next().value!);
-    // Rendered wrappers count too. Optional semantic regions may leave residency without
-    // deleting coverage or invoking another model, before we consider a foreground join.
-    while (summaries.length && this.estimate([...retained, ...summaries], base) > this.budget.inputTokens) summaries.shift();
-    this.viewVersion = JSON.stringify([
-      this.regions.map((region) => [region.id, region.data.sourceFingerprint]),
-      summaries.map((message) => {
-        const id = this.projection.origin(message)!.blockId!;
-        return [id, tiers.get(id)];
-      }),
-    ]);
-    this.lastHistoryEstimate = Math.ceil(summaries.reduce((sum, message) => sum + estimateContextMessage(message), 0) * this.multiplier);
-    const firstDialogue = retained.findIndex((message) => message.role !== "system");
-    const insertion = firstDialogue < 0 ? retained.length : firstDialogue;
-    return [...retained.slice(0, insertion), ...summaries, ...retained.slice(insertion)];
+    let bytes = retainedBytes + summaries.reduce((sum, { message }) => sum + estimateContextMessage(message), 0);
+    // Count escaped wrappers too, just as the actual request does.
+    while (summaries.length && Math.ceil(bytes * multiplier) > inputBudget) bytes -= estimateContextMessage(summaries.shift()!.message);
+    return { summaries, tiers, estimate: Math.ceil(bytes * multiplier) };
+  }
+
+  private historianPlan(unsafe: boolean, estimate: number): HistorianPlan | undefined {
+    if (!this.candidateContext) return undefined;
+    const seen = new Set<string>();
+    const batches = this.candidates
+      .map((ids) => this.canonicalSources(ids))
+      .filter((ids) => {
+        if (!ids.length || ids.some((id) => seen.has(id))) return false;
+        for (const id of ids) seen.add(id);
+        const attempted = this.attempted.get(JSON.stringify(ids));
+        return attempted === undefined || Date.now() - attempted >= 30_000;
+      });
+    const selected = unsafe ? batches : batches.slice(0, 8);
+    if (!selected.length) return undefined;
+    const protectedIds = new Set(this.protectedIds);
+    const context = this.candidateContext;
+    return {
+      mode: unsafe ? "emergency" : "ordinary",
+      batches: Object.freeze(selected.map((ids) => Object.freeze(ids))),
+      units: requestUnits(context.messages, this.projection.describe(context.messages)).map((unit) => ({
+        ids: Object.freeze([...unit.sourceEntryIds]),
+        removable: !unit.mandatory && unit.kind === "history" && unit.sourceEntryIds.size > 0 && ![...unit.sourceEntryIds].some((id) => protectedIds.has(id)),
+        bytes: unit.indices.reduce((sum, index) => sum + estimateContextMessage(context.messages[index]!), 0),
+      })),
+      protectedIds,
+      reducedIds: new Set(this.reductions.keys()),
+      base: this.candidateBaseTokens,
+      multiplier: this.multiplier,
+      inputBudget: this.budget.inputTokens,
+      desiredSavings: Math.max(
+        1,
+        (this.usageViewVersion === this.viewVersion ? (this.providerInputTokens ?? estimate) : estimate) -
+          contextPressure(undefined, 0, this.budget.inputTokens).target,
+      ),
+    };
+  }
+
+  private historianEstimate(plan: HistorianPlan, regions: readonly ContextRegionEntry[]): number {
+    const covered = new Set(regions.flatMap((region) => region.data.sourceEntryIds));
+    const retained = plan.base + plan.units.reduce((sum, unit) => sum + (unit.removable && unit.ids.every((id) => covered.has(id)) ? 0 : unit.bytes), 0);
+    return this.summaryView(regions, plan.protectedIds, plan.reducedIds, retained, plan.inputBudget, plan.multiplier).estimate;
   }
 
   private scheduleHistorian(unsafe = false, estimate = this.lastEstimate): void {
-    if (this.job || this.stopped || this.eventOnly || !this.options.continuityModel) return;
-    if (!unsafe && (!this.usageSample || this.consumedSample === this.usageSample || this.usageViewVersion !== this.viewVersion)) return;
-    const batches = this.candidates
-      .map((ids) => this.canonicalSources(ids))
-      .filter((ids) => ids.length > 0)
-      .filter((ids) => {
-        const attempted = this.attempted.get(JSON.stringify(ids));
-        return attempted === undefined || Date.now() - attempted >= 30_000;
-      })
-      .slice(0, 8);
-    if (!batches.length) return;
-    this.consumedSample = this.usageSample;
-    const target = contextPressure(undefined, 0, this.budget.inputTokens).target;
-    const actual = this.usageViewVersion === this.viewVersion ? this.providerInputTokens : undefined;
-    const desiredSavings = Math.max(1, (actual ?? estimate) - target);
-    const sourceCosts = new Map<string, number>();
-    if (this.candidateContext) {
-      for (const unit of requestUnits(this.candidateContext.messages, this.projection.describe(this.candidateContext.messages))) {
-        const first = [...unit.sourceEntryIds][0];
-        if (first)
-          sourceCosts.set(
-            first,
-            unit.indices.reduce((sum, index) => sum + estimateContextMessage(this.candidateContext!.messages[index]!), 0) * this.multiplier,
-          );
+    if (this.stopped || this.eventOnly || !this.options.continuityModel || Date.now() < this.historianRetryAfter) return;
+    if (this.job) {
+      // An unsafe guard can admit one finite recovery while ordinary work is in flight.
+      // Subsequent guards/appends cannot extend an already-admitted emergency cohort.
+      if (unsafe && this.job.plan.mode === "ordinary") {
+        const plan = this.historianPlan(true, estimate);
+        if (plan) {
+          this.job.plan = plan;
+          this.job.metadata.mode = plan.mode;
+          this.job.metadata.plannedBatches = plan.batches.length;
+          this.job.metadata.plannedSources = plan.batches.reduce((sum, ids) => sum + ids.length, 0);
+          this.job.metadata.initialEstimatedInputTokens = this.historianEstimate(plan, this.regions);
+        }
       }
+      return;
     }
-    const generation = this.generation;
-    const controller = new AbortController();
-    this.controller = controller;
+    if (!unsafe && (!this.usageSample || this.consumedSample === this.usageSample || this.usageViewVersion !== this.viewVersion)) return;
+    const plan = this.historianPlan(unsafe, estimate);
+    if (!plan) return;
+    this.consumedSample = this.usageSample;
+    const initialEstimate = this.historianEstimate(plan, this.regions);
+    const metadata: HistorianProgress = {
+      mode: plan.mode,
+      reason: "generating",
+      plannedBatches: plan.batches.length,
+      plannedSources: plan.batches.reduce((sum, ids) => sum + ids.length, 0),
+      attemptedBatches: 0,
+      committedBatches: 0,
+      unavailableBatches: 0,
+      attemptedSources: 0,
+      committedSources: 0,
+      initialEstimatedInputTokens: initialEstimate,
+      remainingEstimatedInputTokens: initialEstimate,
+    };
+    const job: HistorianJob = {
+      generation: this.generation,
+      controller: new AbortController(),
+      attemptedSources: new Set(),
+      metadata,
+      plan,
+      task: Promise.resolve(),
+      progress: Promise.resolve(),
+    };
+    const wake = () => {
+      const prior = job.wakeProgress;
+      job.progress = new Promise((resolve) => {
+        job.wakeProgress = resolve;
+      });
+      prior?.();
+    };
+    wake();
+    this.job = job;
+    this.historianProgress = metadata;
     this.jobState = "generating";
-    this.progress = new Promise((resolve) => {
-      this.wakeProgress = resolve;
-    });
+    let regions = [...this.regions];
+    const diagnose = (event: string) => this.diagnose({ event, generation: job.generation, ...metadata });
+    diagnose("historian.started");
     const run = async () => {
-      let saved = 0;
-      for (const ids of batches) {
-        this.checkGeneration(generation);
-        const signature = JSON.stringify(ids);
-        this.attempted.set(signature, Date.now());
-        const frozen = await this.conversation.freezeContextRegion(ids);
-        this.checkGeneration(generation);
-        const draft = await generateContextRegionDraft({ model: this.options.continuityModel!, records: frozen.records, signal: controller.signal });
-        this.checkGeneration(generation);
-        await this.conversation.commitContextRegion(frozen, draft, controller.signal);
-        this.checkGeneration(generation);
+      for (;;) {
+        this.checkGeneration(job.generation);
+        job.controller.signal.throwIfAborted();
+        const current = job.plan;
+        const previous = this.historianEstimate(current, regions);
+        metadata.remainingEstimatedInputTokens = previous;
+        if (current.mode === "emergency" && previous <= current.inputBudget) {
+          metadata.reason = "safe";
+          break;
+        }
+        if (current.mode === "ordinary" && metadata.initialEstimatedInputTokens - previous >= current.desiredSavings) {
+          metadata.reason = "target";
+          break;
+        }
+        // Promotion can regroup already-admitted complete canonical units with new
+        // ones. Exclude attempted sources, not the entire overlapping batch.
+        const ids = current.batches.map((batch) => batch.filter((id) => !job.attemptedSources.has(id))).find((batch) => batch.length > 0);
+        if (!ids) {
+          metadata.reason = current.mode === "ordinary" && current.batches.length === 8 ? "batch-limit" : "exhausted";
+          break;
+        }
+        for (const id of ids) job.attemptedSources.add(id);
+        metadata.attemptedBatches += 1;
+        metadata.attemptedSources += ids.length;
+        this.attempted.set(JSON.stringify(ids), Date.now());
+        let frozen;
+        try {
+          frozen = await this.conversation.freezeContextRegion(ids);
+        } catch (cause) {
+          this.checkGeneration(job.generation);
+          if (!(cause instanceof Error) || cause.message !== "ContextRegionSourceUnavailable") throw cause;
+          // An unavailable public source is local to this fixed batch. No retry, no raw
+          // eviction, and no private-tool fallback; other admitted sources can still help.
+          metadata.unavailableBatches += 1;
+          diagnose("historian.source_unavailable");
+          continue;
+        }
+        this.checkGeneration(job.generation);
+        const draft = await generateContextRegionDraft({ model: this.options.continuityModel!, records: frozen.records, signal: job.controller.signal });
+        this.checkGeneration(job.generation);
+        const entry = await this.conversation.commitContextRegion(frozen, draft, job.controller.signal);
+        this.checkGeneration(job.generation);
+        // The plan may have been promoted once while the auxiliary call was in flight.
+        const before = this.historianEstimate(job.plan, regions);
+        if (!regions.some((region) => region.id === entry.id)) regions = [...regions, entry];
+        const remaining = this.historianEstimate(job.plan, regions);
+        metadata.remainingEstimatedInputTokens = remaining;
+        metadata.committedBatches += 1;
+        metadata.committedSources += ids.length;
         this.jobState = "ready";
-        const wake = this.wakeProgress;
-        this.progress = new Promise((resolve) => {
-          this.wakeProgress = resolve;
-        });
-        wake?.();
-        saved += ids.reduce((sum, id) => sum + (sourceCosts.get(id) ?? 0), 0) - (Buffer.byteLength(draft.tiers.P1, "utf8") + 256) * this.multiplier;
-        if (saved >= desiredSavings) break;
+        diagnose("historian.progress");
+        wake();
+        if (remaining >= before) {
+          metadata.reason = "no-progress";
+          break;
+        }
       }
     };
-    const task = run()
-      .catch((cause: unknown) => {
-        if (generation !== this.generation) return;
+    job.task = run()
+      .catch(() => {
+        if (job.generation !== this.generation) return;
         this.jobState = "failed";
-        this.options.onDiagnostic?.({ event: "historian.failed", error: cause instanceof Error ? cause.name : "Error" });
+        // A model/output/storage failure is systemic, not a reason to try every
+        // different source batch during the same sixty-second safety wait.
+        this.historianRetryAfter = Date.now() + 30_000;
+        metadata.reason = "failed";
+        diagnose("historian.failed");
       })
       .finally(() => {
-        if (this.job === task) {
-          this.wakeProgress?.();
-          this.wakeProgress = undefined;
-          this.job = undefined;
-          this.controller = undefined;
-        }
+        if (this.job !== job) return;
+        job.wakeProgress?.();
+        job.wakeProgress = undefined;
+        this.job = undefined;
+        diagnose("historian.settled");
         while (this.attempted.size > 256) this.attempted.delete(this.attempted.keys().next().value!);
+        try {
+          this.options.onBackgroundSettled?.();
+        } catch {
+          this.diagnose({ event: "maintenance.failed", reason: "callback-failed" });
+        }
       });
-    this.job = task;
+  }
+
+  private recordAttempt(context: AgentModelRequestContext, estimate: number, reason: string): void {
+    this.lastEstimate = estimate;
+    this.diagnose({
+      event: "guard.estimate",
+      turnId: context.turnId,
+      step: context.stepNumber,
+      reason,
+      estimatedInputTokens: estimate,
+      inputBudget: this.budget.inputTokens,
+      estimateBasis: this.usageSample ? "calibrated" : "initial",
+      historian: this.jobState,
+    });
+  }
+
+  private diagnose(metadata: Record<string, number | string>): void {
+    try {
+      this.options.onDiagnostic?.(metadata);
+    } catch {
+      // Observability must not reject requests or strand background maintenance.
+    }
   }
 
   private canonicalSources(sourceIds: readonly string[]): string[] {
@@ -316,7 +541,7 @@ export class ContextWorkspace {
       generation: this.generation,
       eventOnly: this.eventOnly,
     };
-    this.options.onDiagnostic?.({
+    this.diagnose({
       turnId: context.turnId,
       step: context.stepNumber,
       estimatedInputTokens: this.lastEstimate,
@@ -342,6 +567,7 @@ export class ContextWorkspace {
         this.budget.inputTokens,
         this.multiplier,
         this.candidateBaseTokens,
+        this.sourceCosts,
       );
     const pressure = contextPressure(inputTokens, this.lastEstimate, this.budget.inputTokens);
     if (pressure.ordinary || pressure.emergency) this.scheduleHistorian();
@@ -433,6 +659,7 @@ export class ContextWorkspace {
       historian: this.jobState,
       backgroundActive: this.job !== undefined,
       regions: this.regions.length,
+      ...(this.historianProgress ? { historianProgress: { ...this.historianProgress } } : {}),
     };
   }
   private resolveBudget(model: LanguageModel): ContextBudget {
@@ -464,6 +691,8 @@ export class ContextWorkspace {
     this.storageGeneration = this.conversation.storageGeneration;
     this.clear();
     this.historyIds.clear();
+    this.canonicalUnits.clear();
+    this.sourceCosts.clear();
     this.providerInputTokens = undefined;
     this.capturedUsageId = undefined;
     this.multiplier = 0.25;
@@ -480,11 +709,11 @@ export class ContextWorkspace {
   }
   private clear(): void {
     this.generation += 1;
-    this.controller?.abort();
-    this.wakeProgress?.();
-    this.wakeProgress = undefined;
+    this.job?.controller.abort();
+    this.job?.wakeProgress?.();
     this.job = undefined;
-    this.controller = undefined;
+    this.historianProgress = undefined;
+    this.historianRetryAfter = 0;
     this.jobState = "idle";
     this.candidates = [];
     this.candidateContext = undefined;
