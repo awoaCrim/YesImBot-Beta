@@ -59,6 +59,36 @@ afterEach(async () => {
 });
 
 describe("models.json modalities", () => {
+  it("scopes thinking overrides to cloned resolved entries without changing registry settings or limits", async () => {
+    const calls: import("../src/models/config.js").ChatModelConfig[] = [];
+    const provider: ModelProvider = {
+      ...createProvider(),
+      chatModels: () => [{ id: "gpt-4o", reasoning: true, thinkingLevel: "high", thinkingLevelMap: { low: "low" }, limit: { context: 128000, output: 16000 } }],
+      chat: (_id, entry) => {
+        calls.push(entry!);
+        return { specificationVersion: "v3", provider: "openai", modelId: "gpt-4o", supportedUrls: {} } as never;
+      },
+    };
+    const service = await createModelService({}, undefined, provider);
+    const revision = service.revision;
+    const main = service.resolveChatModel("openai:gpt-4o");
+    const historian = service.resolveChatModel("openai:gpt-4o", undefined, { thinkingLevel: "low" });
+    expect(main.entry.thinkingLevel).toBe("high");
+    expect(historian.entry.thinkingLevel).toBe("low");
+    expect(calls.map((entry) => entry.thinkingLevel)).toEqual(["high", "low"]);
+    expect(historian.fullId).toBe(main.fullId);
+    expect(historian.model).not.toBe(main.model);
+    expect(historian.capabilities).toEqual(main.capabilities);
+    expect(service.contextLimit(historian.model)).toEqual({ context: 128000, output: 16000 });
+    historian.entry.thinkingLevelMap!.low = null;
+    historian.entry.limit!.output = 1;
+    calls[1]!.thinkingLevelMap!.low = "changed";
+    calls[1]!.limit!.context = 1;
+    const next = service.resolveChatModel("openai:gpt-4o");
+    expect(next.entry).toMatchObject({ thinkingLevel: "high", thinkingLevelMap: { low: "low" }, limit: { context: 128000, output: 16000 } });
+    expect(main.entry.limit).toEqual({ context: 128000, output: 16000 });
+    expect(service.revision).toBe(revision);
+  });
   it("resolves context limits from actual registered provider/model identity without guessing names", async () => {
     const provider: ModelProvider = {
       ...createProvider(),

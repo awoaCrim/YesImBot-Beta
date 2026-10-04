@@ -92,6 +92,38 @@ describe("four-tier historian", () => {
     expect(request.prompt).not.toContain("proof");
     expect(request.system).toContain("同一原文");
     expect(request.maxRetries).toBe(0);
+    expect(request.maxOutputTokens).toBe(8192);
+    expect(request.system).toContain("1200");
+    expect(request.system).toContain("软限制");
+    expect(request.system).toContain("未完成事项");
+  });
+  it.each([
+    [undefined, 8192],
+    [20000, 8192],
+    [1024, 1024],
+    [1, 1],
+  ] as const)("clamps auxiliary output limit %s to %s", async (outputLimit, expected) => {
+    generateText.mockResolvedValue({ text: JSON.stringify(draft) });
+    await generateContextRegionDraft({ model: {} as never, outputLimit, records: [{ entryId: "u", role: "user", timestamp: 1, text: "source" }] });
+    expect(generateText.mock.calls[0]![0].maxOutputTokens).toBe(expected);
+    expect(generateText.mock.calls[0]![0].maxRetries).toBe(0);
+  });
+  it.each([0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])("rejects invalid output limit %s without calling the provider", async (outputLimit) => {
+    const failure = await generateContextRegionDraft({ model: {} as never, outputLimit, records: [] }).catch((cause) =>
+      classifyContextRegionFailure(cause, "model"),
+    );
+    expect(failure).toEqual({ phase: "model", code: "model-limit", retryable: 0 });
+    expect(generateText).not.toHaveBeenCalled();
+  });
+  it("keeps previously valid v1 prompt regions readable after the generation prompt changes", async () => {
+    const { conversation, path } = await fixture();
+    await conversation.storage.append(user("old"));
+    const frozen = await conversation.freezeContextRegion(["old"]);
+    expect(frozen.promptVersion).toBe("magic-region-v2");
+    const region = await conversation.commitContextRegion(frozen, draft);
+    const old = { ...region, data: { ...region.data, promptVersion: "magic-region-v1" } };
+    await writeFile(path(), [user("old"), old].map((entry) => JSON.stringify(entry)).join("\n") + "\n", "utf8");
+    expect((await conversation.contextRegions())[0]!.data.promptVersion).toBe("magic-region-v1");
   });
   it("fails oversized original input rather than silently truncating it", async () => {
     const { conversation } = await fixture();

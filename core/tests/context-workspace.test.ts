@@ -7,6 +7,7 @@ import { Context, h } from "@koishijs/core";
 import { AgentRequestProjection, createAgent, createEntry, createUserMessage, type AgentModelRequestContext } from "@yesimbot/agent-runtime";
 import type { ModelMessage } from "ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
 vi.mock("koishi", async () => import("@koishijs/core"));
 import { createContextWorkspaceTools, createFinishTool } from "../src/agents/tools.js";
@@ -38,7 +39,7 @@ function latch() {
 
 function historian(blocked?: ReturnType<typeof latch>, text = draft) {
   const entered = latch();
-  const generate = vi.fn(async () => {
+  const generate = vi.fn(async (_options: LanguageModelV3CallOptions) => {
     entered.release();
     await blocked?.promise;
     return {
@@ -397,6 +398,159 @@ describe("asynchronous Magic workspace", () => {
   });
 });
 
+function toolPair(text: string, id = "lookup"): ModelMessage[] {
+  return [
+    { role: "assistant", content: [{ type: "tool-call", toolCallId: id, toolName: "lookup", input: {} }] },
+    { role: "tool", content: [{ type: "tool-result", toolCallId: id, toolName: "lookup", output: { type: "text", value: text } }] },
+  ];
+}
+
+describe("provisional tool-result safety", () => {
+  it("keeps changed tool results provisional until a matching usage sample, without accumulating premiums", async () => {
+    const f = await fixture([]);
+    const original = toolPair("A".repeat(4000));
+    await f.workspace.guard(context(f, "turn", 0, original));
+    const initial = f.workspace.status().estimatedInputTokens;
+    f.workspace.observeUsage("turn", 0, 500);
+    await f.workspace.guard(context(f, "turn", 1, structuredClone(original)));
+    expect(f.workspace.status().estimatedInputTokens).toBe(500);
+    const changed = toolPair("B".repeat(4000));
+    await f.workspace.guard(context(f, "turn", 2, changed));
+    const provisional = f.workspace.status().estimatedInputTokens;
+    expect(provisional).toBeGreaterThan(2000);
+    expect(provisional).toBeLessThanOrEqual(initial);
+    f.workspace.observeUsage("other", 2, 1);
+    f.workspace.observeUsage("turn", 1, 1);
+    await f.workspace.guard(context(f, "turn", 3, changed));
+    expect(f.workspace.status().estimatedInputTokens).toBe(provisional);
+    f.workspace.observeUsage("turn", 3, 700);
+    await f.workspace.guard(context(f, "turn", 4, changed));
+    expect(f.workspace.status().estimatedInputTokens).toBe(700);
+    await f.workspace.guard(context(f, "turn", 5, changed));
+    expect(f.workspace.status().estimatedInputTokens).toBe(700);
+  });
+
+  it("does not acknowledge aborted or event-only tool samples", async () => {
+    const f = await fixture([]);
+    const more = toolPair("x".repeat(4000));
+    const controller = new AbortController();
+    await f.workspace.guard({ ...context(f, "cancelled", 0, more), signal: controller.signal });
+    const initial = f.workspace.status().estimatedInputTokens;
+    controller.abort();
+    f.workspace.observeUsage("cancelled", 0, 1);
+    await f.workspace.guard(context(f, "event", 0, more, "event"));
+    f.workspace.observeUsage("event", 0, 1);
+    await f.workspace.guard(context(f, "normal", 0, more));
+    expect(f.workspace.status().estimatedInputTokens).toBe(initial);
+    expect(f.workspace.status().estimateMultiplier).toBe(0.25);
+  });
+
+  it("clears measured tool identities when the model budget changes", async () => {
+    let limit = { context: 50000, output: 1000 };
+    const f = await fixture([], { resolveModelLimit: () => limit });
+    const more = toolPair("x".repeat(4000));
+    await f.workspace.guard(context(f, "turn", 0, more));
+    const initial = f.workspace.status().estimatedInputTokens;
+    f.workspace.observeUsage("turn", 0, 500);
+    await f.workspace.guard(context(f, "turn", 1, more));
+    expect(f.workspace.status().estimatedInputTokens).toBe(500);
+    limit = { context: 60000, output: 1000 };
+    await f.workspace.guard(context(f, "changed", 0, more));
+    expect(f.workspace.status().estimatedInputTokens).toBe(initial);
+  });
+
+  it("uses provisional costs in mandatory-only rejection rather than bypassing recovery then failing at the final check", async () => {
+    const f = await fixture([], { config: { contextWindow: 10000, outputReserveTokens: 1000 } });
+    // ~20KB previously fit at0.25 but cannot fit8k safe input at the provisional0.5.
+    await expect(f.workspace.guard(context(f, "turn", 0, toolPair("x".repeat(20000))))).rejects.toThrow("ContextBudgetExceeded");
+    expect(f.workspace.status().backgroundActive).toBe(false);
+  });
+
+  it("clamps auxiliary output independently of the main reserve and rejects invalid limits without retries", async () => {
+    for (const output of [321, -1]) {
+      const aux = historian();
+      const f = await fixture(many(), {
+        continuityModel: aux.model,
+        resolveModelLimit: (model) => (typeof model !== "string" && model.provider === "historian" ? { context: 100000, output } : undefined),
+      });
+      await f.workspace.guard(context(f));
+      f.workspace.observeUsage("turn", 0, 100000);
+      await settled(f);
+      if (output > 0) {
+        expect(aux.generate.mock.calls[0]![0].maxOutputTokens).toBe(321);
+        expect((await f.conversation.contextRegions()).length).toBeGreaterThan(0);
+      } else {
+        expect(aux.generate).not.toHaveBeenCalled();
+        expect(f.workspace.status().historianProgress).toMatchObject({ reason: "non-retryable", code: "model-limit", generationAttempts: 1 });
+        expect(await f.conversation.contextRegions()).toHaveLength(0);
+      }
+    }
+  });
+
+  it("recovers before a real SDK continuation with a large tool result, preserving the result and complete pair", async () => {
+    const blocked = latch();
+    const aux = historian(blocked);
+    const diagnostics: Record<string, number | string>[] = [];
+    const f = await fixture(many(), {
+      continuityModel: aux.model,
+      config: { contextWindow: 147200, outputReserveTokens: 8192 },
+      onDiagnostic: (value) => diagnostics.push(value),
+      mergeMessages: mergeAdjacentUserMessages,
+    });
+    const body = "PRIVATE_TOOL_ONLY:" + "网页详情：".repeat(6000);
+    const scripted = mainModel([
+      { name: "lookup", input: () => "{}", usage: 98378 },
+      { name: "finish", input: () => "{}", usage: 80000 },
+    ]);
+    const agent = createAgent({
+      model: scripted.model,
+      storage: f.conversation.storage,
+      requestProjection: f.projection,
+      beforeModelRequest: (request) => f.workspace.guard(request),
+      onModelUsage: ({ turnId, stepNumber, inputTokens }) => f.workspace.observeUsage(turnId, stepNumber, inputTokens),
+      tools: [{ name: "lookup", description: "Returns a large page", inputSchema: z.object({}), execute: async () => body }, createFinishTool()],
+      requireTerminalTool: true,
+      plugins: [
+        {
+          name: "capture",
+          enforce: "pre",
+          transformEntries(entries) {
+            f.workspace.capture(entries);
+            return entries;
+          },
+        },
+        createInternalHistoryProjectionPlugin("gemini-native", f.projection),
+      ],
+    });
+    const run = Array.fromAsync(agent.run(createUserMessage("current question")));
+    await aux.entered.promise;
+    expect(scripted.calls).toHaveLength(1); // The risky continuation has not reached the provider.
+    expect(diagnostics.some((value) => value.event === "guard.estimate" && value.reason === "unsafe" && Number(value.estimatedInputTokens) > 124288)).toBe(
+      true,
+    );
+    expect(JSON.stringify(aux.generate.mock.calls)).not.toContain("PRIVATE_TOOL_ONLY");
+    blocked.release();
+    const events = await run;
+    await settled(f);
+    expect(events.at(-1)).toMatchObject({ type: "turn.done" });
+    expect(scripted.calls).toHaveLength(2);
+    expect((await f.conversation.contextRegions()).length).toBeGreaterThan(0);
+    const prompt = scripted.calls[1]!.prompt;
+    expect(JSON.stringify(prompt)).toContain(body);
+    const calls = prompt.flatMap((message) =>
+      message.role === "assistant" ? message.content.filter((part) => part.type === "tool-call").map((part) => part.toolCallId) : [],
+    );
+    const results = prompt.flatMap((message) =>
+      message.role === "tool" ? message.content.filter((part) => part.type === "tool-result").map((part) => part.toolCallId) : [],
+    );
+    expect(results).toEqual(calls);
+    expect(results).toContain("call_1");
+    const continuationEstimates = diagnostics.filter((value) => value.step === 1 && value.event === undefined);
+    expect(continuationEstimates.length).toBeGreaterThan(0);
+    expect(continuationEstimates.every((value) => Number(value.estimatedInputTokens) <= 124288)).toBe(true);
+  });
+});
+
 describe("real Agent provider boundary", () => {
   it("wires the actual Core Gemini pipeline, legacy summaries and single Magic controller", async () => {
     const f = await fixture(Array.from({ length: 100 }, (_, i) => `历史${i}:` + "x".repeat(600)));
@@ -431,13 +585,15 @@ describe("real Agent provider boundary", () => {
       { name: "finish", input: () => "{}", usage: 150001 },
     ]);
     const aux = historian();
+    const legacyCompact = historian();
     const bot = { selfId: "bot", sendMessage: vi.fn() };
     const runtime = new ChannelRuntime(new Context(), {
       channel,
       bot: bot as never,
       will: { decide: async () => "trigger", observe: async () => {} } as never,
       model: scripted.model,
-      compactModel: aux.model,
+      compactModel: legacyCompact.model,
+      historianModel: aux.model,
       readImagePolicy: { mode: "unavailable" },
       historyProjection: "gemini-native",
       config: Config({
@@ -480,6 +636,9 @@ describe("real Agent provider boundary", () => {
         expect(request.tools?.filter((tool) => tool.type === "function" && tool.name === "ctx_expand")).toHaveLength(1);
       }
       expect(JSON.stringify(scripted.calls[1]!.prompt)).toContain("历史0:");
+      await aux.entered.promise;
+      expect(aux.generate).toHaveBeenCalled();
+      expect(legacyCompact.generate).not.toHaveBeenCalled();
       expect(compact).not.toHaveBeenCalled();
       expect(bot.sendMessage).not.toHaveBeenCalled();
     } finally {
