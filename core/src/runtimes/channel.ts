@@ -207,7 +207,15 @@ export class ChannelRuntime {
         modelLimit: options.contextModelLimit,
         resolveModelLimit: options.resolveContextModelLimit,
         ...(options.historyProjection === "gemini-native" ? { mergeMessages: mergeAdjacentUserMessages } : {}),
-        onDiagnostic: (metadata) => this.logger.debug("runtime.context_budget", metadata),
+        onDiagnostic: (metadata) => {
+          const failed =
+            metadata.event === "historian.failed" ||
+            metadata.event === "maintenance.failed" ||
+            (metadata.event === "guard.estimate" && ["safety-deadline", "unresolved-unsafe", "mandatory-overflow"].includes(String(metadata.reason)));
+          if (failed) this.logger.warn("runtime.context_budget", metadata);
+          else this.logger.debug("runtime.context_budget", metadata);
+        },
+        onBackgroundSettled: () => this.scheduleArchiveCheck(),
       });
       tools.push(...createContextWorkspaceTools(this.contextWorkspace));
     }
@@ -945,12 +953,12 @@ export class ChannelRuntime {
     void this.schedule(async () => {
       if (this.stopped || this.agent.getActiveTurnId() !== null) return;
       await this.archiveIfOversize();
-    });
+    }).catch(() => this.logger.warn("runtime.archive_check_failed", { reason: "archive_failed" }));
   }
 
   private async archiveIfOversize(): Promise<void> {
     const maxBytes = this.options.archiveMaxBytes ?? 0;
-    if (this.stopped || maxBytes <= 0) return;
+    if (this.stopped || maxBytes <= 0 || this.contextWorkspace?.status().backgroundActive) return;
     if (!this.options.compactModel) {
       await this.options.channel.conversation.archiveIfOversize(maxBytes);
       return;
