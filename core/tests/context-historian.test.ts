@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createEntry, type AgentEntry } from "@yesimbot/agent-runtime";
+import { APICallError } from "ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const generateText = vi.hoisted(() => vi.fn());
@@ -11,6 +12,7 @@ vi.mock("ai", async (original) => ({ ...(await original<typeof import("ai")>()),
 
 import { ContextBlockStore, rangeFingerprint } from "../src/conversations/context-blocks.js";
 import {
+  classifyContextRegionFailure,
   generateContextRegionDraft,
   validateContextRegionData,
   validateContextRegionDraft,
@@ -89,6 +91,7 @@ describe("four-tier historian", () => {
     expect(request.prompt).not.toContain("PRIVATE");
     expect(request.prompt).not.toContain("proof");
     expect(request.system).toContain("同一原文");
+    expect(request.maxRetries).toBe(0);
   });
   it("fails oversized original input rather than silently truncating it", async () => {
     const { conversation } = await fixture();
@@ -126,6 +129,106 @@ describe("four-tier historian", () => {
     );
     expect(entry.data.sourceEntryIds).toHaveLength(300);
     expect(await conversation.contextRegions()).toEqual([entry]);
+  });
+});
+
+describe("sanitized historian failure evidence", () => {
+  const records = [{ entryId: "u", role: "user" as const, timestamp: 1, text: "public original" }];
+  const privateText = "PRIVATE sk-secret /private/path provider body chat text";
+  const api = (statusCode?: number, isRetryable = true) =>
+    new APICallError({
+      message: privateText,
+      url: "https://private.invalid/?token=sk-secret",
+      requestBodyValues: { prompt: privateText },
+      responseBody: privateText,
+      responseHeaders: { authorization: privateText },
+      statusCode,
+      isRetryable,
+      cause: new Error(privateText),
+      data: { privateText },
+    });
+
+  it.each([
+    [408, true, 1],
+    [429, true, 1],
+    [500, true, 1],
+    [599, true, 1],
+    [503, false, 0],
+    [400, true, 0],
+    [401, true, 0],
+    [403, true, 0],
+    [409, true, 0],
+  ] as const)("bounds HTTP classification without adopting SDK's 409 retry policy (%s/%s)", (status, retryable, expected) => {
+    expect(classifyContextRegionFailure(api(status, retryable), "model")).toEqual({
+      phase: "model",
+      code: "model-http",
+      httpStatus: status,
+      retryable: expected,
+    });
+  });
+  it.each([NaN, Infinity, -1, 99, 600, 429.5])("does not expose or retry invalid HTTP status %s", (status) => {
+    expect(classifyContextRegionFailure(api(status), "model")).toEqual({ phase: "model", code: "model-unknown", retryable: 0 });
+  });
+  it("recognizes only known statusless SDK, transport and timeout errors; storage never inherits retries", () => {
+    expect(classifyContextRegionFailure(api(), "model")).toEqual({ phase: "model", code: "model-unknown", retryable: 0 });
+    const network = api();
+    Object.assign(network.cause as Error, { code: "ECONNRESET" });
+    expect(classifyContextRegionFailure(network, "model")).toEqual({ phase: "model", code: "model-network", retryable: 1 });
+    expect(classifyContextRegionFailure(api(undefined, false), "model")).toEqual({ phase: "model", code: "model-unknown", retryable: 0 });
+    expect(classifyContextRegionFailure(new Error(privateText, { cause: Object.assign(new Error(privateText), { code: "ECONNRESET" }) }), "model")).toEqual({
+      phase: "model",
+      code: "model-network",
+      retryable: 1,
+    });
+    expect(classifyContextRegionFailure(new DOMException(privateText, "TimeoutError"), "model")).toEqual({
+      phase: "model",
+      code: "model-timeout",
+      retryable: 1,
+    });
+    expect(classifyContextRegionFailure(new TypeError("fetch failed " + privateText), "model")).toEqual({
+      phase: "model",
+      code: "model-unknown",
+      retryable: 0,
+    });
+    expect(classifyContextRegionFailure(api(503), "commit")).toEqual({ phase: "commit", code: "commit-failed", retryable: 0 });
+    expect(classifyContextRegionFailure(new Error("constructor"), "source")).toEqual({ phase: "source", code: "source-failed", retryable: 0 });
+    expect(classifyContextRegionFailure(new Error("StaleContextRegion"), "commit")).toEqual({ phase: "commit", code: "stale-context", retryable: 0 });
+    const controller = new AbortController();
+    controller.abort(new Error(privateText));
+    expect(classifyContextRegionFailure(api(429), "model", controller.signal)).toEqual({ phase: "model", code: "cancelled", retryable: 0 });
+    expect(classifyContextRegionFailure(new DOMException(privateText, "AbortError"), "model")).toEqual({ phase: "model", code: "cancelled", retryable: 0 });
+  });
+  it("drops raw model error details instead of carrying them in the generated failure", async () => {
+    generateText.mockRejectedValueOnce(api(503));
+    const failure = await generateContextRegionDraft({ model: {} as never, records }).catch((cause: unknown) => cause);
+    expect(classifyContextRegionFailure(failure, "model")).toEqual({ phase: "model", code: "model-http", httpStatus: 503, retryable: 1 });
+    expect(JSON.stringify(failure)).not.toContain("PRIVATE");
+    expect(String(failure)).not.toContain("sk-secret");
+    expect(failure).not.toHaveProperty("cause");
+  });
+  it.each([
+    [privateText, "output-json"],
+    [JSON.stringify({ ...draft, importance: 2, privateText }), "output-schema"],
+    [privateText.repeat(1000), "output-too-large"],
+  ])("keeps output validation strict but permits one bounded regeneration (%s)", async (text, code) => {
+    generateText.mockResolvedValueOnce({ text, finishReason: "length", rawFinishReason: privateText });
+    const output = vi.fn();
+    const failure = await generateContextRegionDraft({ model: {} as never, records, onOutput: output }).catch((cause: unknown) => cause);
+    const expected = { phase: "output", code, retryable: 1, finishReason: "length", outputBytes: Buffer.byteLength(text, "utf8") };
+    expect(classifyContextRegionFailure(failure, "model")).toEqual(expected);
+    expect(output).toHaveBeenCalledWith({ finishReason: "length", outputBytes: expected.outputBytes });
+    expect(String(failure)).toContain("InvalidContextRegionOutput");
+    expect(JSON.stringify(failure)).not.toContain("PRIVATE");
+    expect(failure).not.toHaveProperty("cause");
+  });
+  it("allowlists finish reasons and ignores observer exceptions without invalidating valid output", async () => {
+    generateText.mockResolvedValueOnce({ text: JSON.stringify(draft), finishReason: privateText });
+    const output = vi.fn(() => {
+      throw new Error(privateText);
+    });
+    expect(await generateContextRegionDraft({ model: {} as never, records, onOutput: output })).toEqual(draft);
+    expect(output).toHaveBeenCalledWith({ finishReason: "unknown", outputBytes: Buffer.byteLength(JSON.stringify(draft), "utf8") });
+    expect(generateText).toHaveBeenCalledOnce();
   });
 });
 

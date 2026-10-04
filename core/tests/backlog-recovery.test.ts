@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { LanguageModelV3, LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { Context, h } from "@koishijs/core";
 import { AgentRequestProjection, createAgent, createEntry, createUserMessage, type AgentModelRequestContext } from "@yesimbot/agent-runtime";
-import type { ModelMessage } from "ai";
+import { APICallError, type ModelMessage } from "ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("koishi", async () => import("@koishijs/core"));
@@ -360,14 +360,155 @@ describe("frozen emergency backlog recovery", () => {
     expect(aux.generate).toHaveBeenCalledOnce();
   }, 30000);
 
+  it("retries a transient model failure after the foreground deadline without another input or SDK retries", async () => {
+    const blocked = latch();
+    const entered = latch();
+    const aux = historian();
+    aux.generate.mockImplementationOnce(async () => {
+      entered.release();
+      await blocked.promise;
+      throw new APICallError({ message: "PRIVATE provider body", url: "https://private.invalid", requestBodyValues: {}, statusCode: 503 });
+    });
+    const f = await fixture(100, 6000, { continuityModel: aux.model });
+    const freeze = vi.spyOn(f.conversation, "freezeContextRegion");
+    vi.useFakeTimers();
+    const outcome = f.workspace.guard(context(f)).catch((cause: Error) => cause.message);
+    await entered.promise;
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(await outcome).toBe("ContextBudgetExceeded");
+    vi.useRealTimers();
+    blocked.release();
+    await settled(f);
+    const progress = f.workspace.status().historianProgress!;
+    expect(progress).toMatchObject({ reason: "safe", retriedBatches: 1 });
+    expect(progress.remainingEstimatedInputTokens).toBeLessThanOrEqual(124288);
+    expect(aux.generate).toHaveBeenCalledTimes(progress.committedBatches + 1);
+    expect(freeze).toHaveBeenCalledTimes(progress.committedBatches);
+    const sources = freeze.mock.calls.flatMap(([ids]) => [...ids]);
+    expect(new Set(sources).size).toBe(sources.length);
+    expect(f.diagnostic).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "historian.retry", phase: "model", code: "model-http", httpStatus: 503, attempt: 1, maxAttempts: 2 }),
+    );
+    expect(JSON.stringify(f.diagnostic.mock.calls)).not.toContain("PRIVATE");
+    expect(f.stream).not.toHaveBeenCalled();
+  }, 30000);
+
+  it("regenerates malformed output from the same frozen source and commits only valid summaries", async () => {
+    const aux = historian();
+    const valid = aux.generate.getMockImplementation()!;
+    aux.generate.mockImplementationOnce(async (options) => ({ ...(await valid(options)), content: [{ type: "text", text: "PRIVATE malformed output" }] }));
+    const f = await fixture(100, 6000, { continuityModel: aux.model });
+    const freeze = vi.spyOn(f.conversation, "freezeContextRegion");
+    const result = await f.workspace.guard(context(f));
+    await settled(f);
+    expect(JSON.stringify(result)).toContain("CURRENT request");
+    const regions = await f.conversation.contextRegions();
+    expect(regions.length).toBeGreaterThan(0);
+    expect(aux.generate).toHaveBeenCalledTimes(regions.length + 1);
+    expect(freeze).toHaveBeenCalledTimes(regions.length);
+    expect(f.workspace.status().historianProgress).toMatchObject({ reason: "safe", retriedBatches: 1 });
+    expect(f.diagnostic).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "historian.retry", phase: "output", code: "output-json", finishReason: "stop" }),
+    );
+    expect(JSON.stringify(await f.conversation.storage.read())).not.toContain("PRIVATE malformed output");
+    expect(JSON.stringify(f.diagnostic.mock.calls)).not.toContain("PRIVATE");
+  }, 30000);
+
+  it.each(["http", "unknown", "commit"] as const)("does not retry a permanent %s failure or erase raw sources", async (failure) => {
+    const aux = historian();
+    const error = new APICallError({
+      message: "PRIVATE credentials",
+      url: "https://private.invalid",
+      requestBodyValues: {},
+      statusCode: failure === "commit" ? 503 : 401,
+    });
+    if (failure !== "commit") aux.generate.mockRejectedValueOnce(failure === "http" ? error : new Error("PRIVATE unknown failure"));
+    const f = await fixture(100, 6000, { continuityModel: aux.model });
+    if (failure === "commit") vi.spyOn(f.conversation, "commitContextRegion").mockRejectedValueOnce(error);
+    await expect(f.workspace.guard(context(f))).rejects.toThrow("ContextBudgetExceeded");
+    await settled(f);
+    expect(aux.generate).toHaveBeenCalledOnce();
+    expect(await f.conversation.contextRegions()).toHaveLength(0);
+    expect((await f.conversation.storage.read()).filter((entry) => entry.type === "message")).toHaveLength(100);
+    expect(f.workspace.status().historianProgress).toMatchObject({
+      reason: "non-retryable",
+      generationAttempts: 1,
+      retriedBatches: 0,
+      phase: failure === "commit" ? "commit" : "model",
+      code: failure === "commit" ? "commit-failed" : failure === "http" ? "model-http" : "model-unknown",
+    });
+    expect(JSON.stringify(f.diagnostic.mock.calls)).not.toContain("PRIVATE");
+  });
+
+  it.each(["stop", "archive"] as const)("cancels the retry delay on %s without a second request or stale commit", async (action) => {
+    const aux = historian(undefined, "invalid JSON");
+    const retrying = latch();
+    const maintenance = vi.fn();
+    const f = await fixture(100, 6000, {
+      continuityModel: aux.model,
+      onBackgroundSettled: maintenance,
+      onDiagnostic: (metadata) => {
+        if (metadata.event === "historian.retry") retrying.release();
+      },
+    });
+    const session = f.conversation.currentSessionId();
+    vi.useFakeTimers();
+    const outcome = f.workspace.guard(context(f)).catch((cause: Error) => cause.message);
+    await retrying.promise;
+    expect(f.workspace.status()).toMatchObject({ backgroundActive: true, historianProgress: { reason: "retrying", attempt: 1 } });
+    if (action === "stop") f.workspace.stop();
+    else {
+      // Session filenames use wall time; advance it without firing the retry timer.
+      vi.setSystemTime(Date.now() + 10000);
+      await f.conversation.archive(true);
+    }
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(await outcome).toBe("StaleContextRead");
+    await settled(f);
+    expect(aux.generate).toHaveBeenCalledOnce();
+    expect(maintenance).not.toHaveBeenCalled();
+    expect(await f.conversation.contextRegions()).toHaveLength(0);
+    if (action === "archive") {
+      await f.conversation.switch(session);
+      expect(await f.conversation.contextRegions()).toHaveLength(0);
+    }
+  });
+
+  it("exhausts two model attempts, then backs off instead of trying every remaining cohort", async () => {
+    const aux = historian();
+    aux.generate.mockRejectedValue(
+      new APICallError({ message: "PRIVATE server error", url: "https://private.invalid", requestBodyValues: {}, statusCode: 503 }),
+    );
+    const f = await fixture(100, 6000, { continuityModel: aux.model });
+    await expect(f.workspace.guard(context(f))).rejects.toThrow("ContextBudgetExceeded");
+    await settled(f);
+    await expect(f.workspace.guard(context(f, "immediate-repeat"))).rejects.toThrow("ContextBudgetExceeded");
+    expect(aux.generate).toHaveBeenCalledTimes(2);
+    expect(f.workspace.status().historianProgress).toMatchObject({
+      reason: "retry-exhausted",
+      generationAttempts: 2,
+      attemptedBatches: 1,
+      committedBatches: 0,
+      phase: "model",
+      code: "model-http",
+    });
+    expect((await f.conversation.storage.read()).filter((entry) => entry.type === "message")).toHaveLength(100);
+    expect(await f.conversation.contextRegions()).toHaveLength(0);
+    expect(JSON.stringify(f.diagnostic.mock.calls)).not.toContain("PRIVATE");
+  });
+
   it("backs off systemic generation failures instead of trying every remaining cohort", async () => {
     const aux = historian(undefined, "invalid JSON");
     const f = await fixture(undefined, undefined, { continuityModel: aux.model });
     await expect(f.workspace.guard(context(f))).rejects.toThrow("ContextBudgetExceeded");
     await settled(f);
     await expect(f.workspace.guard(context(f, "retry"))).rejects.toThrow("ContextBudgetExceeded");
-    expect(aux.generate).toHaveBeenCalledOnce();
-    expect(f.workspace.status()).toMatchObject({ historian: "failed", backgroundActive: false });
+    expect(aux.generate).toHaveBeenCalledTimes(2);
+    expect(f.workspace.status()).toMatchObject({
+      historian: "failed",
+      backgroundActive: false,
+      historianProgress: { reason: "retry-exhausted", generationAttempts: 2, retriedBatches: 1, phase: "output", code: "output-json" },
+    });
     expect(await f.conversation.contextRegions()).toHaveLength(0);
     expect(f.diagnostic).toHaveBeenCalledWith(expect.objectContaining({ event: "guard.estimate", reason: "unresolved-unsafe" }));
   });

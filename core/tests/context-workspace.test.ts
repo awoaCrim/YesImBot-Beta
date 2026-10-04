@@ -148,7 +148,7 @@ function context(
 }
 const many = () => Array.from({ length: 90 }, (_, index) => `历史${index}:` + "x".repeat(4000));
 async function settled(f: Awaited<ReturnType<typeof fixture>>) {
-  await vi.waitFor(() => expect(f.workspace.status().backgroundActive).toBe(false));
+  await vi.waitFor(() => expect(f.workspace.status().backgroundActive).toBe(false), { timeout: 5000 });
 }
 
 describe("asynchronous Magic workspace", () => {
@@ -198,7 +198,8 @@ describe("asynchronous Magic workspace", () => {
     await settled(f);
     expect(await f.conversation.contextRegions()).toHaveLength(0);
     expect(JSON.stringify(await f.workspace.guard(context(f, "turn", 1)))).toContain("历史0:");
-    expect(aux.generate).toHaveBeenCalledTimes(1);
+    expect(aux.generate).toHaveBeenCalledTimes(2);
+    expect(f.workspace.status().historianProgress).toMatchObject({ reason: "retry-exhausted", generationAttempts: 2, attemptedBatches: 1 });
   });
   it("rejects fixed mandatory overflow without waiting for an impossible summary", async () => {
     const f = await fixture([], { config: { contextWindow: 10000, outputReserveTokens: 1000 } });
