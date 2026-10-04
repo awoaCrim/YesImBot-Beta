@@ -1669,6 +1669,63 @@ describe("ChannelRuntime provider-usage compaction", () => {
 // ---------------------------------------------------------------------------
 
 describe("Runtimes identity", () => {
+  it.each([
+    { enabled: true, level: "high", separate: true, expected: "low" },
+    { enabled: true, level: "high", separate: false, expected: "low" },
+    { enabled: true, level: "off", separate: false, expected: "off" },
+    { enabled: true, level: "minimal", separate: true, expected: "minimal" },
+    { enabled: true, level: "low", separate: true, expected: "low" },
+    { enabled: true, level: undefined, separate: true, expected: "low" },
+    { enabled: false, level: "high", separate: true, expected: undefined },
+  ] as const)("scopes historian thinking without replacing main/legacy settings: %j", async ({ enabled, level, separate, expected }) => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-scoped-historian-"));
+    const ctx = new Context();
+    const channels = new Channels(ctx, { basePath: root });
+    const main = { provider: "test", modelId: "main" };
+    const legacy = { provider: "test", modelId: "compact" };
+    const scoped = { provider: "test", modelId: separate ? "compact" : "main" };
+    const model = {
+      revision: 1,
+      contextLimit: () => undefined,
+      resolveChatModel: vi.fn((id: string, _context?: ChannelContext, options?: { thinkingLevel?: string }) => ({
+        fullId: id,
+        providerId: "test",
+        modelId: id.split(":")[1],
+        model: options ? scoped : id === "test:main" ? main : legacy,
+        entry: { id: id.split(":")[1], reasoning: true, thinkingLevel: options?.thinkingLevel ?? level },
+      })),
+    };
+    const runtimes = new Runtimes(
+      ctx,
+      channels,
+      model as never,
+      {
+        ...config,
+        basePath: root,
+        chatModel: "test:main",
+        logLevel: 0,
+        session: {
+          ...config.session,
+          compact: { ...config.session.compact, mode: "compartment", model: separate ? "test:compact" : undefined },
+          magicContext: { enabled, contextWindow: 147200 },
+        },
+      },
+      new Agents(ctx),
+    );
+    try {
+      const channel = await channels.resolve({ type: "guild", platform: "test", channelId: "room", guildId: "room" });
+      await runtimes.get(channel, { selfId: "bot", sendMessage: vi.fn() } as never);
+      const overrideCalls = model.resolveChatModel.mock.calls.filter((call) => call[2] !== undefined);
+      expect(overrideCalls).toHaveLength(enabled ? 1 : 0);
+      if (enabled) expect(overrideCalls[0]).toEqual([separate ? "test:compact" : "test:main", channel.context, { thinkingLevel: expected }]);
+      expect(vi.mocked(createAgent).mock.calls.at(-1)![0].model).toBe(main);
+      expect(model.resolveChatModel.mock.calls[0]?.[2]).toBeUndefined();
+    } finally {
+      await runtimes.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("reuses a runtime when Cordis returns different proxies for the same Bot", async () => {
     const root = await mkdtemp(join(tmpdir(), "yesimbot-proxy-bot-"));
     const ctx = new Context();

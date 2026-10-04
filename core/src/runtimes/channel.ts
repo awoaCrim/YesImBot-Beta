@@ -116,6 +116,8 @@ export interface ChannelRuntimeOptions {
   readonly roleProfile?: MainAgentRoleProfile;
   readonly messageBatch?: MessageBatchPlugin;
   readonly compactModel?: LanguageModel;
+  /** Separately resolved Magic-only settings; never used by the main agent or legacy compaction. */
+  readonly historianModel?: LanguageModel;
   readonly archiveMaxBytes?: number;
   /** Core persistent overflow index for fragments older than the resident window. */
   readonly compactFragments?: CompactFragmentRecallSource;
@@ -203,7 +205,7 @@ export class ChannelRuntime {
         config: options.config.session.magicContext!,
         compactMode: options.config.session.compact.mode,
         model: options.model,
-        continuityModel: options.compactModel ?? options.model,
+        continuityModel: options.historianModel ?? options.compactModel ?? options.model,
         modelLimit: options.contextModelLimit,
         resolveModelLimit: options.resolveContextModelLimit,
         ...(options.historyProjection === "gemini-native" ? { mergeMessages: mergeAdjacentUserMessages } : {}),

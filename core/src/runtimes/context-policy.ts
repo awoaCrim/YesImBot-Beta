@@ -37,6 +37,7 @@ export function contextCandidates(
   multiplier: number,
   baseTokens = 0,
   sourceCosts?: ReadonlyMap<string, number>,
+  messageTokenCosts?: readonly number[],
 ): string[][] {
   const current = new Set(context.currentMessageIds);
   const units = requestUnits(context.messages, context.projection?.describe(context.messages) ?? context.messages.map(() => undefined));
@@ -49,17 +50,17 @@ export function contextCandidates(
         ![...unit.sourceEntryIds].some((id) => current.has(id) || covered.has(id)),
     )
     .sort((a, b) => a.timestamp - b.timestamp || a.indices[0]! - b.indices[0]!);
+  const tokenCost = (index: number) => messageTokenCosts?.[index] ?? estimateContextMessage(context.messages[index]!) * multiplier;
   const mandatoryTokens =
-    (baseTokens +
-      units
-        .filter((unit) => unit.mandatory || [...unit.sourceEntryIds].some((id) => current.has(id)))
-        .reduce((sum, unit) => sum + unit.indices.reduce((total, index) => total + estimateContextMessage(context.messages[index]!), 0), 0)) *
-    multiplier;
+    baseTokens * multiplier +
+    units
+      .filter((unit) => unit.mandatory || [...unit.sourceEntryIds].some((id) => current.has(id)))
+      .reduce((sum, unit) => sum + unit.indices.reduce((total, index) => total + tokenCost(index), 0), 0);
   const protectedTokens = Math.max(0, Math.floor(Math.min(Math.min(CONTEXT_TARGET_TOKENS, capacity * 0.8) * 0.2, capacity * 0.9 - mandatoryTokens)));
   let tailTokens = 0;
   const eligible = new Set<(typeof historical)[number]>();
   for (const unit of [...historical].reverse()) {
-    const cost = unit.indices.reduce((sum, index) => sum + estimateContextMessage(context.messages[index]!), 0) * multiplier;
+    const cost = unit.indices.reduce((sum, index) => sum + tokenCost(index), 0);
     if (tailTokens + cost > protectedTokens) {
       eligible.add(unit);
       tailTokens = protectedTokens;

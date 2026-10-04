@@ -1,5 +1,4 @@
 import { EphemeralImageProjectionStore } from "@yesimbot/agent-runtime";
-import type { LanguageModel } from "ai";
 import type { Bot, Context, Logger, Session } from "koishi";
 
 import { Agents } from "../agents/index.js";
@@ -112,7 +111,14 @@ export class Runtimes {
           providerToolCount: Object.keys(chat.tools ?? {}).length,
         });
       }
-      const compactModel = this.resolveCompactModel(chat.model, channel.context);
+      const compact = this.resolveCompactModel(chat, channel.context);
+      const compactModel = compact.model;
+      const configuredThinking = compact.entry.thinkingLevel;
+      const historianModel = this.config.session.magicContext?.enabled
+        ? this.model.resolveChatModel(compact.fullId, channel.context, {
+            thinkingLevel: configuredThinking === "off" || configuredThinking === "minimal" || configuredThinking === "low" ? configuredThinking : "low",
+          }).model
+        : undefined;
       const vision = this.resolveVision(channel.context);
       const imageProjection = new EphemeralImageProjectionStore();
       const polisher = this.polishers.resolve();
@@ -160,6 +166,7 @@ export class Runtimes {
         directImageInput: this.config.imageInput && (chat.entry.modalities?.input?.includes("image") ?? false),
         toolChoice,
         compactModel,
+        historianModel,
         providerTools: chat.tools,
         visionModel: vision?.model,
         readImagePolicy: resolveReadImagePolicy(chat, vision, this.config.imageInput),
@@ -277,7 +284,7 @@ export class Runtimes {
       const chat = noSummary || magic ? undefined : this.model.resolveChatModel(this.config.chatModel, channel.context);
       const input = chat
         ? {
-            model: this.resolveCompactModel(chat.model, channel.context),
+            model: this.resolveCompactModel(chat, channel.context).model,
           }
         : undefined;
       const archiveWithoutSeed = noSummary || (!magic && !input);
@@ -318,8 +325,8 @@ export class Runtimes {
     return sessions.length ? sessions.map((session) => `${session.isActive ? "→ " : "  "}${session.filename}`).join("\n") : "无会话记录。";
   }
 
-  private resolveCompactModel(fallback: LanguageModel, context: ChannelContext): LanguageModel {
-    return this.config.session.compact.model ? this.model.resolveChatModel(this.config.session.compact.model, context).model : fallback;
+  private resolveCompactModel(fallback: ChatModelRef, context: ChannelContext): ChatModelRef {
+    return this.config.session.compact.model ? this.model.resolveChatModel(this.config.session.compact.model, context) : fallback;
   }
 
   private resolveVision(context: ChannelContext) {

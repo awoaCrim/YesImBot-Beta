@@ -161,7 +161,7 @@ export class ModelService {
     };
   }
 
-  public resolveChatModel(fullId: string, context?: ChannelContext): ChatModelRef {
+  public resolveChatModel(fullId: string, context?: ChannelContext, options?: Readonly<Pick<ChatModelConfig, "thinkingLevel">>): ChatModelRef {
     const record = this.getChatRecord(fullId);
     const provider = this.providers.get(record.providerId);
     if (!provider) {
@@ -175,7 +175,10 @@ export class ModelService {
       model: record.modelId,
       modalities: record.config.modalities,
     });
-    const source = provider.chat!(record.modelId, cloneChatModelConfig(record.config));
+    const entry = cloneChatModelConfig(record.config);
+    if (options?.thinkingLevel !== undefined) entry.thinkingLevel = options.thinkingLevel;
+    // A per-resolution override must not mutate the registry or another use of the same model.
+    const source = provider.chat!(record.modelId, cloneChatModelConfig(entry));
     const model = isModelObject(source)
       ? [...this.middlewares].reduce(
           (current, middleware) => wrapLanguageModel({ model: current, middleware, providerId: record.providerId, modelId: record.modelId }),
@@ -210,7 +213,7 @@ export class ModelService {
       fullId: record.fullId,
       providerId: record.providerId,
       modelId: record.modelId,
-      entry: cloneChatModelConfig(record.config),
+      entry,
       model,
       capabilities,
       tools: tools && { ...tools },
@@ -578,6 +581,7 @@ function cloneChatModelConfig(config: ChatModelConfig): ChatModelConfig {
   return {
     ...config,
     thinkingLevelMap: config.thinkingLevelMap ? { ...config.thinkingLevelMap } : undefined,
+    limit: config.limit ? { ...config.limit } : undefined,
     modalities: config.modalities
       ? {
           ...(config.modalities.input ? { input: [...config.modalities.input] } : {}),
