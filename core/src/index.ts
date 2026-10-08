@@ -11,6 +11,10 @@ export default YesImBotService;
 export type {
   ChannelPlugin,
   ChannelPluginSetupContext,
+  ImagePreviewCapability,
+  ImagePreviewFrame,
+  ImagePreviewRequest,
+  ImageDescribeRequest,
   MainAgentRoleProfile,
   MainAgentRoleProvider,
   MessagePolisherCapability,

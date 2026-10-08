@@ -1,6 +1,7 @@
 import { EphemeralImageProjectionStore } from "@yesimbot/agent-runtime";
 import type { Bot, Context, Logger, Session } from "koishi";
 
+import { createImagePreviewCapability } from "../agents/image-preview.js";
 import { Agents } from "../agents/index.js";
 import { createSendMessagePolisher, PolisherRegistry } from "../agents/polisher.js";
 import type { ReadImagePolicy } from "../agents/tools.js";
@@ -121,6 +122,7 @@ export class Runtimes {
         : undefined;
       const vision = this.resolveVision(channel.context);
       const imageProjection = new EphemeralImageProjectionStore();
+      const readImagePolicy = resolveReadImagePolicy(chat, vision, this.config.imageInput);
       const polisher = this.polishers.resolve();
       const polish =
         polisher === undefined
@@ -142,6 +144,7 @@ export class Runtimes {
       const will = await this.agents.setupWill(willContext, session);
       const plugins = await this.agents.setup(channel.context, bot, {
         imageProjection,
+        imagePreview: createImagePreviewCapability({ policy: readImagePolicy, projection: imageProjection }),
         polisherActive: polisher !== undefined,
         rolePromptsManaged: polisher === undefined,
       });
@@ -169,7 +172,7 @@ export class Runtimes {
         historianModel,
         providerTools: chat.tools,
         visionModel: vision?.model,
-        readImagePolicy: resolveReadImagePolicy(chat, vision, this.config.imageInput),
+        readImagePolicy,
         imageProjection,
         config: this.config,
         plugins,

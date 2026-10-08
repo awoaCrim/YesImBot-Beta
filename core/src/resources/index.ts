@@ -22,7 +22,8 @@ export type ResourceReadErrorCode =
   | "timeout"
   | "resource_read_aborted"
   | "resource_too_large"
-  | "resource_read_failed";
+  | "resource_read_failed"
+  | "resource_delivery_restricted";
 
 export interface ResourceOpenOptions {
   readonly signal: AbortSignal;
@@ -197,6 +198,12 @@ async function prepareElement(element: Element, resources: ChannelResources, sig
     // ponytail: full 32-hex ID required for output resolution; prefix/short IDs are not resolvable
     const scheme = src.slice(0, src.indexOf(":"));
     if (scheme === "asset") return undefined;
+  }
+  // Sticker artifacts are historical/read-only projections, never a second delivery route.
+  // Enforce after element parsing (and polishing), including file/nested image elements.
+  const parsedSource = parseUri(src);
+  if (parsedSource?.protocol === "artifact:" && parsedSource.hostname === "sticker") {
+    throw new ResourceReadError("resource_delivery_restricted");
   }
   const opened = await resources.open(src, signal);
   if (!opened) return undefined;

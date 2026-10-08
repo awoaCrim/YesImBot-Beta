@@ -677,6 +677,46 @@ describe("read tool resource errors", () => {
 // ---------------------------------------------------------------------------
 
 describe("prepareOutputSegments", () => {
+  it.each(["img", "file", "nested", "entities"])("blocks sticker artifact delivery through %s while retaining read access", async (shape) => {
+    const resources = await createResources();
+    const uri = await resources.artifacts.forTool("sticker").put(PNG_BYTES, { mediaType: "image/png" });
+    const markup =
+      shape === "nested"
+        ? `<message><img src="${uri}"/></message>`
+        : shape === "entities"
+          ? `<img src="${uri.replace(":", "&#58;")}"/>`
+          : `<${shape} src="${uri}"/>`;
+    await expect(prepareOutputSegments([h.parse(markup)], resources)).rejects.toMatchObject({ code: "resource_delivery_restricted" });
+    expect((await resources.open(uri))?.bytes).toEqual(PNG_BYTES);
+  });
+
+  it("enforces the sticker artifact gate after polishing but allows literal URI text and raw mode", async () => {
+    const resources = await createResources();
+    const uri = await resources.artifacts.forTool("sticker").put(PNG_BYTES, { mediaType: "image/png" });
+    const sendMessage = vi.fn(async () => ["sent"]);
+    const options = {
+      bot: { platform: "test", sendMessage } as never,
+      channelId: "channel",
+      resources,
+      pacing: { charactersPerSecond: 1000, maxTotalDelayMs: 0 },
+      innerThought: false,
+    };
+    const polish = vi.fn(async () => [`rewritten <img src="${uri}"/>`]);
+    const polished = createSendMessageTool({ ...options, polish });
+    const execution = { toolCallId: "send", turnId: "turn", messages: [] } as never;
+    expect(await polished.execute({ messages: [`draft <img src="${uri}"/>`] }, execution)).toMatchObject({
+      ok: false,
+      error: { name: "resource_delivery_restricted" },
+    });
+    expect(polish).toHaveBeenCalledOnce();
+    expect(sendMessage).not.toHaveBeenCalled();
+    const normal = createSendMessageTool(options);
+    expect(await normal.execute({ messages: [uri] }, execution)).toMatchObject({ ok: true });
+    expect(await normal.execute({ messages: [`<img src="${uri}"/>`], mode: "raw" }, execution)).toMatchObject({ ok: true });
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(sendMessage.mock.calls.every((call) => (call as unknown as [string, { type: string }[]])[1].every((part) => part.type === "text"))).toBe(true);
+  });
+
   async function resourcesWith(open: ResourceReader["setup"], registrations: Map<string, ResourceReader> = new Map()): Promise<ChannelResources> {
     const resources = await createResources();
     for (const [_scheme, r] of registrations) resources.use(r);

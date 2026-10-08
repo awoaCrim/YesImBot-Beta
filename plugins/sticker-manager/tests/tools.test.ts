@@ -1,341 +1,200 @@
-/* eslint-disable vitest/require-mock-type-parameters */
-import type { AgentTool } from "@yesimbot/agent-runtime";
-import type { AssetStore, ChannelContext } from "koishi-plugin-yesimbot";
-import { PNG } from "pngjs";
 import { describe, expect, it, vi } from "vitest";
+vi.mock("koishi", async () => import("@koishijs/core"));
+import { GifReader } from "omggif";
 
-import type { StickerClassifier } from "../src/classifier.js";
-import type { StickerSender } from "../src/sender.js";
 import type { StickerStore } from "../src/store.js";
-import { createStickerTools } from "../src/tools.js";
-import type { StickerConfig, StickerProjection } from "../src/types.js";
+import { pickBestTaggedSticker, stickerSendMessageBlockReason } from "../src/tools.js";
+import { createDeps, pngBytes, sticker, stickerId } from "./preview-fixtures.js";
 
-const scope: ChannelContext = { type: "guild", platform: "test", channelId: "room-1", guildId: "room-1" };
-
-const config: StickerConfig = {
-  scope: "global",
-  storagePath: "data",
-  classificationModel: "",
-  classificationPrompt: "{{categories}}",
-  maxImportFileBytes: 1024 * 1024,
-  tagMode: false,
-  fuzzyTagMatch: true,
-  tagRandomRange: 1,
-  sendStaticAsGif: true,
-  stickerElement: true,
-  enableSteal: true,
-};
-
-const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
-
-function projection(overrides: Partial<StickerProjection> = {}): StickerProjection {
-  return {
-    id: "a".repeat(64),
-    category: "meme",
-    tags: [],
-    mime: "image/png",
-    size: pngBytes.byteLength,
-    source: { kind: "steal" },
-    usageCount: 0,
-    lastUsedAt: null,
-    createdAt: "2026-01-01T00:00:00.000Z",
-    ...overrides,
-  };
-}
-
-function createDeps(overrides: Partial<StickerConfig> = {}) {
-  const effectiveConfig = { ...config, ...overrides };
-  const store = {
-    listCategories: vi.fn(async () => []),
-    listTags: vi.fn(async () => []),
-    save: vi.fn(async (input: { tags?: readonly string[] }) => ({ status: "created", sticker: projection({ tags: [...(input.tags ?? [])] }) })),
-    get: vi.fn(async () => null),
-    search: vi.fn(async () => [projection()]),
-    listByScopeKey: vi.fn(async () => [projection()]),
-    random: vi.fn(async () => projection()),
-    readBytes: vi.fn(async () => pngBytes),
-    markUsed: vi.fn(async () => projection({ usageCount: 1 })),
-  };
-  const classifier: StickerClassifier = { classify: vi.fn(async () => ({ category: "meme", tags: ["搞笑"] })) };
-  const sender: StickerSender = { send: vi.fn(async () => undefined) };
-  const assets: AssetStore = { put: vi.fn(async () => "a".repeat(32)), get: vi.fn(async () => pngBytes), clear: vi.fn(async () => undefined) };
-  const sentTurnIds = new Set<string>();
-  const tools = createStickerTools({ store: store as unknown as StickerStore, classifier, sender, assets, scope, config: effectiveConfig, sentTurnIds });
-  return { store, classifier, sender, assets, sentTurnIds, tools };
-}
-
-async function execute(tool: AgentTool, input: unknown, turnId = "turn-1"): Promise<unknown> {
-  return tool.execute!(input, { abortSignal: undefined, turnId } as never);
-}
-
-function toolNames(tools: AgentTool[]): Set<string> {
-  return new Set(tools.map((tool) => tool.name));
-}
-
-function toolByName(tools: AgentTool[], name: string): AgentTool {
-  const tool = tools.find((candidate) => candidate.name === name);
-  if (!tool) throw new Error(`missing tool: ${name}`);
-  return tool;
+async function send(deps: ReturnType<typeof createDeps>, input = { sticker_id: stickerId }) {
+  return deps.execute(deps.tool("sticker_send"), input);
 }
 
 describe("sticker agent tools", () => {
-  it("keeps the legacy tool set while stealing is enabled", () => {
-    const { tools } = createDeps({ enableSteal: true });
-    expect(toolNames(tools)).toEqual(new Set(["sticker_steal", "sticker_send", "sticker_categories", "sticker_search"]));
+  it("keeps collection and tag switches independent of sending", () => {
+    const deps = createDeps({ enableSteal: false, tagMode: true });
+    expect(deps.tools.map((t) => t.name)).toEqual(["sticker_send", "sticker_categories", "sticker_search", "sticker_tags"]);
+    expect(deps.tools.map((t) => t.description).join("\n")).not.toContain("sticker_steal");
+    expect(createDeps().tools.some((t) => t.name === "sticker_steal")).toBe(true);
   });
 
-  it("marks sticker_send as terminal because the tool performs platform delivery", () => {
-    const { tools } = createDeps({ enableSteal: false });
-
-    expect(toolByName(tools, "sticker_send").terminal).toBe(true);
-  });
-
-  it("documents direct category sends and literal keyword searches without inventing semantic matching", () => {
-    const { tools } = createDeps({ enableSteal: false });
-    const send = toolByName(tools, "sticker_send");
-    const search = toolByName(tools, "sticker_search");
-
-    expect(send.description).toContain("在发送文字前决定是否使用");
-    expect(send.description).toContain("已知分类时无需先搜索");
-    expect(send.description).toContain("不合适时可以省略");
-    expect(search.description).toContain("完整分类名精确匹配");
-    expect(search.description).toContain("分类名、id 或标签的单个子串");
-    expect(search.description).toContain("不支持 OR/AND 运算");
-    expect(search.description).toContain("不按图片画面或人物进行语义搜索");
-  });
-
-  it("sends directly from a known category without requiring a search", async () => {
-    const deps = createDeps({ enableSteal: false });
-    const result = await execute(toolByName(deps.tools, "sticker_send"), { category: "meme" });
-
-    expect(deps.store.random).toHaveBeenCalledWith("global", "meme");
-    expect(deps.store.search).not.toHaveBeenCalled();
-    expect(deps.sender.send).toHaveBeenCalledOnce();
-    expect(result).toMatchObject({ ok: true });
-  });
-
-  it("hides sticker_steal but keeps sending, categories and search when stealing is disabled", async () => {
-    const deps = createDeps({ enableSteal: false });
-    expect(toolNames(deps.tools)).toEqual(new Set(["sticker_send", "sticker_categories", "sticker_search"]));
-    expect(deps.tools.map((tool) => tool.description).join("\n")).not.toContain("sticker_steal");
-    expect(toolByName(deps.tools, "sticker_search").description).toContain("必须调用 sticker_send");
-    expect(toolByName(deps.tools, "sticker_search").description).not.toContain("<sticker");
-
-    const sendResult = await execute(toolByName(deps.tools, "sticker_send"), {});
-    expect(deps.sender.send).toHaveBeenCalledWith({ bytes: pngBytes, mediaType: "image/png" });
-    expect(deps.store.markUsed).toHaveBeenCalledWith("global", "a".repeat(64));
-    expect(sendResult).toMatchObject({ ok: true, category: "meme" });
-
-    deps.store.listCategories.mockResolvedValue([{ category: "meme", count: 1 }]);
-    const categoriesResult = await execute(toolByName(deps.tools, "sticker_categories"), {});
-    expect(categoriesResult).toMatchObject({ ok: true, categories: [{ category: "meme", count: 1 }] });
-
-    const searchResult = await execute(toolByName(deps.tools, "sticker_search"), { category: "meme" });
-    expect(deps.store.search).toHaveBeenCalledWith("global", { category: "meme" });
-    expect(searchResult).toMatchObject({ ok: true, stickers: [{ id: "a".repeat(64), category: "meme" }] });
-  });
-
-  it("keeps the tagMode tool set unchanged when stealing is disabled", () => {
-    const { tools } = createDeps({ enableSteal: false, tagMode: true });
-    expect(toolNames(tools)).toEqual(new Set(["sticker_send", "sticker_categories", "sticker_search", "sticker_tags"]));
-  });
-
-  it("exposes sticker_tags only in experimental tag mode", () => {
-    const disabled = createDeps();
-    expect(disabled.tools.some((tool) => tool.name === "sticker_tags")).toBe(false);
-
-    const enabled = createDeps({ tagMode: true });
-    expect(enabled.tools.some((tool) => tool.name === "sticker_tags")).toBe(true);
-  });
-
-  it("sticker_steal reads the asset and saves with classified category", async () => {
+  it("makes continuation explicit and keeps search metadata-only", () => {
     const deps = createDeps();
-    const [tool] = deps.tools;
-    const result = await execute(tool, { asset_id: "a".repeat(32) });
-    expect(deps.assets.get).toHaveBeenCalledWith("a".repeat(32));
-    expect(deps.classifier.classify).toHaveBeenCalled();
-    expect(deps.store.save).toHaveBeenCalledWith(expect.objectContaining({ scopeKey: "global", category: "meme", mediaType: "image/png" }));
-    expect(result).toMatchObject({ ok: true, status: "created", id: "a".repeat(64) });
+    const terminal = deps.tool("sticker_send").terminal;
+    if (typeof terminal !== "function") throw new Error("missing terminal predicate");
+    expect(terminal({ sticker_id: stickerId })).toBe(true);
+    expect(terminal({ sticker_id: stickerId, continue: true })).toBe(false);
+    expect(deps.tool("sticker_search").description).toContain("不支持 OR/AND");
+    expect(deps.tool("sticker_search").description).toContain("不代表你已经看过");
   });
 
-  it("sticker_steal auto-tags the classified category in tag mode", async () => {
-    const deps = createDeps({ tagMode: true });
-    const [tool] = deps.tools;
-    const result = await execute(tool, { asset_id: "a".repeat(32) });
-    expect(deps.store.save).toHaveBeenCalledWith(expect.objectContaining({ tags: ["meme", "搞笑"] }));
-    expect(result).toMatchObject({ ok: true, tags: ["meme", "搞笑"] });
+  it.each([{}, { category: "meme" }, { sticker_id: stickerId }])("rejects unread or blind sends %j", async (input) => {
+    const deps = createDeps();
+    await deps.execute(deps.tool("sticker_search"), {});
+    expect(await deps.execute(deps.tool("sticker_send"), input)).toEqual({ ok: false, error: "sticker_preview_required" });
+    expect(deps.sender.send).not.toHaveBeenCalled();
+    expect(deps.store.random).not.toHaveBeenCalled();
   });
 
-  it("sticker_steal skips classifier and save for an existing sticker", async () => {
-    const deps = createDeps({ tagMode: true });
-    deps.store.get.mockResolvedValue(projection({ id: "a".repeat(64), category: "meme", tags: ["meme"] }));
-    const [tool] = deps.tools;
-
-    const result = await execute(tool, { asset_id: "a".repeat(32) });
-
-    expect(deps.classifier.classify).not.toHaveBeenCalled();
-    expect(deps.store.save).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ ok: true, status: "duplicate", id: "a".repeat(64) });
-  });
-
-  it("sticker_send with fuzzy tags scores multiple tag matches on one sticker", async () => {
-    const deps = createDeps({ tagMode: true, tagRandomRange: 0 });
-    deps.store.listByScopeKey.mockResolvedValue([
-      projection({ id: "a".repeat(64), tags: ["可爱猫猫", "工作"] }),
-      projection({ id: "b".repeat(64), tags: ["猫"] }),
-    ]);
-    const [, sendTool] = deps.tools;
-    const result = await execute(sendTool, { tags: ["猫", "可爱"] });
-    expect(deps.store.listByScopeKey).toHaveBeenCalledWith("global");
+  it("sends exactly the viewed target and records usage", async () => {
+    const deps = createDeps();
+    expect(await deps.view({ category: "meme" })).toMatchObject({ ok: true, id: stickerId });
+    expect(deps.store.random).toHaveBeenCalledWith("global", "meme");
+    expect(deps.store.markUsed).not.toHaveBeenCalled();
+    expect(await send(deps)).toMatchObject({ ok: true, id: stickerId });
     expect(deps.sender.send).toHaveBeenCalledWith({ bytes: pngBytes, mediaType: "image/png" });
-    expect(deps.store.markUsed).toHaveBeenCalledWith("global", "a".repeat(64));
-    expect(result).toMatchObject({ ok: true, tags: ["可爱猫猫", "工作"] });
+    expect(deps.store.markUsed).toHaveBeenCalledWith("global", stickerId);
+    expect(deps.store.random).toHaveBeenCalledOnce();
+    deps.projection.clearAll();
   });
 
-  it("sticker_send tag random range can include lower-scoring matches", async () => {
-    const deps = createDeps({ tagMode: true, tagRandomRange: 1 });
-    deps.store.listByScopeKey.mockResolvedValue([
-      projection({ id: "a".repeat(64), tags: ["可爱猫猫", "工作"] }),
-      projection({ id: "b".repeat(64), tags: ["可爱"] }),
-    ]);
-    const [, sendTool] = deps.tools;
-    const random = vi.spyOn(Math, "random").mockReturnValue(0.99);
+  it("rejects a different target and changed bytes", async () => {
+    const deps = createDeps();
+    await deps.view();
+    expect(await send(deps, { sticker_id: "b".repeat(64) })).toMatchObject({ error: "sticker_preview_mismatch" });
+    deps.store.readBytes.mockResolvedValueOnce(new Uint8Array([1, 2, 3]));
+    expect(await send(deps)).toMatchObject({ error: "sticker_preview_stale" });
+    expect(deps.sender.send).not.toHaveBeenCalled();
+    expect(await send(deps)).toMatchObject({ ok: true });
+    deps.projection.clearAll();
+  });
 
+  it("blocks concurrent sends before sender is awaited", async () => {
+    const deps = createDeps();
+    await deps.view();
+    const results = await Promise.all([send(deps), send(deps)]);
+    expect(results).toEqual(expect.arrayContaining([expect.objectContaining({ ok: true }), { ok: false, error: "sticker_send_limit_reached" }]));
+    expect(deps.sender.send).toHaveBeenCalledOnce();
+    expect(deps.store.markUsed).toHaveBeenCalledOnce();
+    deps.projection.clearAll();
+  });
+
+  it("never retries ambiguous delivery", async () => {
+    const deps = createDeps();
+    await deps.view();
+    deps.sender.send.mockRejectedValueOnce(new Error("transport failed"));
+    expect(await send(deps)).toEqual({ ok: false, error: "sticker_delivery_uncertain" });
+    expect(await send(deps)).toMatchObject({ error: "sticker_send_limit_reached" });
+    expect(deps.sender.send).toHaveBeenCalledOnce();
+    expect(deps.store.markUsed).not.toHaveBeenCalled();
+    deps.projection.clearAll();
+  });
+
+  it("reports delivery honestly when usage accounting fails", async () => {
+    const deps = createDeps();
+    await deps.view();
+    deps.store.markUsed.mockRejectedValueOnce(new Error("db failed"));
+    expect(await send(deps)).toMatchObject({ ok: true, warning: "sticker_usage_update_failed" });
+    expect(await send(deps)).toMatchObject({ error: "sticker_send_limit_reached" });
+    deps.projection.clearAll();
+  });
+
+  it("requires a new view in a later turn", async () => {
+    const deps = createDeps();
+    await deps.view();
+    await send(deps);
+    deps.gate.clearTurn("turn-1");
+    deps.slot.clearTurn("turn-1");
+    expect(await deps.execute(deps.tool("sticker_send"), { sticker_id: stickerId }, "turn-2")).toMatchObject({ error: "sticker_preview_required" });
+    await deps.view({ sticker_id: stickerId }, "turn-2");
+    expect(await deps.execute(deps.tool("sticker_send"), { sticker_id: stickerId }, "turn-2")).toMatchObject({ ok: true });
+    deps.projection.clearAll();
+  });
+
+  it("does not send when abort arrives during byte lookup", async () => {
+    const deps = createDeps();
+    await deps.view();
+    const controller = new AbortController();
+    deps.store.readBytes.mockImplementationOnce(async () => {
+      controller.abort();
+      return pngBytes;
+    });
+    expect(await deps.execute(deps.tool("sticker_send"), { sticker_id: stickerId }, "turn-1", controller.signal)).toMatchObject({
+      error: "resource_read_aborted",
+    });
+    expect(deps.sender.send).not.toHaveBeenCalled();
+    deps.projection.clearAll();
+  });
+
+  it("releases preflight failures but not delivery attempts", async () => {
+    const deps = createDeps();
+    await deps.view();
+    deps.store.get.mockResolvedValueOnce(null);
+    expect(await send(deps)).toMatchObject({ error: "sticker_not_found" });
+    deps.store.readBytes.mockRejectedValueOnce(new Error("missing"));
+    expect(await send(deps)).toMatchObject({ ok: false });
+    expect(await send(deps)).toMatchObject({ ok: true });
+    deps.projection.clearAll();
+  });
+
+  it("still converts static art to GIF only on delivery", async () => {
+    const deps = createDeps({ sendStaticAsGif: true });
+    await deps.view();
+    await send(deps);
+    const sent = vi.mocked(deps.sender.send).mock.calls[0]![0] as unknown as { bytes: Uint8Array; mediaType: string };
+    expect(sent.mediaType).toBe("image/gif");
+    expect(new GifReader(sent.bytes).numFrames()).toBe(1);
+    deps.projection.clearAll();
+  });
+
+  it("preserves collection classification and duplicate handling", async () => {
+    const deps = createDeps({ tagMode: true });
+    deps.store.get.mockResolvedValueOnce(null);
+    expect(await deps.execute(deps.tool("sticker_steal"), { asset_id: "a".repeat(32) })).toMatchObject({ ok: true, status: "created" });
+    expect(deps.store.save).toHaveBeenCalledWith(expect.objectContaining({ tags: ["meme", "搞笑"] }));
+    expect(await deps.execute(deps.tool("sticker_steal"), { asset_id: "a".repeat(32) })).toMatchObject({ status: "duplicate" });
+    expect(deps.store.save).toHaveBeenCalledOnce();
+  });
+
+  it("preserves manual collection and invalid/missing asset behavior", async () => {
+    const deps = createDeps();
+    deps.store.get.mockResolvedValueOnce(null);
+    await deps.execute(deps.tool("sticker_steal"), { asset_id: "a".repeat(32), category: "manual" });
+    expect(deps.classifier.classify).not.toHaveBeenCalled();
+    expect(deps.store.save).toHaveBeenCalledWith(expect.objectContaining({ category: "manual" }));
+    expect(await deps.execute(deps.tool("sticker_steal"), { asset_id: "bad" })).toMatchObject({ error: "invalid_asset_id" });
+    deps.assets.get.mockRejectedValueOnce(new Error("gone"));
+    expect(await deps.execute(deps.tool("sticker_steal"), { asset_id: "a".repeat(32) })).toMatchObject({ error: "asset_not_found" });
+  });
+
+  it("preserves categories and search without incrementing usage", async () => {
+    const deps = createDeps({ enableSteal: false });
+    expect(await deps.execute(deps.tool("sticker_categories"), {})).toMatchObject({ categories: [{ category: "meme", count: 1 }] });
+    expect(await deps.execute(deps.tool("sticker_search"), { category: "meme" })).toMatchObject({ stickers: [{ id: stickerId }] });
+    expect(deps.store.markUsed).not.toHaveBeenCalled();
+  });
+
+  it("retains fuzzy/exact tag selection and random score range for preview", async () => {
+    const deps = createDeps({ tagMode: true });
+    const a = sticker({ tags: ["可爱猫猫", "工作"] });
+    const b = sticker({ id: "b".repeat(64), tags: ["猫"] });
+    deps.store.listByScopeKey.mockResolvedValue([a, b]);
+    const store = deps.store as unknown as StickerStore;
+    expect(await pickBestTaggedSticker(store, "global", ["猫", "可爱"], undefined, true, 0)).toEqual(a);
+    expect(await pickBestTaggedSticker(store, "global", ["猫"], undefined, false, 0)).toEqual(b);
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.99);
     try {
-      await execute(sendTool, { tags: ["猫", "可爱"] });
+      expect(await pickBestTaggedSticker(store, "global", ["猫", "可爱"], undefined, true, 1)).toEqual(b);
     } finally {
       random.mockRestore();
     }
-
-    expect(deps.store.markUsed).toHaveBeenCalledWith("global", "b".repeat(64));
   });
 
-  it("sticker_send with one fuzzy tag can match multiple stickers", async () => {
-    const deps = createDeps({ tagMode: true });
-    const first = projection({ id: "a".repeat(64), tags: ["猫猫"] });
-    const second = projection({ id: "b".repeat(64), tags: ["猫"] });
-    deps.store.listByScopeKey.mockResolvedValue([first, second]);
-    const [, sendTool] = deps.tools;
-
-    await execute(sendTool, { tags: ["猫"] });
-
-    expect(deps.sender.send).toHaveBeenCalledOnce();
-    expect(deps.store.markUsed).toHaveBeenCalledWith("global", expect.stringMatching(/^(a{64}|b{64})$/));
+  it.each([
+    '<text><sticker id="example"/></text>',
+    '<text><img src="artifact://sticker/id"/></text>',
+    '<inner_thought><sticker id="example"/></inner_thought>visible text',
+  ])("allows literal or stripped sticker examples %s", (message) => {
+    expect(stickerSendMessageBlockReason({ messages: [message] })).toBeUndefined();
   });
 
-  it("sticker_send keeps exact tag matching when fuzzy matching is disabled", async () => {
-    const deps = createDeps({ tagMode: true, fuzzyTagMatch: false });
-    deps.store.listByScopeKey.mockResolvedValue([projection({ id: "a".repeat(64), tags: ["猫猫"] }), projection({ id: "b".repeat(64), tags: ["猫"] })]);
-    const [, sendTool] = deps.tools;
-
-    const result = await execute(sendTool, { tags: ["猫"] });
-
-    expect(deps.store.markUsed).toHaveBeenCalledWith("global", "b".repeat(64));
-    expect(result).toMatchObject({ ok: true, tags: ["猫"] });
-  });
-
-  it("sticker_send sends the selected sticker and records usage", async () => {
-    const deps = createDeps();
-    deps.store.get.mockResolvedValue(projection());
-    const sendTool = toolByName(deps.tools, "sticker_send");
-    const result = await execute(sendTool, { sticker_id: "a".repeat(64) });
-    expect(deps.sender.send).toHaveBeenCalledWith({ bytes: pngBytes, mediaType: "image/png" });
-    expect(deps.store.markUsed).toHaveBeenCalledWith("global", "a".repeat(64));
-    expect(result).toMatchObject({ ok: true, category: "meme" });
-  });
-
-  it("allows only one successful sticker send per turn", async () => {
-    const deps = createDeps();
-    const sendTool = toolByName(deps.tools, "sticker_send");
-
-    const first = await execute(sendTool, {}, "turn-1");
-    const second = await execute(sendTool, {}, "turn-1");
-
-    expect(first).toMatchObject({ ok: true });
-    expect(second).toEqual({ ok: false, error: "sticker_send_limit_reached" });
-    expect(deps.sender.send).toHaveBeenCalledOnce();
-    expect(deps.store.markUsed).toHaveBeenCalledOnce();
-  });
-
-  it("allows sticker sends in different turns", async () => {
-    const deps = createDeps();
-    const sendTool = toolByName(deps.tools, "sticker_send");
-
-    await execute(sendTool, {}, "turn-1");
-    const second = await execute(sendTool, {}, "turn-2");
-
-    expect(second).toMatchObject({ ok: true });
-    expect(deps.sender.send).toHaveBeenCalledTimes(2);
-    expect(deps.store.markUsed).toHaveBeenCalledTimes(2);
-  });
-
-  it("does not claim a turn when sticker sending fails", async () => {
-    const deps = createDeps();
-    deps.sender.send.mockRejectedValueOnce(new Error("send_failed"));
-    const sendTool = toolByName(deps.tools, "sticker_send");
-
-    const first = await execute(sendTool, {}, "turn-1");
-    const second = await execute(sendTool, {}, "turn-1");
-
-    expect(first).toEqual({ ok: false, error: "send_failed" });
-    expect(second).toMatchObject({ ok: true });
-    expect(deps.sender.send).toHaveBeenCalledTimes(2);
-    expect(deps.store.markUsed).toHaveBeenCalledOnce();
-  });
-
-  it("claims a turn before usage accounting completes", async () => {
-    const deps = createDeps();
-    deps.store.markUsed.mockRejectedValueOnce(new Error("usage_failed"));
-    const sendTool = toolByName(deps.tools, "sticker_send");
-
-    const first = await execute(sendTool, {}, "turn-1");
-    const second = await execute(sendTool, {}, "turn-1");
-
-    expect(first).toEqual({ ok: false, error: "usage_failed" });
-    expect(second).toEqual({ ok: false, error: "sticker_send_limit_reached" });
-    expect(deps.sender.send).toHaveBeenCalledOnce();
-    expect(deps.store.markUsed).toHaveBeenCalledOnce();
-  });
-
-  it("does not claim a turn when sticker selection fails", async () => {
-    const deps = createDeps();
-    deps.store.random.mockResolvedValueOnce(null);
-    const sendTool = toolByName(deps.tools, "sticker_send");
-
-    const first = await execute(sendTool, {}, "turn-1");
-    const second = await execute(sendTool, {}, "turn-1");
-
-    expect(first).toEqual({ ok: false, error: "sticker_not_found" });
-    expect(second).toMatchObject({ ok: true });
-    expect(deps.sender.send).toHaveBeenCalledOnce();
-  });
-
-  it("sticker_send converts a static PNG to a single-frame GIF", async () => {
-    const deps = createDeps({ sendStaticAsGif: true });
-    deps.store.get.mockResolvedValue(projection({ id: "a".repeat(64), mime: "image/png" }));
-    const png = new PNG({ width: 1, height: 1 });
-    png.data.set([255, 0, 0, 255]);
-    deps.store.readBytes.mockResolvedValue(new Uint8Array(PNG.sync.write(png)));
-    const [, sendTool] = deps.tools;
-
-    await execute(sendTool, { sticker_id: "a".repeat(64) });
-
-    expect(deps.sender.send).toHaveBeenCalledWith({ bytes: expect.any(Uint8Array), mediaType: "image/gif" });
-  });
-
-  it("sticker_categories returns category summaries", async () => {
-    const deps = createDeps();
-    deps.store.listCategories.mockResolvedValue([{ category: "meme", count: 2 }]);
-    const [, , categoriesTool] = deps.tools;
-    const result = await execute(categoriesTool, {});
-    expect(result).toMatchObject({ ok: true, categories: [{ category: "meme", count: 2 }] });
-  });
-
-  it("sticker_tags returns tag summaries in tag mode", async () => {
-    const deps = createDeps({ tagMode: true });
-    deps.store.listTags.mockResolvedValue([{ tag: "猫猫", count: 2 }]);
-    const tagsTool = deps.tools.find((tool) => tool.name === "sticker_tags");
-    const result = await execute(tagsTool!, {});
-    expect(result).toMatchObject({ ok: true, tags: [{ tag: "猫猫", count: 2 }] });
+  it.each([
+    '<img src="artifact://sticker/id"/>',
+    '<file src="artifact://sticker/id"/>',
+    '<message><img src="artifact&#58;//sticker/id"/></message>',
+    '<sticker id="a"/>',
+  ])("blocks the legacy delivery bypass %s", (message) => {
+    expect(stickerSendMessageBlockReason({ messages: [message] })).toBe("sticker_send_required");
+    expect(stickerSendMessageBlockReason({ messages: [message], mode: "raw" })).toBeUndefined();
   });
 });

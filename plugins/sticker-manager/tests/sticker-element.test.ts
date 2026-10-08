@@ -71,6 +71,23 @@ function assistantEntry(content: string): AgentEntry {
 }
 
 describe("sticker output element", () => {
+  it("preserves mixed assistant text/tool calls in both projection directions", async () => {
+    const store = createStore();
+    const artifacts = createArtifacts();
+    const entry = createMessageEntry(
+      createAssistantMessage([
+        { type: "text", text: '<sticker tags="猫"/><img src="artifact://sticker/00000000-0000-7000-8000-000000000000"/>' },
+        { type: "tool-call", toolCallId: "send-1", toolName: "send_message", input: { messages: ["hello"] } },
+      ]),
+    );
+    const options = { store, artifacts, scopeKey: "global", config: config() };
+    expect((await projectStickerElements([entry], options))[0]).toBe(entry);
+    expect((await projectStickerHistoryElements([entry], options))[0]).toBe(entry);
+    expect(store.readBytes).not.toHaveBeenCalled();
+    expect(store.markUsed).not.toHaveBeenCalled();
+    expect(artifacts.open).not.toHaveBeenCalled();
+  });
+
   it("resolves fuzzy tags to a sticker and replaces the element with an image", async () => {
     const store = createStore();
     const [projected] = await projectStickerElements([assistantEntry('<sticker tags="猫"/>')], {
@@ -82,7 +99,7 @@ describe("sticker output element", () => {
     const message = projected.data as { content: string };
 
     expect(message.content).toContain('<img src="artifact://sticker/');
-    expect(store.markUsed).toHaveBeenCalledWith("global", "a".repeat(64));
+    expect(store.markUsed).not.toHaveBeenCalled();
   });
 
   it("resolves an exact sticker id", async () => {

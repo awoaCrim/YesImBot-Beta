@@ -2,6 +2,7 @@ import type { AgentPlugin, EphemeralImageProjectionStore } from "@yesimbot/agent
 import type { Awaitable, Bot, Context, Logger, Session } from "koishi";
 
 import type { ChannelContext } from "../channels/index.js";
+import type { ImagePreviewCapability } from "./image-preview.js";
 import { defaultWillEngine, type WillEngine, type WillPlugin } from "./will.js";
 
 type Disposer = () => void;
@@ -18,6 +19,12 @@ export interface MainAgentRoleProvider {
 
 export interface ChannelPluginSetupContext {
   readonly imageProjection: EphemeralImageProjectionStore;
+  /**
+   * Core-owned read-before-send seam: reuse of the active image capability without duplicating
+   * provider credentials or the ephemeral byte-retention policy. Absent means the channel has no
+   * working image route, so a plugin must not claim it displayed any content.
+   */
+  readonly imagePreview?: ImagePreviewCapability;
   /** True when an active polisher owns style rendering, so role prompts must not reach the main Agent. */
   readonly polisherActive: boolean;
   /** Core assembles this opted-in provider's role material in its frozen role section. */
@@ -137,3 +144,11 @@ export {
   type PolisherTurnEntry,
   type RolePromptProfileProvider,
 } from "./polisher.js";
+
+export {
+  createImagePreviewCapability,
+  type ImageDescribeRequest,
+  type ImagePreviewCapability,
+  type ImagePreviewFrame,
+  type ImagePreviewRequest,
+} from "./image-preview.js";

@@ -1,5 +1,5 @@
 import { EphemeralImageProjectionStore, jsonSchema, type AgentMessage, type AgentTool } from "@yesimbot/agent-runtime";
-import { generateText, type LanguageModel } from "ai";
+import type { LanguageModel } from "ai";
 import { h, type Bot, type Element } from "koishi";
 
 import type { PacingConfig } from "../config.js";
@@ -9,6 +9,7 @@ import { parseReply } from "../messages/index.js";
 import { detectImageMediaType, prepareOutputSegments, ResourceReadError, type ChannelResources } from "../resources/index.js";
 import { ContextBudgetError } from "../runtimes/context-budget.js";
 import type { ContextWorkspace, ContextBlocksInput, ContextLoadInput } from "../runtimes/context-workspace.js";
+import { describeImageBytes } from "./image-preview.js";
 import { buildPolisherTurnContext, validatePolishedMessages, type PolisherTurnContext } from "./polisher.js";
 
 const READ_MAX_TEXT_CHARS = 30_000;
@@ -399,33 +400,6 @@ export function createContextWorkspaceTools(workspace: ContextWorkspace): AgentT
   ];
 }
 
-async function describeImageBytes(options: {
-  model: LanguageModel;
-  bytes: Uint8Array;
-  mediaType: string;
-  question: string;
-  abortSignal?: AbortSignal;
-}): Promise<string> {
-  const result = await generateText({
-    model: options.model,
-    temperature: 0.2,
-    abortSignal: options.abortSignal,
-    messages: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: `请详细描述这张图片，并回答问题：${options.question}\n区分可见事实与推测；如果无法确认具体身份、作品、地点或事件，请明确说明不确定及原因，不要猜测。\n\n图片内容：`,
-          },
-          { type: "file", data: options.bytes, mediaType: options.mediaType },
-        ],
-      },
-    ],
-  });
-  return result.text;
-}
-
 export type ExpandCompartmentInput = { compartmentId: string; offset?: number; limit?: number };
 
 export type ExpandCompartmentOutput =
@@ -513,10 +487,13 @@ ${factsRequired ? "调用后生成真正展示给用户的消息，可以针对�
 
 ## messages
 要发送的消息列表，每一项作为一条独立消息按顺序发出。
+由你在提交草稿时按语义和聊天节奏决定分条：独立的回应、转折、补充适合放入不同项目；短而完整的回复可以只发一条。不要把所有内容挤进同一条，也不要按字数、句号或空行机械拆分。
+完整代码、命令、引用及其必要上下文不要拆散；除此之外，事实说明也可以按独立语义分条。不要用普通文本中的空行制造消息分段；需要分开时，把每条消息写成 messages 的独立项目。
+同一次调用的多个项目会全部按顺序发送，不需要仅为分条设置 continue=true。润色阶段不会替你新增或合并分段。
 ${
   factsRequired
     ? "只写清楚本轮要表达的事实、判断和交流动作，不自行添加事实或承诺；措辞风格由发送前的润色阶段处理，每条草稿独立改写，条数与顺序保持不变。"
-    : "事实、指令、代码、链接和其他后果重大的内容保持在同一条消息内；精确文本使用 raw 或 <text>，避免元素解析吞掉字符。不要用普通文本中的空行制造消息分段；平台不会把空行渲染成视觉分隔。需要分开时，把每条消息写成 messages 的独立项目。"
+    : "精确文本使用 raw 或 <text>，避免元素解析吞掉字符。"
 }
 
 ## channel
