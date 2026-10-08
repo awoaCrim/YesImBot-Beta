@@ -1,12 +1,14 @@
 import { jsonSchema, type AgentTool } from "@yesimbot/agent-runtime";
-import type { AssetStore, ChannelContext } from "koishi-plugin-yesimbot";
+import type { Element } from "koishi";
+import { parseReply, type AssetStore, type ChannelContext } from "koishi-plugin-yesimbot";
 
 import type { StickerClassifier } from "./classifier.js";
 import { detectImageMediaType, sha256Hex } from "./files.js";
 import { prepareStaticGif } from "./frames.js";
+import type { StickerPreviewGate, StickerSendSlot } from "./preview-evidence.js";
 import type { StickerSender } from "./sender.js";
 import type { StickerStore } from "./store.js";
-import { normalizeCategory, normalizeTags, scopeKeyFor, type StickerConfig, type StickerProjection } from "./types.js";
+import { normalizeCategory, normalizeTags, scopeKeyFor, type StickerConfig } from "./types.js";
 
 type ToolResult = { ok: true; message: string; [key: string]: unknown } | { ok: false; error: string };
 
@@ -17,7 +19,10 @@ export interface StickerToolsOptions {
   assets: AssetStore;
   scope: ChannelContext;
   config: StickerConfig;
-  sentTurnIds: Set<string>;
+  /** One successfully delivered sticker per turn, concurrency safe. */
+  sendSlot: StickerSendSlot;
+  /** Exact-content read evidence produced by `sticker_preview`. */
+  previewGate: StickerPreviewGate;
 }
 
 interface StealStickerInput {
@@ -26,10 +31,8 @@ interface StealStickerInput {
 }
 
 interface SendStickerInput {
-  sticker_id?: string;
-  category?: string;
-  index?: number;
-  tags?: string[];
+  sticker_id: string;
+  continue?: boolean;
 }
 
 interface SearchStickerInput {
@@ -40,7 +43,7 @@ interface SearchStickerInput {
 }
 
 export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
-  const { store, classifier, sender, assets, scope, config, sentTurnIds } = options;
+  const { store, classifier, sender, assets, scope, config, sendSlot, previewGate } = options;
   const scopeKey = scopeKeyFor(scope, config);
 
   const stealTool: AgentTool<StealStickerInput, ToolResult> = {
@@ -106,85 +109,98 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
 
   const sendTool: AgentTool<SendStickerInput, ToolResult> = {
     name: "sticker_send",
-    terminal: true,
+    terminal: (input) => !input.continue,
     description: [
-      "发送一个已收藏的表情包，可作为轻松互动中的回应或文字后的情绪反应；在发送文字前决定是否使用。",
-      "同一轮最多实际发送一张；本轮成功发送后再次调用会返回 sticker_send_limit_reached。",
-      "不传 sticker_id、category、index、tags 时会随机选择一张；不合适时可以省略表情包，不要为了发送而随机选无关内容。",
-      "sticker_id 优先；category 必须与已有分类名精确一致，单传 category 会从该分类随机选一张，已知分类时无需先搜索；也可按 index 指定。",
-      "sticker_categories 和当前库概览提供分类，sticker_search 用于查找具体 id；查询结果不代表你已看过图片。",
-      "如果本轮还要发送文字，必须先让 send_message 使用 continue=true，再调用本工具；本工具调用后会结束本轮。",
+      "发送一张已经用 sticker_preview 查看过的表情包；sticker_id 必须是这一步返回的同一个 id。",
+      "同一轮最多实际发送一张；本轮成功或结果不确定后再次调用会返回 sticker_send_limit_reached。",
+      "表情包可以单独作为回应，也可以放在文字之前或之后；顺序由你决定，没有固定搭配。",
+      "默认发送后结束本轮；continue=true 时继续下一步，用于在表情包之后还要发送文字。",
+      "不合适的场合可以直接省略表情包、只用文字回应，不要为了发送而选无关内容。",
       ...(config.sendStaticAsGif ? ["静态图片会自动转成单帧 GIF 后发送。"] : []),
-      ...(config.tagMode ? [`也可仅传 tags 选择多个标签，并从匹配分范围内的表情包中随机发送。${config.fuzzyTagMatch ? "tag 默认支持模糊匹配。" : ""}`] : []),
     ].join("\n"),
     inputSchema: jsonSchema<SendStickerInput>({
       type: "object",
       properties: {
-        sticker_id: { type: "string", description: "sticker_search 返回的 id" },
-        category: { type: "string", description: "已有分类的完整名称，精确匹配；单传时从该分类随机选择" },
-        index: { type: "integer", minimum: 1, description: "分类内 1-based 序号" },
-        ...(config.tagMode
-          ? {
-              tags: {
-                type: "array",
-                items: { type: "string" },
-                maxItems: 5,
-                description: config.fuzzyTagMatch
-                  ? "实验性标签列表，支持模糊匹配；从匹配分范围内的表情包中随机发送"
-                  : "实验性标签列表，从匹配分范围内的表情包中随机发送",
-              },
-            }
-          : {}),
+        sticker_id: { type: "string", description: "sticker_preview 返回的 id，必须原样传入" },
+        continue: { type: "boolean", description: "默认 false，发送后结束本轮；之后还要发送文字或其他内容时设为 true" },
       },
+      required: ["sticker_id"],
       additionalProperties: false,
     }),
-    execute: async ({ sticker_id, category, index, tags }, execution) => {
-      if (sentTurnIds.has(execution.turnId)) return { ok: false, error: "sticker_send_limit_reached" };
+    execute: async ({ sticker_id, continue: shouldContinue }, execution) => {
+      // Read gate: require exact current-turn preview evidence for this same sticker. The runtime
+      // only appends a step's tool results after that step finishes, so `execution.messages` can
+      // never contain this step's own preview: a same-step preview cannot unlock its own send.
+      const evidence = previewGate.resolve(execution.turnId, execution.messages);
+      if (!sticker_id) return { ok: false, error: "sticker_preview_required" };
+      if (!evidence) return { ok: false, error: "sticker_preview_required" };
+      if (sticker_id !== evidence.stickerId) return { ok: false, error: "sticker_preview_mismatch" };
+      const sticker = await store.get(scopeKey, sticker_id).catch(() => null);
+      if (!sticker) return { ok: false, error: "sticker_not_found" };
+      if (execution.abortSignal?.aborted || previewGate.resolve(execution.turnId, execution.messages) !== evidence) {
+        return { ok: false, error: "sticker_preview_required" };
+      }
 
+      // Claim synchronously before any await so concurrent calls cannot both reach the platform.
+      const claim = sendSlot.tryClaim(execution.turnId, execution.abortSignal);
+      if (claim !== "claimed") return { ok: false, error: "sticker_send_limit_reached" };
+
+      let bytes: Uint8Array;
       try {
-        let sticker: StickerProjection;
-        if (sticker_id) {
-          const found = await store.get(scopeKey, sticker_id);
-          if (!found) return { ok: false, error: "sticker_not_found" };
-          sticker = found;
-        } else if (index !== undefined) {
-          const found = await store.search(scopeKey, { category, limit: 100 });
-          const selected = found[index - 1];
-          if (!selected) return { ok: false, error: "sticker_index_out_of_range" };
-          sticker = selected;
-        } else if (tags && tags.length > 0) {
-          const tagged = await pickBestTaggedSticker(store, scopeKey, tags, category, config.fuzzyTagMatch, config.tagRandomRange);
-          if (!tagged) return { ok: false, error: "sticker_not_found" };
-          sticker = tagged;
-        } else {
-          const found = await store.random(scopeKey, category);
-          if (!found) return { ok: false, error: "sticker_not_found" };
-          sticker = found;
-        }
-
-        const bytes = await store.readBytes(sticker);
-        const prepared = prepareStaticGif(bytes, sticker.mime, config.sendStaticAsGif);
-        await sender.send({ bytes: prepared.bytes, mediaType: prepared.mediaType });
-        sentTurnIds.add(execution.turnId);
-        await store.markUsed(scopeKey, sticker.id);
-        return {
-          ok: true,
-          id: sticker.id,
-          category: sticker.category,
-          tags: sticker.tags,
-          message: tags && tags.length > 0 ? `已按标签 ${tags.join("、")} 发送 ${sticker.category} 分类的表情包` : `已发送 ${sticker.category} 分类的表情包`,
-        };
+        bytes = await store.readBytes(sticker);
       } catch (cause) {
+        sendSlot.release(execution.turnId);
         return { ok: false, error: cause instanceof Error ? cause.message : String(cause) };
       }
+      // Bytes no longer match what was previewed: the model never saw this content, so send nothing.
+      if (sha256Hex(bytes) !== evidence.contentHash) {
+        sendSlot.release(execution.turnId);
+        return { ok: false, error: "sticker_preview_stale" };
+      }
+
+      if (execution.abortSignal?.aborted || previewGate.resolve(execution.turnId, execution.messages) !== evidence) {
+        sendSlot.release(execution.turnId);
+        return { ok: false, error: "resource_read_aborted" };
+      }
+      let prepared;
+      try {
+        prepared = prepareStaticGif(bytes, evidence.mediaType, config.sendStaticAsGif);
+      } catch {
+        sendSlot.release(execution.turnId);
+        return { ok: false, error: "sticker_prepare_failed" };
+      }
+      try {
+        await sender.send({ bytes: prepared.bytes, mediaType: prepared.mediaType });
+      } catch {
+        // The platform may already have accepted the sticker; never invite an automatic duplicate.
+        sendSlot.markUncertain(execution.turnId);
+        return { ok: false, error: "sticker_delivery_uncertain" };
+      }
+      sendSlot.confirm(execution.turnId);
+      let usageWarning: string | undefined;
+      try {
+        await store.markUsed(scopeKey, sticker.id);
+      } catch {
+        // Delivery succeeded even if accounting failed. Never tell the model to resend it.
+        usageWarning = "sticker_usage_update_failed";
+      }
+      return {
+        ok: true,
+        id: sticker.id,
+        category: sticker.category,
+        tags: sticker.tags,
+        continued: shouldContinue === true,
+        ...(usageWarning ? { warning: usageWarning } : {}),
+        message: `已发送 ${sticker.category} 分类的表情包`,
+      };
     },
   };
 
   const categoriesTool: AgentTool<Record<string, never>, ToolResult> = {
     name: "sticker_categories",
     description: config.enableSteal
-      ? "列出当前可见的表情包分类和每类数量，用于选择 sticker_steal 或 sticker_send 的分类。"
-      : "列出当前可见的表情包分类和每类数量，用于选择 sticker_send 的分类。",
+      ? "列出当前可见的表情包分类和每类数量，用于选择 sticker_steal 或 sticker_preview 的分类。"
+      : "列出当前可见的表情包分类和每类数量，用于选择 sticker_preview 的分类。",
     inputSchema: jsonSchema<Record<string, never>>({ type: "object", additionalProperties: false }),
     execute: async () => {
       const categories = await store.listCategories(scopeKey);
@@ -195,7 +211,7 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
   const tagsTool = config.tagMode
     ? ({
         name: "sticker_tags",
-        description: "实验性：列出当前可见表情包的标签和数量，用于 sticker_send 按标签发送。",
+        description: "实验性：列出当前可见表情包的标签和数量，用于 sticker_preview 按标签选定目标。",
         inputSchema: jsonSchema<Record<string, never>>({ type: "object", additionalProperties: false }),
         execute: async () => {
           const tags = await store.listTags(scopeKey);
@@ -207,10 +223,9 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
   const searchTool: AgentTool<SearchStickerInput, ToolResult> = {
     name: "sticker_search",
     description: [
-      "搜索当前可见的表情包，返回紧凑 id 列表，供 sticker_send 使用。",
+      "搜索当前可见的表情包，返回紧凑 id 候选列表。",
       "category 按完整分类名精确匹配；keyword 只是分类名、id 或标签的单个子串，不支持 OR/AND 运算，也不按图片画面或人物进行语义搜索。",
-      "已知合适分类时，可直接用 sticker_send 按分类发送，无需先搜索。",
-      "sticker_search 只用于查询；确定目标后必须调用 sticker_send。",
+      "搜索结果只是候选元数据，不代表你已经看过画面；确定目标后先用 sticker_preview 查看，再用返回的同一 id 发送。",
       "绝不能把返回的 id 拼成 artifact:// 等资源 URI。",
       ...(config.tagMode ? ["实验性 tag 模式开启时，可按 tags 过滤。"] : []),
     ].join("\n"),
@@ -236,7 +251,7 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
           size: sticker.size,
           usageCount: sticker.usageCount,
         })),
-        message: stickers.length ? "已返回搜索结果" : "没有匹配的表情包",
+        message: stickers.length ? "已返回搜索结果；这些只是元数据，发送前需先 sticker_preview 查看画面" : "没有匹配的表情包",
       };
     },
   };
@@ -244,34 +259,24 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
   return [...(config.enableSteal ? [stealTool] : []), sendTool, categoriesTool, searchTool, ...(tagsTool ? [tagsTool] : [])];
 }
 
-export async function pickBestTaggedSticker(
-  store: StickerStore,
-  scopeKey: string,
-  tags: readonly string[],
-  category?: string,
-  fuzzyTagMatch = true,
-  randomRange = 0,
-): Promise<StickerProjection | null> {
-  const normalized = normalizeTags(tags);
-  if (normalized.length === 0) return null;
-  const rows = await store.listByScopeKey(scopeKey);
-  const scoped = category ? rows.filter((sticker) => sticker.category === category) : rows;
-  const matches = scoped.filter((sticker) => normalized.some((tag) => stickerMatches(sticker.tags, tag, fuzzyTagMatch)));
-  if (matches.length === 0) return null;
-  const score = (sticker: StickerProjection): number =>
-    normalized.reduce((count, tag) => count + (stickerMatches(sticker.tags, tag, fuzzyTagMatch) ? 1 : 0), 0);
-  const best = Math.max(...matches.map(score));
-  const threshold = Math.min(best, Math.max(0, randomRange));
-  const candidates = matches.filter((sticker) => score(sticker) >= best - threshold);
-  return candidates[Math.floor(Math.random() * candidates.length)] ?? null;
+/**
+ * Delivery-boundary guard for `send_message`.
+ *
+ * Legacy sticker projection can leave `artifact://sticker/<id>.<ext>` URIs in assistant history, and
+ * `prepareElement` turns any resolvable resource URI into real platform bytes. Passing one of those
+ * URIs to `send_message` would therefore deliver a sticker without the preview gate or the per-turn
+ * quota. This returns a block reason for exactly that case and never inspects unrelated payloads.
+ */
+export function stickerSendMessageBlockReason(input: unknown): string | undefined {
+  const value = input as { messages?: unknown; mode?: unknown } | null;
+  if (value?.mode === "raw" || !Array.isArray(value?.messages)) return undefined;
+  const restricted = (element: Element): boolean =>
+    element.type === "sticker" ||
+    ((element.type === "img" || element.type === "file") && /^artifact:\/\/sticker\//i.test(String(element.attrs.src ?? ""))) ||
+    element.children.some(restricted);
+  return value.messages.some((message) => typeof message === "string" && parseReply(message).some((segment) => segment.some(restricted)))
+    ? "sticker_send_required"
+    : undefined;
 }
 
-function stickerMatches(tags: readonly string[], requested: string, fuzzyTagMatch: boolean): boolean {
-  return tags.some((tag) => (fuzzyTagMatch ? fuzzyTagEquals(requested, tag) : tag === requested));
-}
-
-function fuzzyTagEquals(requested: string, stored: string): boolean {
-  const left = requested.toLowerCase();
-  const right = stored.toLowerCase();
-  return left.length > 0 && (right.includes(left) || left.includes(right));
-}
+export { pickBestTaggedSticker } from "./tag-selection.js";

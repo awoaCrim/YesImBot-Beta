@@ -1,8 +1,9 @@
 /* eslint-disable vitest/require-mock-type-parameters */
-import { createAgent, createUserMessage, jsonSchema, type AgentPlugin } from "@yesimbot/agent-runtime";
+import { createAgent, createUserMessage, createToolMessage, EphemeralImageProjectionStore, jsonSchema, type AgentPlugin } from "@yesimbot/agent-runtime";
 import type { ModelMessage } from "ai";
 import { convertArrayToReadableStream, MockLanguageModelV3 } from "ai/test";
-import type { ChannelContext } from "koishi-plugin-yesimbot";
+import type { ChannelContext, ChannelPluginSetupContext } from "koishi-plugin-yesimbot";
+import { PNG } from "pngjs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("koishi", () => {
@@ -117,10 +118,10 @@ describe("StickerManagerPlugin", () => {
       commands,
       agentDispose,
       logger,
-      async start(bot: unknown = { selfId: "bot" }, channelScope: ChannelContext = scope): Promise<AgentPlugin | null> {
+      async start(bot: unknown = { selfId: "bot" }, channelScope: ChannelContext = scope, runtime?: ChannelPluginSetupContext): Promise<AgentPlugin | null> {
         await ready[0]?.();
         if (!registeredPlugin) throw new Error("sticker plugin was not registered");
-        return registeredPlugin.setup(channelScope, bot as never);
+        return registeredPlugin.setup(channelScope, bot as never, runtime);
       },
       async stop(): Promise<void> {
         await dispose[0]?.();
@@ -163,7 +164,7 @@ describe("StickerManagerPlugin", () => {
     const harness = createHarness({ enableSteal: false, tagMode: true });
     const agentPlugin = await harness.start();
 
-    await expectToolNames(agentPlugin, ["sticker_send", "sticker_categories", "sticker_search", "sticker_tags"]);
+    await expectToolNames(agentPlugin, ["sticker_preview", "sticker_send", "sticker_categories", "sticker_search", "sticker_tags"]);
     const prompt = await pluginPrompt(agentPlugin);
     expect(prompt).not.toContain("sticker_steal");
     expect(prompt).not.toContain("收藏当前消息");
@@ -186,20 +187,21 @@ describe("StickerManagerPlugin", () => {
     expect(prompt).not.toContain("千早爱音");
     expect(prompt).toContain("同一轮最多实际发送一张");
     expect(prompt).toContain("开心、得意、吐槽、害羞");
-    expect(prompt).toContain("不必等对方要求");
-    expect(prompt).toContain("发送文字前先决定");
-    expect(prompt).toContain("不合适时可省略");
-    expect(prompt).toContain("不要为完成规则强行发送");
+    expect(prompt).toContain("不要求每轮都发表情包");
+    expect(prompt).toContain("先表情后文字");
+    expect(prompt).toContain("只发文字");
+    expect(prompt).toContain("发送前必须先用 sticker_preview");
     expect(prompt.length).toBeLessThan(700);
-    expect(prompt).toContain("先调用 send_message 并设置 continue=true，再调用 terminal 的 sticker_send");
+    expect(prompt).not.toContain("再调用 terminal 的 sticker_send");
+    expect(prompt).toContain("continue 设为 true");
     expect(prompt).not.toContain("也可以直接输出 <sticker");
     expect(prompt).not.toContain("需要发图时可直接输出");
     expect(prompt).not.toContain("不需要调用 sticker_send");
 
     const tools = (await agentPlugin?.tools?.({} as never)) ?? [];
     const sendTool = tools.find((tool) => tool.name === "sticker_send");
-    expect(sendTool?.description).toContain("不传 sticker_id、category、index、tags 时会随机选择一张");
-    expect(sendTool?.description).toContain("先让 send_message 使用 continue=true，再调用本工具");
+    expect(sendTool?.description).toContain("已经用 sticker_preview 查看过");
+    expect(sendTool?.description).toContain("continue=true");
   });
 
   function preparation(turnId: string, stepNumber = 0) {
@@ -338,8 +340,7 @@ describe("StickerManagerPlugin", () => {
     const text = catalogFrom((await plugin?.prepareStep?.([], preparation("turn-1"))) ?? []);
 
     expect(text).toContain("回合开始时可见库为空");
-    expect(text).toContain("未获得新库存结果前");
-    expect(text).toContain("不要随机调用 sticker_send");
+    expect(text).toContain("可以正常发送文字");
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
@@ -409,7 +410,7 @@ describe("StickerManagerPlugin", () => {
     const harness = createHarness({ enableSteal: true });
     const agentPlugin = await harness.start();
 
-    await expectToolNames(agentPlugin, ["sticker_steal", "sticker_send", "sticker_categories", "sticker_search"]);
+    await expectToolNames(agentPlugin, ["sticker_preview", "sticker_steal", "sticker_send", "sticker_categories", "sticker_search"]);
     const prompt = await pluginPrompt(agentPlugin);
     expect(prompt).toContain("sticker_steal");
     expect(prompt).toContain("收藏当前消息");
@@ -418,7 +419,12 @@ describe("StickerManagerPlugin", () => {
   it("clears the per-turn sticker claim when the Agent turn finishes", async () => {
     const harness = createHarness({ sendStaticAsGif: false });
     const sendMessage = vi.fn(async () => ["message-1"]);
-    const agentPlugin = await harness.start({ selfId: "bot", sendMessage });
+    const projection = new EphemeralImageProjectionStore();
+    const agentPlugin = await harness.start({ selfId: "bot", sendMessage }, scope, {
+      imageProjection: projection,
+      polisherActive: false,
+      imagePreview: { mode: "vision", preview: () => ({ mode: "unavailable", error: "image_input_unavailable" }), describe: async () => "红色画面" },
+    });
     if (!registeredPlugin || !agentPlugin) throw new Error("sticker plugin was not initialized");
 
     const sticker: StickerProjection = {
@@ -433,18 +439,32 @@ describe("StickerManagerPlugin", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
     };
     vi.spyOn(registeredPlugin.store, "random").mockResolvedValue(sticker);
-    vi.spyOn(registeredPlugin.store, "readBytes").mockResolvedValue(new Uint8Array([1, 2, 3]));
+    vi.spyOn(registeredPlugin.store, "get").mockResolvedValue(sticker);
+    const png = new PNG({ width: 1, height: 1 });
+    png.data.set([255, 0, 0, 255]);
+    vi.spyOn(registeredPlugin.store, "readBytes").mockResolvedValue(new Uint8Array(PNG.sync.write(png)));
     vi.spyOn(registeredPlugin.store, "markUsed").mockResolvedValue(sticker);
 
     const tool = () => agentPlugin.tools?.({} as never);
-    const firstTool = (await tool())?.find((candidate) => candidate.name === "sticker_send");
-    const first = await firstTool?.execute?.({}, { turnId: "turn-1" } as never);
-    const blocked = await firstTool?.execute?.({}, { turnId: "turn-1" } as never);
+    const firstTools = await tool();
+    const firstTool = firstTools?.find((candidate) => candidate.name === "sticker_send");
+    const preview = firstTools?.find((candidate) => candidate.name === "sticker_preview");
+    if (!preview) throw new Error("no preview");
+    const view = async (turnId: string) => {
+      const output = await preview.execute({}, { turnId, toolCallId: "view", messages: [] } as never);
+      const projected = await preview.toModelOutput!({ toolCallId: "view", input: {}, output });
+      return { turnId, messages: [createToolMessage([{ type: "tool-result", toolName: "sticker_preview", toolCallId: "view", output: projected }])] } as never;
+    };
+    const context = await view("turn-1");
+    const first = await firstTool?.execute?.({ sticker_id: sticker.id }, context);
+    const blocked = await firstTool?.execute?.({ sticker_id: sticker.id }, context);
 
     await agentPlugin.onTurnFinish?.({ turnId: "turn-1", status: "done", messages: [] }, { turnId: "turn-1" } as never);
 
     const nextTool = (await tool())?.find((candidate) => candidate.name === "sticker_send");
-    const afterFinish = await nextTool?.execute?.({}, { turnId: "turn-1" } as never);
+    expect(await nextTool?.execute?.({ sticker_id: sticker.id }, context)).toMatchObject({ error: "sticker_preview_required" });
+    const afterFinish = await nextTool?.execute?.({ sticker_id: sticker.id }, await view("turn-2"));
+    projection.clearAll();
 
     expect(first).toMatchObject({ ok: true });
     expect(blocked).toEqual({ ok: false, error: "sticker_send_limit_reached" });

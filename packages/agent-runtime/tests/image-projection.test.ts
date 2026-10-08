@@ -14,6 +14,50 @@ afterEach(() => {
 });
 
 describe("EphemeralImageProjectionStore", () => {
+  it("keeps multiple frames under one call with backward-compatible first-frame access and shared TTL", async () => {
+    vi.useFakeTimers();
+    const store = new EphemeralImageProjectionStore({ ttlMs: 50 });
+    const frames = [
+      { bytes: FIRST, mediaType: "image/png" },
+      { bytes: SECOND, mediaType: "image/jpeg" },
+    ];
+    expect(store.stageFrames({ toolCallId: "frames", turnId: "turn", frames })).toBe(true);
+    expect(store.get("frames")).toEqual(frames[0]);
+    await vi.advanceTimersByTimeAsync(40);
+    expect(store.getFrames("frames")).toEqual(frames);
+    await vi.advanceTimersByTimeAsync(40);
+    expect(store.has("frames")).toBe(true);
+    await vi.advanceTimersByTimeAsync(11);
+    expect(store.getFrames("frames")).toEqual([]);
+  });
+
+  it("evicts and clears complete frame sets at capacity, abort and turn boundaries", () => {
+    const store = new EphemeralImageProjectionStore({ capacity: 1 });
+    const frames = [
+      { bytes: FIRST, mediaType: "image/png" },
+      { bytes: SECOND, mediaType: "image/png" },
+    ];
+    const controller = new AbortController();
+    store.stageFrames({ toolCallId: "a", turnId: "one", frames });
+    store.stageFrames({ toolCallId: "b", turnId: "two", frames, signal: controller.signal });
+    expect(store.getFrames("a")).toEqual([]);
+    store.clearTurn("one");
+    expect(store.getFrames("b")).toHaveLength(2);
+    controller.abort();
+    expect(store.getFrames("b")).toEqual([]);
+    expect(store.stageFrames({ toolCallId: "b", turnId: "two", frames, signal: controller.signal })).toBe(false);
+    store.stageFrames({ toolCallId: "c", turnId: "two", frames });
+    store.clearTurn("two");
+    expect(store.getFrames("c")).toEqual([]);
+  });
+
+  it("removes a prior set when replacement has no usable image bytes", () => {
+    const store = new EphemeralImageProjectionStore();
+    stage(store, "call", FIRST);
+    expect(store.stageFrames({ toolCallId: "call", turnId: "turn", frames: [{ bytes: new Uint8Array(), mediaType: "image/png" }] })).toBe(false);
+    expect(store.has("call")).toBe(false);
+  });
+
   it("keeps repeated current-turn projections alive only within the sliding TTL", async () => {
     vi.useFakeTimers();
     const store = new EphemeralImageProjectionStore({ ttlMs: 50, capacity: 2 });

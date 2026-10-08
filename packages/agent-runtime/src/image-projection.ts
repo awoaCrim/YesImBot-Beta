@@ -12,12 +12,24 @@ export interface EphemeralImageProjectionStage extends EphemeralImageProjection 
   readonly signal?: AbortSignal;
 }
 
+/**
+ * Multi-frame variant for tools whose evidence is a bounded sample rather than one image, for
+ * example a GIF preview. Frames share one call id, one TTL and one cleanup boundary.
+ */
+export interface EphemeralImageFramesStage {
+  readonly toolCallId: string;
+  readonly turnId: string;
+  readonly frames: readonly EphemeralImageProjection[];
+  readonly signal?: AbortSignal;
+}
+
 export interface EphemeralImageProjectionStoreOptions {
   readonly ttlMs?: number;
   readonly capacity?: number;
 }
 
-interface PendingImageProjection extends EphemeralImageProjection {
+interface PendingImageProjection {
+  readonly frames: readonly EphemeralImageProjection[];
   readonly turnId: string;
   readonly signal?: AbortSignal;
   readonly onAbort?: () => void;
@@ -39,8 +51,20 @@ export class EphemeralImageProjectionStore {
   }
 
   public stage(input: EphemeralImageProjectionStage): boolean {
+    return this.stageFrames({
+      toolCallId: input.toolCallId,
+      turnId: input.turnId,
+      frames: [{ bytes: input.bytes, mediaType: input.mediaType }],
+      signal: input.signal,
+    });
+  }
+
+  /** Stages a bounded frame set under one call id; an aborted signal releases any previous set. */
+  public stageFrames(input: EphemeralImageFramesStage): boolean {
     this.clear(input.toolCallId);
     if (input.signal?.aborted) return false;
+    const frames = input.frames.filter((frame) => frame.bytes instanceof Uint8Array && frame.bytes.byteLength > 0);
+    if (frames.length === 0) return false;
 
     while (this.pending.size >= this.capacity) {
       const oldest = this.pending.keys().next().value as string | undefined;
@@ -51,8 +75,7 @@ export class EphemeralImageProjectionStore {
     const onAbort = () => this.clear(input.toolCallId);
     const timeout = this.createTimeout(input.toolCallId);
     this.pending.set(input.toolCallId, {
-      bytes: input.bytes,
-      mediaType: input.mediaType,
+      frames: frames.map((frame) => ({ bytes: frame.bytes, mediaType: frame.mediaType })),
       turnId: input.turnId,
       signal: input.signal,
       onAbort,
@@ -63,11 +86,21 @@ export class EphemeralImageProjectionStore {
   }
 
   public get(toolCallId: string): EphemeralImageProjection | undefined {
+    return this.getFrames(toolCallId)[0];
+  }
+
+  /** Returns every staged frame for the call id, refreshing only the shared sliding TTL. */
+  public getFrames(toolCallId: string): readonly EphemeralImageProjection[] {
     const current = this.pending.get(toolCallId);
-    if (!current) return undefined;
+    if (!current) return [];
     clearTimeout(current.timeout);
     current.timeout = this.createTimeout(toolCallId);
-    return { bytes: current.bytes, mediaType: current.mediaType };
+    return current.frames;
+  }
+
+  /** True while the call id still owns a live projection; used to reject evidence after abort. */
+  public has(toolCallId: string): boolean {
+    return this.pending.has(toolCallId);
   }
 
   public clear(toolCallId: string): void {

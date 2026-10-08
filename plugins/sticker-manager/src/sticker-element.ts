@@ -26,6 +26,10 @@ export async function projectStickerElements(entries: readonly AgentEntry[], opt
       continue;
     }
     const content = assistantText(entry.data.content);
+    if (Array.isArray(entry.data.content) && entry.data.content.some((part) => part.type !== "text")) {
+      result.push(entry);
+      continue;
+    }
     if (!content || !content.includes("sticker")) {
       result.push(entry);
       continue;
@@ -46,6 +50,10 @@ export async function projectStickerHistoryElements(entries: readonly AgentEntry
       continue;
     }
     const content = assistantText(entry.data.content);
+    if (Array.isArray(entry.data.content) && entry.data.content.some((part) => part.type !== "text")) {
+      result.push(entry);
+      continue;
+    }
     if (!content || !content.includes("artifact://sticker/")) {
       result.push(entry);
       continue;
@@ -126,7 +134,6 @@ async function replaceElement(element: Element, options: StickerElementOptions):
         .forTool("sticker")
         .put(prepared.bytes, { mediaType: prepared.mediaType, filename: `${sticker.id}.${extensionOf(prepared.mediaType)}` });
       options.artifactIds?.set(uri, sticker.id);
-      await options.store.markUsed(options.scopeKey, sticker.id);
       return h("img", { src: uri });
     } catch {
       return undefined;

@@ -2135,6 +2135,57 @@ describe("Runtimes identity", () => {
     }
   });
 
+  it.each(["native", "vision", "unavailable"] as const)("shares the %s image preview policy and projection with channel plugins", async (mode) => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-preview-policy-"));
+    try {
+      const ctx = new Context();
+      const channels = new Channels(ctx, { basePath: root });
+      const agents = new Agents(ctx);
+      const setup = vi.fn(async () => null);
+      agents.use({ setup });
+      const model = {
+        resolveChatModel: vi.fn(() => ({
+          model: {} as never,
+          entry: { modalities: { input: ["image"] } },
+          capabilities: { imageToolResult: mode === "native" ? "native" : "unsupported" },
+        })),
+      };
+      const runtimes = new Runtimes(
+        ctx,
+        channels,
+        model as never,
+        {
+          ...config,
+          basePath: root,
+          imageInput: true,
+          visionModel: mode === "vision" ? "vision:model" : "",
+        },
+        agents,
+      );
+      const scope = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as const;
+      await runtimes.get(await channels.resolve(scope), { platform: "test", selfId: "bot" } as never);
+      const runtime = (setup.mock.calls[0] as unknown as [unknown, unknown, import("../src/agents/index.js").ChannelPluginSetupContext])[2];
+      expect(runtime.imagePreview?.mode).toBe(mode);
+      const outcome = runtime.imagePreview!.preview({
+        toolCallId: "preview",
+        turnId: "turn",
+        frames: [{ bytes: PNG_BYTES, mediaType: "image/png", label: "image" }],
+      });
+      expect(outcome.mode).toBe(mode === "native" ? "native" : "unavailable");
+      expect(runtime.imageProjection.getFrames("preview")).toHaveLength(mode === "native" ? 1 : 0);
+      // createAgent is mocked in this suite; explicitly exercise the registered lifecycle hook.
+      const imageLifecycle = vi
+        .mocked(createAgent)
+        .mock.calls.at(-1)?.[0]
+        .plugins?.find((plugin) => plugin.name === "core.image-projection");
+      await imageLifecycle?.stop?.();
+      expect(runtime.imageProjection.getFrames("preview")).toEqual([]);
+      await runtimes.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("routes unsupported primary image tool results through the configured vision model", async () => {
     const root = await mkdtemp(join(tmpdir(), "yesimbot-runtimes-"));
     try {

@@ -27,10 +27,13 @@ node scripts/setup-koishi.mjs --create-app ../my-koishi --start
 机器人自己会用这些能力：
 
 - 看到合适的图片时，自动收藏并分类（可用 `enableSteal` 关闭）。
-- 聊天需要表情包时，自动从库里找一张发出来。
+- 聊天需要表情包时，先查看候选的实际画面，再决定是否发送；不会只凭分类或标签盲发。
+- 表情包可以单独回应，也可以放在文字前后或两段文字之间；不要求每轮都发，同一轮最多发一张。
 - 找不到分类时会告诉你，或问管理员先导入。
 
 群友不需要记任何命令。
+
+查看表情包使用 YesImBot Core 的图片能力：主模型和传输支持图片工具结果时直接看图，否则使用 Core 配置的 `visionModel`。两条路径都不可用或查看失败时，机器人不会发送该表情包，仍可回复文字。视觉模型预览会产生额外调用费用；`classificationModel` 只负责收藏时分类，不能代替发送前查看。GIF 预览会采样多帧，发送时保留原始动画。
 
 ## 管理员常用命令
 
@@ -99,7 +102,7 @@ yesimbot.sticker.cleanup
 
 - `sticker_steal` 收藏时会按分类自动打 tag（`enableSteal` 关闭时该工具不提供）。
 - 新增 `sticker_tags` 工具，用于查询当前标签和数量。
-- `sticker_send` 可传多个 `tags`，会从匹配最多标签的表情包中随机发送。
+- `sticker_preview` 可传多个 `tags`，从匹配最多标签的表情包中挑选候选供查看；之后由 `sticker_send` 发送同一个 ID。
 - `sticker_search` 支持按 `tags` 过滤。
 
 开启方式：
@@ -162,4 +165,4 @@ data/yesimbot/sticker-manager/files
 
 ### 机器人在群里为什么不主动发表情包
 
-先确认库里已经有表情包，并且机器人的模型能正常使用工具。你可以先手动执行 `yesimbot.sticker.get 分类` 测试能否发送。
+先确认库里已有表情包、模型能使用工具，并且 Core 的直接图片能力或 `visionModel` 可用。机器人会根据语境决定是否使用，不保证固定频率。你可以手动执行 `yesimbot.sticker.get 分类` 测试平台能否发送；该管理命令不经过 Agent 的预览流程。
