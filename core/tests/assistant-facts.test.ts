@@ -296,6 +296,30 @@ describe("history extraction failure and cache", () => {
     expect(generateText).toHaveBeenCalledOnce();
   });
 
+  it("gives every batch its own deadline instead of one budget shared by the serial run", async () => {
+    // Production fault: batches run serially under a single deadline, so the time consumed by
+    // early batches aborts whatever batch is in flight once the shared budget runs out.
+    const created: AbortController[] = [];
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
+      const controller = new AbortController();
+      created.push(controller);
+      return controller.signal;
+    });
+    generateText.mockImplementation(async (input: { prompt: string }) => {
+      // Simulate the shared budget elapsing while an early batch is still being served.
+      if (generateText.mock.calls.length === 2) created[0]!.abort();
+      return validOutput(input);
+    });
+    const f = fixture();
+    // 128 sources fill exactly MAX_BATCHES (4 x 32) so the only way to fail is a starved deadline.
+    const entries = Array.from({ length: 128 }, (_, index) => plain(`a${index}`, `历史回复${index}`));
+    const result = await f.facts.projectEntries(entries);
+    // Every admitted batch must be served, and a deadline already spent by earlier batches
+    // must not starve the remaining ones.
+    expect(generateText).toHaveBeenCalledTimes(4);
+    expect(view(result)).not.toContain("客观正文暂不可用");
+  });
+
   it("shares identical pending batches while allowing a waiting caller to cancel independently", async () => {
     let release!: (value: unknown) => void;
     generateText.mockImplementationOnce(
