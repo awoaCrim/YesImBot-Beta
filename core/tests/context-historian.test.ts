@@ -64,7 +64,14 @@ function speech(): AgentEntry[] {
         id: "proof",
         timestamp: 3,
         role: "tool",
-        content: [{ type: "tool-result", toolCallId: "send", toolName: "send_message", output: { type: "json", value: { ok: true, count: 1 } } }],
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "send",
+            toolName: "send_message",
+            output: { type: "json", value: { ok: true, count: 1, messageIds: ["platform-id"] } },
+          },
+        ],
       },
       { id: "proof", timestamp: 3 },
     ),

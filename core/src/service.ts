@@ -57,6 +57,10 @@ export default class YesImBotService extends Service<Config> {
       readTimeoutMs: config.resourceReadTimeout * 1000,
       compactConfig: config.session.compact,
       magicContext: config.session.magicContext?.enabled,
+      resolveHistoryFactsModel: (context) => {
+        const auxiliary = this.model.resolveAuxiliaryModel("utility", context);
+        return { model: auxiliary.model, key: `${auxiliary.fullId}:${this.model.revision}` };
+      },
     });
     const agentsLogger = ctx.logger("yesimbot.agents");
     agentsLogger.level = config.logLevel ?? 2;

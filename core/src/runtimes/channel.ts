@@ -35,6 +35,7 @@ import {
 import type { WillBatchDecision, WillEngine, WillReservationOutcome, WillState } from "../agents/will.js";
 import { type Channel, type ChannelContext, deriveChannelKey } from "../channels/index.js";
 import type { Config } from "../config.js";
+import { AssistantHistoryFacts } from "../conversations/assistant-facts.js";
 import { resolveLatestCompactBoundary } from "../conversations/boundary.js";
 import { formatRecalledContinuities } from "../conversations/compact.js";
 import type { ContinuityEntry } from "../conversations/context-blocks.js";
@@ -185,6 +186,7 @@ export class ChannelRuntime {
         ...(options.polisher
           ? {
               factsRequired: true,
+              polisherMode: options.polisher.mode ?? "rewrite",
               ...(options.polish ? { polish: options.polish } : {}),
             }
           : {}),
@@ -200,6 +202,13 @@ export class ChannelRuntime {
     }
     const channelKey = deriveChannelKey(this.context);
     const projection = options.config.session.magicContext?.enabled ? new AgentRequestProjection() : undefined;
+    const historyFacts =
+      options.config.session.compact.assistantAsFacts === true
+        ? (options.channel.conversation.historyFacts ??
+          new AssistantHistoryFacts({
+            scope: () => `${options.channel.conversation.currentSessionId()}:${options.channel.conversation.storageGeneration}`,
+          }))
+        : undefined;
     if (projection) {
       this.contextWorkspace = new ContextWorkspace(options.channel.conversation, projection, {
         config: options.config.session.magicContext!,
@@ -253,6 +262,7 @@ export class ChannelRuntime {
           selfId: this.selfId,
           customInnerThought: options.config.customInnerThought,
           delegated: options.polisher !== undefined,
+          polisherMode: options.polisher?.mode,
           roleProfile: options.roleProfile,
           logger: this.logger,
         }),
@@ -278,7 +288,7 @@ export class ChannelRuntime {
         // Read-only legacy compact/continuity compatibility; this never schedules compaction.
         this.compactRecallPlugin(channelKey),
         createSummaryHistoryPlugin(inlineFragmentCount(options.config), projection, this.contextWorkspace ? undefined : options.channel.conversation),
-        createInternalHistoryProjectionPlugin(options.historyProjection ?? "default", projection),
+        historyFacts?.plugin(projection) ?? createInternalHistoryProjectionPlugin(options.historyProjection ?? "default", projection),
         createModelInputPlugin(
           options.historyProjection ?? "default",
           this.contextWorkspace !== undefined,

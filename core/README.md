@@ -5,12 +5,13 @@ Messenger, channel resources, and the per-channel runtime.
 
 ## Public API
 
-`ctx.yesimbot` exposes exactly four domain entries:
+`ctx.yesimbot` exposes these domain entries:
 
 - `model`
 - `messenger.use()` / `messenger.post()`
 - `agent.use()` / `agent.will()`
 - `resource.get()` / `resource.use()`
+- `polisher.use()` / `polisher.profile()` for optional delegated expression
 
 It also exposes the lifecycle `stop()` inherited from the Koishi service.
 
@@ -97,6 +98,14 @@ Prompts are frozen for each runtime, not reloaded from disk every turn. See
 [main-Agent prompt ownership](../docs/prompt-architecture.md) for precedence,
 standalone/delegated compatibility and an opt-in Anon reference draft.
 
+## Objective historical views
+
+`session.compact.assistantAsFacts` defaults to false. When true, Conversation uses only the configured `auxiliaryModel` utility route to extract/cache objective assistant-attributed records for every retained historical own reply, including recent history, new compression/continuity and explicit expansion. Failures retain safe unavailable metadata, never old dialogue or a main-model fallback. Cache is channel/session/model/proof-bound and ephemeral; original JSONL, other user messages and current signed tool continuations remain unchanged. Existing committed summaries are not automatically migrated.
+
+## Optional expression delegation
+
+The [message-polisher plugin](../plugins/message-polisher/README.md) supports default-compatible `rewrite` and opt-in `compose`. Rewrite receives facts plus a same-count draft and falls back once to that draft. Compose main provides facts/intent/optional verbatim without Persona/card or dialogue; the dedicated expression model receives the complete live profile and organizes bounded variable-count messages. Compose failure sends nothing, never internal facts/intent. Core retains all delivery controls. This plugin's dedicated model is separate from historical extraction's auxiliaryModel.
+
 ## Output and delivery
 
 Model text output is never delivered. It is recorded in history and logged as the
@@ -114,8 +123,10 @@ tools may deliver their own supported content:
   terminal through a predicate over its own input, so one tool covers both
   "reply and stop" and "reply and keep working".
 - Adjacent messages are paced by `pacing`; a failure stops the remaining items
-  and returns `{ok:false, error, sent, failedAt}` so the model sees exactly what
-  was delivered.
+  and returns `{ok:false, error, sent, failedAt}`. Polished receipts also carry
+  `deliveredMessages`, containing only complete items with valid segment IDs.
+  Counts/indexes refer to accepted generated items, not drafts or physical segments;
+  partially sent failed items are not promoted to full historical replies.
 
 `finish` ends a turn without sending anything. Because delivery requires an
 explicit tool call, plain model text is not a delivered reply. Core requires a

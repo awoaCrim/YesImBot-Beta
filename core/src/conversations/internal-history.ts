@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import {
   createMessageEntry,
   type AgentAssistantMessage,
@@ -30,6 +32,8 @@ interface HistoricalSendResult {
   readonly ok: boolean;
   readonly sentCount: number;
   readonly failedAt?: number;
+  /** Core-recorded complete platform items; absent on legacy receipts. */
+  readonly deliveredMessages?: readonly string[];
 }
 
 interface LegacyMarkerProjection {
@@ -114,43 +118,21 @@ export function stripInternalAssistantInputs(
 /** Public-output evidence used by block loading. No internal assistant text or failed send is exposed. */
 export function collectDeliveredSourceRecords(entries: readonly AgentEntry[]): ReadonlyMap<string, readonly CompressionRecord[]> {
   const results = collectHistoricalSendResults(entries, true);
-  const counts = new Map<string, number>();
-  const resultPositions = new Map<string, number>();
-  for (const [index, entry] of entries.entries()) {
-    if (entry.type !== "message" || entry.data.role !== "tool" || !Array.isArray(entry.data.content)) continue;
-    for (const part of entry.data.content) {
-      if (part.type === "tool-result") {
-        counts.set(part.toolCallId, (counts.get(part.toolCallId) ?? 0) + 1);
-        resultPositions.set(part.toolCallId, index);
-      }
-    }
-  }
-  const callCounts = new Map<string, number>();
-  for (const entry of entries) {
-    if (entry.type !== "message" || entry.data.role !== "assistant" || !Array.isArray(entry.data.content)) continue;
-    for (const part of entry.data.content) if (part.type === "tool-call") callCounts.set(part.toolCallId, (callCounts.get(part.toolCallId) ?? 0) + 1);
-  }
   const records = new Map<string, readonly CompressionRecord[]>();
-  for (const [index, entry] of entries.entries()) {
+  for (const entry of entries) {
     if (entry.type !== "message" || entry.data.role !== "assistant" || !Array.isArray(entry.data.content)) continue;
     const output: CompressionRecord[] = [];
     for (const part of entry.data.content) {
-      if (
-        part.type !== "tool-call" ||
-        part.toolName !== HISTORICAL_OUTPUT_TOOL_NAME ||
-        counts.get(part.toolCallId) !== 1 ||
-        callCounts.get(part.toolCallId) !== 1 ||
-        (resultPositions.get(part.toolCallId) ?? -1) <= index
-      )
-        continue;
+      if (part.type !== "tool-call" || part.toolName !== HISTORICAL_OUTPUT_TOOL_NAME) continue;
       const result = results.get(part.toolCallId);
       if (!result || result.sentCount <= 0 || (!result.ok && (result.failedAt ?? 0) <= 0)) continue;
-      const messages = readHistoricalSendMessages(part.input);
+      const messages = result.deliveredMessages ?? readHistoricalSendMessages(part.input);
       if (!messages) continue;
       // sent IDs count platform segments, not input messages. A partial receipt proves
       // only inputs strictly before failedAt; even partially sent failed input is excluded.
       const count = result.ok ? result.sentCount : result.failedAt!;
-      if ((result.ok && count !== messages.length) || (!result.ok && count >= messages.length)) continue;
+      if ((result.ok && count !== messages.length) || (!result.ok && (result.deliveredMessages ? count !== messages.length : count >= messages.length)))
+        continue;
       for (const message of messages.slice(0, count)) {
         // Unbalanced control markup cannot prove where private text ends. The old
         // history projection stays unchanged; block loading fails closed for this row.
@@ -163,6 +145,70 @@ export function collectDeliveredSourceRecords(entries: readonly AgentEntry[]): R
     if (output.length) records.set(entry.id, output);
   }
   return records;
+}
+
+/** Source/body/proof identity without exposing original private fields to derived prompts. */
+export function collectAssistantSourceProofs(entries: readonly AgentEntry[]): ReadonlyMap<string, string> {
+  const receipts = new Map<string, object[]>();
+  for (const entry of entries) {
+    if (entry.type !== "message" || entry.data.role !== "tool" || !Array.isArray(entry.data.content)) continue;
+    for (const part of entry.data.content)
+      if (part.type === "tool-result" && part.toolName === HISTORICAL_OUTPUT_TOOL_NAME) {
+        const list = receipts.get(part.toolCallId) ?? [];
+        list.push(entry.data);
+        receipts.set(part.toolCallId, list);
+      }
+  }
+  const result = new Map<string, string>();
+  for (const entry of entries) {
+    if (entry.type !== "message") continue;
+    const origins: object[] = [entry.data];
+    if (entry.data.role === "assistant" && Array.isArray(entry.data.content)) {
+      for (const part of entry.data.content)
+        if (part.type === "tool-call" && part.toolName === HISTORICAL_OUTPUT_TOOL_NAME) origins.push(...(receipts.get(part.toolCallId) ?? []));
+    }
+    result.set(entry.id, createHash("sha256").update(JSON.stringify(origins)).digest("hex"));
+  }
+  return result;
+}
+
+/** Only new actual-body receipts override legacy renderers; invalid new proof masks the draft. */
+export function collectActualDeliveredSourceRecords(entries: readonly AgentEntry[]): ReadonlyMap<string, readonly CompressionRecord[]> {
+  const calls = new Set<string>();
+  for (const entry of entries) {
+    if (entry.type !== "message" || entry.data.role !== "tool" || !Array.isArray(entry.data.content)) continue;
+    for (const part of entry.data.content) {
+      if (part.type !== "tool-result" || part.toolName !== HISTORICAL_OUTPUT_TOOL_NAME) continue;
+      const output: unknown = part.output;
+      const value = parseJsonValue(isRecord(output) && "value" in output ? output.value : output);
+      if (isRecord(value) && Object.hasOwn(value, "deliveredMessages")) calls.add(part.toolCallId);
+    }
+  }
+  const delivered = collectDeliveredSourceRecords(entries);
+  const result = new Map<string, readonly CompressionRecord[]>();
+  for (const entry of entries) {
+    if (
+      entry.type === "message" &&
+      entry.data.role === "assistant" &&
+      Array.isArray(entry.data.content) &&
+      entry.data.content.some((part) => part.type === "tool-call" && calls.has(part.toolCallId))
+    )
+      result.set(entry.id, delivered.get(entry.id) ?? []);
+  }
+  return result;
+}
+
+export function sanitizeDeliveredMessage(value: string): string {
+  return value
+    .replace(/<inner_thought\b[^>]*\/?>[\s\S]*?<\/inner_thought\s*>/gi, "")
+    .replace(/<inner_thought\b[^>]*\/?\s*>/gi, "")
+    .replace(/<\/?img\b[^>]*>/gi, "[图片]")
+    .replace(/<\/?image\b[^>]*>/gi, "[图片]")
+    .replace(/<\/?file\b[^>]*>/gi, "[文件]")
+    .replace(/<message\s*\/>/gi, "\n")
+    .replace(/<\/?text\b[^>]*>/gi, "")
+    .replace(/\b(?:artifact|asset|workspace):\/\/[^\s"'<>]+/gi, "[资源]")
+    .trim();
 }
 
 function appendProjectedEntries(target: AgentEntry[], transcripts: AgentEntry[], entries: readonly AgentEntry[]): void {
@@ -222,7 +268,8 @@ function stripAssistantContent(
     }
     if (sourcePart.type === "tool-call" && sourcePart.toolName === HISTORICAL_OUTPUT_TOOL_NAME) {
       changed = true;
-      if (mode === "default") {
+      const receipt = typeof sourcePart.toolCallId === "string" ? sendResults.get(sourcePart.toolCallId) : undefined;
+      if (mode === "default" || receipt?.deliveredMessages !== undefined) {
         const delivered = projectDeliveredMessages(sourcePart, sendResults);
         if (delivered) transcripts.push(delivered);
         continue;
@@ -232,7 +279,9 @@ function stripAssistantContent(
       if (!messages) continue;
       const part = structuredClone(sourcePart) as Record<string, unknown>;
       if (!isRecord(part.input)) continue;
-      const input = { ...part.input, messages: [...messages] };
+      // Compose calls contain facts/intent, not a messages draft. Do not invent arguments
+      // or substitute generated dialogue into the signed historical call.
+      const input = { ...part.input, ...(Array.isArray(part.input.messages) ? { messages: [...messages] } : {}) };
       removePrivateToolFields(input);
       part.input = input;
       content.push(part);
@@ -298,13 +347,30 @@ function stripToolContent(
 }
 
 function collectHistoricalSendResults(entries: readonly AgentEntry[], strict = false): ReadonlyMap<string, HistoricalSendResult> {
+  const calls = new Map<string, { index: number; count: number }>();
+  const receiptCounts = new Map<string, number>();
+  for (const [index, entry] of entries.entries()) {
+    if (entry.type !== "message" || (entry.data.role !== "assistant" && entry.data.role !== "tool") || !Array.isArray(entry.data.content)) continue;
+    for (const part of entry.data.content as readonly unknown[]) {
+      if (!isRecord(part) || typeof part.toolCallId !== "string") continue;
+      if (entry.data.role === "assistant" && part.type === "tool-call")
+        calls.set(part.toolCallId, { index, count: (calls.get(part.toolCallId)?.count ?? 0) + 1 });
+      if (entry.data.role === "tool" && part.type === "tool-result") receiptCounts.set(part.toolCallId, (receiptCounts.get(part.toolCallId) ?? 0) + 1);
+    }
+  }
   const results = new Map<string, HistoricalSendResult>();
-  for (const entry of entries) {
+  for (const [index, entry] of entries.entries()) {
     if (entry.type !== "message" || entry.data.role !== "tool" || !Array.isArray(entry.data.content)) continue;
     for (const sourcePart of entry.data.content as readonly unknown[]) {
       if (!isRecord(sourcePart) || sourcePart.type !== "tool-result" || sourcePart.toolName !== HISTORICAL_OUTPUT_TOOL_NAME) continue;
       if (typeof sourcePart.toolCallId !== "string") continue;
-      results.set(sourcePart.toolCallId, decodeHistoricalSendResult(sourcePart, strict));
+      const result = decodeHistoricalSendResult(sourcePart, strict);
+      const call = calls.get(sourcePart.toolCallId);
+      // Only legacy receipts retain permissive compatibility. Actual-body receipts must have
+      // unambiguous ordered proof in every history renderer, not only explicit expansion.
+      const ambiguousProof =
+        (strict || result.deliveredMessages !== undefined) && (call?.count !== 1 || call.index >= index || receiptCounts.get(sourcePart.toolCallId) !== 1);
+      results.set(sourcePart.toolCallId, ambiguousProof ? { ok: false, sentCount: 0 } : result);
     }
   }
   return results;
@@ -315,47 +381,46 @@ function decodeHistoricalSendResult(part: Record<string, unknown>, strict = fals
   const rawValue = isRecord(rawOutput) && "value" in rawOutput ? rawOutput.value : rawOutput;
   const value = parseJsonValue(rawValue);
   if (!isRecord(value)) return { ok: false, sentCount: 0 };
-  if (strict) {
+  const hasBody = Object.hasOwn(value, "deliveredMessages");
+  if (strict || hasBody) {
     const ids = value.ok === true ? value.messageIds : value.sent;
     const invalidIds = ids !== undefined && (!Array.isArray(ids) || !ids.every((id) => typeof id === "string" && id.length > 0));
     const invalidCount = value.count !== undefined && (typeof value.count !== "number" || !Number.isSafeInteger(value.count) || value.count < 0);
     const explicitNoDelivery = Array.isArray(ids) && ids.length === 0;
-    if (invalidIds || invalidCount || explicitNoDelivery || (value.ok !== true && value.ok !== false)) return { ok: false, sentCount: 0 };
+    const completeCount = value.ok === true ? value.count : value.failedAt;
+    const insufficientIds = !Array.isArray(ids) || (typeof completeCount === "number" && ids.length < completeCount);
+    if (invalidIds || invalidCount || explicitNoDelivery || insufficientIds || (value.ok !== true && value.ok !== false)) return { ok: false, sentCount: 0 };
   }
+  const deliveredMessages = value.deliveredMessages;
+  if (
+    hasBody &&
+    (!Array.isArray(deliveredMessages) ||
+      !deliveredMessages.every((text) => typeof text === "string" && text.trim().length > 0) ||
+      (value.ok === true ? deliveredMessages.length !== value.count : deliveredMessages.length !== value.failedAt))
+  )
+    return { ok: false, sentCount: 0 };
+  const body = hasBody ? { deliveredMessages: deliveredMessages as string[] } : {};
   if (value.ok === true) {
     const count = typeof value.count === "number" && Number.isInteger(value.count) && value.count >= 0 ? value.count : undefined;
     const messageIds = Array.isArray(value.messageIds) ? value.messageIds.length : undefined;
-    return { ok: true, sentCount: count ?? messageIds ?? 0 };
+    return { ok: true, sentCount: count ?? messageIds ?? 0, ...body };
   }
   const sentCount = Array.isArray(value.sent) ? value.sent.length : 0;
   const failedAt = typeof value.failedAt === "number" && Number.isInteger(value.failedAt) && value.failedAt >= 0 ? value.failedAt : undefined;
-  return { ok: false, sentCount, ...(failedAt === undefined ? {} : { failedAt }) };
+  return { ok: false, sentCount, ...(failedAt === undefined ? {} : { failedAt }), ...body };
 }
 
 function projectDeliveredMessages(part: Record<string, unknown>, sendResults: ReadonlyMap<string, HistoricalSendResult>): DeliveredTranscriptData | undefined {
   if (typeof part.toolCallId !== "string") return undefined;
   const result = sendResults.get(part.toolCallId);
   if (!result || (!result.ok && result.sentCount === 0)) return undefined;
-  const input = isRecord(part.input) ? part.input.messages : undefined;
+  const input = result.deliveredMessages ?? (isRecord(part.input) ? part.input.messages : undefined);
   if (!Array.isArray(input)) return undefined;
   const messages = input.filter((value): value is string => typeof value === "string");
   const count = result.ok ? Math.min(result.sentCount || messages.length, messages.length) : Math.min(result.failedAt ?? 0, messages.length);
   const delivered = messages.slice(0, count).map(sanitizeDeliveredMessage).filter(Boolean);
   if (delivered.length === 0) return undefined;
   return { messages: delivered, deliveredCount: count, partial: !result.ok };
-}
-
-function sanitizeDeliveredMessage(value: string): string {
-  return value
-    .replace(/<inner_thought\b[^>]*\/?>[\s\S]*?<\/inner_thought\s*>/gi, "")
-    .replace(/<inner_thought\b[^>]*\/?\s*>/gi, "")
-    .replace(/<\/?img\b[^>]*>/gi, "[图片]")
-    .replace(/<\/?image\b[^>]*>/gi, "[图片]")
-    .replace(/<\/?file\b[^>]*>/gi, "[文件]")
-    .replace(/<message\s*\/>/gi, "\n")
-    .replace(/<\/?text\b[^>]*>/gi, "")
-    .replace(/\b(?:artifact|asset|workspace):\/\/[^\s"'<>]+/gi, "[资源]")
-    .trim();
 }
 
 function collectSafeGeminiSendCalls(entries: readonly AgentEntry[], sendResults: ReadonlyMap<string, HistoricalSendResult>): Map<string, readonly string[]> {
@@ -372,8 +437,9 @@ function collectSafeGeminiSendCalls(entries: readonly AgentEntry[], sendResults:
         continue;
       }
       const result = sendResults.get(sourcePart.toolCallId);
-      const messages = readHistoricalSendMessages(sourcePart.input);
-      if (!result?.ok || !messages || result.sentCount !== messages.length) continue;
+      const messages = readHistoricalSendMessages(sourcePart.input) ?? result?.deliveredMessages;
+      // New actual-body receipts are projected as transcripts, never into signed old args.
+      if (!result?.ok || result.deliveredMessages !== undefined || !messages || result.sentCount !== messages.length) continue;
       const sanitized = messages.map(sanitizeDeliveredMessage);
       if (sanitized.some((message) => message.length === 0)) continue;
       calls.set(sourcePart.toolCallId, sanitized);

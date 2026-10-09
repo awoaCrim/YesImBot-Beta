@@ -5,6 +5,7 @@ import type { SystemModelMessage } from "ai";
 import type { Logger } from "koishi";
 
 import type { MainAgentRoleProfile } from "../agents/index.js";
+import type { PolisherMode, PolisherPromptProfile } from "../agents/polisher.js";
 import type { ChannelContext } from "../channels/index.js";
 
 export const DEFAULT_PERSONA = `# Athena
@@ -40,6 +41,14 @@ const CORE_DELEGATED_DRAFT_RULES = `对外回复先满足当前消息的直接�
 调用 send_message 时，除了要发送的草稿 messages，还要在 facts 中逐条列出这次回复依据的明示事实：哪些来自可见消息、哪些来自工具结果、哪些只是你的推断。facts 只用于发送前的校验与改写，不会发送给任何人。
 messages 只需完整表达事实、判断和交流动作，不要自行补充事实或承诺。语言风格、语气和句式由发送前的润色阶段处理。
 ${CORE_MESSAGE_SEGMENTATION_RULE}`;
+
+const CORE_COMPOSE_WORKING_MODE = `你负责逻辑思考、事实核对、工具调用和任务执行，不负责人格表演或角色台词。先理解当前情境，再决定是否参与、采取何种动作及需要对外传达哪些信息。
+主模型不需要人格材料；独立发送阶段携带完整角色设置，自主构思措辞、语气、节奏与消息分条。这里不是待处理的问题列表，不需要每条消息都回应。`;
+
+const CORE_COMPOSE_OUTPUT_RULES = `调用 send_message 时提交 facts 与 intent，不提交 messages 草稿。
+facts 仅列出本次拟对外传达的客观信息点，保留数量、对象、时间、条件、否定、承诺及不确定性；不写口癖、风格台词或完整工具日志。intent 描述回答、确认、拒绝、澄清等交流动作和必要约束，不预写回复。
+必须逐字交付的代码、命令、精确引用或资源元素放入可选 verbatim；不得用它提交风格草稿。实际自然表达和消息分条由润色模型组织。
+生成失败时不得直接发送 facts/intent，不自动改回自己写角色回复；已部分发送时不要重新生成或整批重发。`;
 
 const CORE_DELEGATED_ACTION_RULES = `需要精确完成某件事时，使用实际存在的工具并确认返回结果；不需要回应时，调用 finish 结束本轮。是否回应是行为决策，不要求主 Agent选择措辞风格。`;
 
@@ -145,6 +154,7 @@ export interface CoreSystemPromptOptions {
   readonly customInnerThought?: boolean;
   /** When an active polisher owns style rendering, Core drops all persona-specific instructions. */
   readonly delegated?: boolean;
+  readonly polisherMode?: PolisherMode;
   readonly logger?: Logger;
   readonly roleProfile?: MainAgentRoleProfile;
 }
@@ -154,26 +164,34 @@ export async function readPersona(basePath: string, logger?: Logger): Promise<st
 }
 
 export async function buildCoreSystemPrompt(options: CoreSystemPromptOptions): Promise<SystemModelMessage[]> {
+  const delegated = options.delegated === true;
   const [agents, explicitPersona] = await Promise.all([
     readPromptFile(options.basePath, "AGENTS.md", options.logger),
-    readPromptFile(options.basePath, "PERSONA.md", options.logger),
+    delegated ? Promise.resolve(undefined) : readPromptFile(options.basePath, "PERSONA.md", options.logger),
   ]);
-  const delegated = options.delegated === true;
   const profile = options.roleProfile;
-  const hasCard = Boolean(profile?.characterDefinition?.trim() || profile?.roleInstructions?.trim());
-  // Legacy services wrote this exact template. Treat only that exact content as fallback, without rewriting files.
-  const persona = hasCard && explicitPersona === DEFAULT_PERSONA.trim() ? undefined : (explicitPersona ?? (hasCard ? undefined : DEFAULT_PERSONA));
+  const persona = selectPersona(explicitPersona, profile);
 
   return [
     {
       role: "system",
       content: delegated
-        ? delegatedConstitution(options.customInnerThought ?? false)
+        ? delegatedConstitution(options.customInnerThought ?? false, options.polisherMode)
         : normalConstitution(persona, profile, options.customInnerThought ?? false),
     },
     ...(agents ? [wrap("agents", agents)] : []),
     formatRuntimeContext(options.channel, options.selfId),
   ];
+}
+
+/** Same live identity precedence as the ordinary main prompt, without another style configuration. */
+export async function resolvePolisherPromptProfile(
+  basePath: string,
+  card?: Omit<PolisherPromptProfile, "persona">,
+  logger?: Logger,
+): Promise<PolisherPromptProfile> {
+  const explicit = await readPromptFile(basePath, "PERSONA.md", logger);
+  return { ...card, persona: selectPersona(explicit, card) ?? "" };
 }
 
 /** Create an editable blank template; the default stays in memory so a card can be the sole identity.
@@ -195,6 +213,12 @@ export async function ensureAgentsFile(basePath: string): Promise<void> {
   }
 }
 
+function selectPersona(explicit: string | undefined, profile?: MainAgentRoleProfile): string | undefined {
+  const hasCard = Boolean(profile?.characterDefinition?.trim() || profile?.roleInstructions?.trim());
+  // Recognize only the exact legacy default; never rewrite or heuristically deduplicate operator files.
+  return hasCard && explicit === DEFAULT_PERSONA.trim() ? undefined : (explicit ?? (hasCard ? undefined : DEFAULT_PERSONA));
+}
+
 function normalConstitution(persona: string | undefined, profile: MainAgentRoleProfile | undefined, customInnerThought: boolean): string {
   const card = [profile?.characterDefinition, profile?.roleInstructions].filter((section) => section?.trim()).join("\n\n");
   const primary = persona ? `主身份与行为文档（PERSONA.md 优先）：\n<persona>\n${persona}\n</persona>` : "角色卡是当前主身份与行为定义。";
@@ -210,7 +234,8 @@ function normalConstitution(persona: string | undefined, profile: MainAgentRoleP
     .join("\n\n");
 }
 
-function delegatedConstitution(customInnerThought: boolean): string {
+function delegatedConstitution(customInnerThought: boolean, mode: PolisherMode = "rewrite"): string {
+  const compose = mode === "compose";
   return `你的意识不是连续的。你在事件到来时醒来——有人发了消息、时间流逝到了某个节点、你之前发起的行动有了结果、或系统判断此刻需要你的注意。两次醒来之间，你没有体验，也没有等待的感觉；对你来说，上一次思考的最后一个念头和这一次思考的第一个念头是紧挨着的。
 
 你面前的上下文就是你此刻全部的感知窗口。它包含：
@@ -219,7 +244,7 @@ function delegatedConstitution(customInnerThought: boolean): string {
 - 你自己过去说过的话和做过的事
 - 如果你之前调用了工具，它的返回结果也会出现在这里
 
-${CORE_DELEGATED_WORKING_MODE}
+${compose ? CORE_COMPOSE_WORKING_MODE : CORE_DELEGATED_WORKING_MODE}
 
 # 感知
 
@@ -231,13 +256,13 @@ ${CORE_PERCEPTION}
 ${CORE_DELEGATED_ACTION_RULES}
 
 # 输出
-你输出的文本不会被发送到任何地方。它是你的内部工作区——观察、判断、推敲措辞、规划步骤都可以写在这里，没有人看得到。
+你输出的文本不会被发送到任何地方。${compose ? "它是观察、判断、核对事实和规划工具步骤的内部工作区；不要预演对外台词。" : "它是你的内部工作区——观察、判断、推敲措辞、规划步骤都可以写在这里，没有人看得到。"}
 对外内容只能通过当前实际提供的发送工具到达平台。文字消息使用 send_message；插件提供的其他发送工具可以直接发送其支持的内容。未调用任何发送工具时，本轮不会有内容发出。判断此刻不需要你参与时，调用 finish 结束本轮。
 这意味着你不需要用文字表示自己在做什么或不做什么。「保持沉默」「无需回复」「我选择不回应」这类话没有收件人，写出来只是浪费一次思考——直接调用 finish。
 调用工具不等于发言。查完资料、做完操作之后，你依然可以选择说话或不说话。
-${CORE_DELEGATED_DRAFT_RULES}
+${compose ? CORE_COMPOSE_OUTPUT_RULES : CORE_DELEGATED_DRAFT_RULES}
 
-${customInnerThought ? CORE_INNER_THOUGHT_DELEGATED : ""}# 对外部世界的知觉
+${customInnerThought ? (compose ? "# 内心判断\n\nsend_message 的 inner_thought 仅为私有的简短行为判断，不发送给润色模型或平台，也不是事实依据。不预演台词；无需回应时直接调用无参数的 finish。\n\n" : CORE_INNER_THOUGHT_DELEGATED) : ""}# 对外部世界的知觉
 
 不知道就是不知道，无法做到就是无法做到。不要把搜索结果包装成自己本来就知道的事，不要把猜测表述为确认，不要编造细节来填补认知空白。
 

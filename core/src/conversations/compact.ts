@@ -52,6 +52,10 @@ export interface CompressionRecord {
 export interface CompressionRenderOptions {
   readonly mode?: CompressionMode;
   readonly assistantAsFacts?: boolean;
+  /** Auxiliary-extracted factual views keyed by canonical entry, never original dialogue. */
+  readonly assistantFacts?: ReadonlyMap<string, readonly string[]>;
+  /** Actual-body receipts take precedence even when objective history is disabled. */
+  readonly deliveredRecords?: ReadonlyMap<string, readonly CompressionRecord[]>;
 }
 
 export interface ContinuityDraft {
@@ -87,15 +91,26 @@ export function mergeContinuityDrafts(drafts: readonly ContinuityDraft[]): Conti
 }
 
 /** Bounded, source-only input for the continuity model; oversized input fails rather than truncating provenance. */
-export function renderContinuitySource(entries: readonly AgentEntry[]): string {
-  const chunks = renderContinuitySourceChunks(entries);
+export function renderContinuitySource(entries: readonly AgentEntry[], options: CompressionRenderOptions = {}): string {
+  const chunks = renderContinuitySourceChunks(entries, options);
   if (chunks.length > 1) throw new Error("ContinuitySourceTooLarge");
   return chunks[0] ?? "";
 }
 
 /** Splits only at complete rendered records, or at UTF-8-safe code-point boundaries for one long record. */
-export function renderContinuitySourceChunks(entries: readonly AgentEntry[]): string[] {
-  const rendered = filterEntriesForCompression(entries, { mode: "compartment", assistantAsFacts: true });
+export function renderContinuitySourceChunks(entries: readonly AgentEntry[], options: CompressionRenderOptions = {}): string[] {
+  // Preserve the pre-feature continuity source when disabled. This quoting is compatibility
+  // rendering, not the new objective extractor: enabled input must never include these lines.
+  const rendered =
+    options.assistantAsFacts === true
+      ? filterEntriesForCompression(entries, { ...options, mode: "compartment" })
+      : entries
+          .flatMap((entry) => options.deliveredRecords?.get(entry.id) ?? renderCompressionRecords(entry))
+          .map(
+            (record) =>
+              `[${formatCompactTimestamp(record.timestamp)}] [${compressionLabel(record, "compartment")}]: ${record.role === "assistant" ? `assistant 曾输出原文：“${record.text}”` : record.text}`,
+          )
+          .join("\n");
   if (!rendered) return [];
   const chunks: string[] = [];
   let current = "";
@@ -331,15 +346,28 @@ export function formatRecalledContinuities(
 export function filterEntriesForCompression(entries: readonly AgentEntry[], options: CompressionRenderOptions = {}): string {
   const mode = options.mode ?? "summary";
   const lines: string[] = [];
+  const factualEntries = new Set<string>();
   for (const entry of entries) {
-    for (const record of renderCompressionRecords(entry)) {
+    const facts = options.assistantAsFacts === true ? options.assistantFacts?.get(entry.id) : undefined;
+    // Compose/typed legacy transcript owners need not have any raw renderable dialogue.
+    // The canonical owner still carries the extracted source and its verified receipt proof.
+    const records =
+      facts && entry.type === "message"
+        ? [{ entryId: entry.id, timestamp: compactSourceTimestamp(entry), role: "assistant" as const, text: facts.join("；") }]
+        : (options.deliveredRecords?.get(entry.id) ?? renderCompressionRecords(entry));
+    for (const record of records) {
       // Summary mode keeps the legacy renderer: ordinary Agent `user` messages were never
       // treated as platform conversation input; compartment mode intentionally includes them.
       if (mode === "summary" && record.role === "user" && record.speaker === undefined) continue;
       if (mode === "compartment" && record.role === "assistant" && options.assistantAsFacts !== true) continue;
       const stamp = formatCompactTimestamp(record.timestamp);
       const label = compressionLabel(record, mode);
-      const text = record.role === "assistant" && options.assistantAsFacts === true ? `assistant 曾输出原文：“${record.text}”` : record.text;
+      if (record.role === "assistant" && options.assistantAsFacts === true && factualEntries.has(entry.id)) continue;
+      if (record.role === "assistant") factualEntries.add(entry.id);
+      const text =
+        record.role === "assistant" && options.assistantAsFacts === true
+          ? (options.assistantFacts?.get(entry.id)?.join("；") ?? "助手有历史输出记录；没有可确认的客观正文，不能补回原始台词。")
+          : record.text;
       lines.push(`[${stamp}] [${label}]: ${text}`);
     }
   }

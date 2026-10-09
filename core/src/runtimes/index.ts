@@ -11,7 +11,7 @@ import type { Config } from "../config.js";
 import { MessageBatchRegistry } from "../message-batches/index.js";
 import { AuxiliaryModelError, type ChatModelRef, ModelService } from "../models/index.js";
 import { ChannelRuntime } from "./channel.js";
-import { readPersona } from "./prompt.js";
+import { resolvePolisherPromptProfile } from "./prompt.js";
 
 export class Runtimes {
   private readonly logger: Logger;
@@ -129,11 +129,9 @@ export class Runtimes {
           ? undefined
           : createSendMessagePolisher({
               registry: this.polishers,
-              resolveProfile: async () => ({
-                persona: await readPersona(this.config.basePath, this.logger),
-                ...(await this.polishers.resolveProfile(channel.context)),
-              }),
+              resolveProfile: async () => resolvePolisherPromptProfile(this.config.basePath, await this.polishers.resolveProfile(channel.context), this.logger),
               context: channel.context,
+              capability: polisher,
             });
       const roleProfile = polisher === undefined ? await this.agents.resolveRoleProfile(channel.context) : undefined;
       if (this.agents.revision !== agentRevision) {

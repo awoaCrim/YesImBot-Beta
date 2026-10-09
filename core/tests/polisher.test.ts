@@ -323,6 +323,7 @@ describe("createSendMessageTool polisher integration", () => {
       error: { name: "Error", message: "offline" },
       sent: ["m1"],
       failedAt: 1,
+      deliveredMessages: ["润色一"],
     });
     expect(sendMessage).toHaveBeenCalledTimes(2);
     expect(sentPayload(sendMessage, 0)).toContain("润色一");

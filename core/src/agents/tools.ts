@@ -2,6 +2,7 @@ import { EphemeralImageProjectionStore, jsonSchema, type AgentMessage, type Agen
 import type { LanguageModel } from "ai";
 import { h, type Bot, type Element } from "koishi";
 
+import { withAbortSignal } from "../abort.js";
 import type { PacingConfig } from "../config.js";
 import { ContextSourceError } from "../conversations/context-blocks.js";
 import type { CompartmentExpansionRecord, Conversation } from "../conversations/index.js";
@@ -10,7 +11,14 @@ import { detectImageMediaType, prepareOutputSegments, ResourceReadError, type Ch
 import { ContextBudgetError } from "../runtimes/context-budget.js";
 import type { ContextWorkspace, ContextBlocksInput, ContextLoadInput } from "../runtimes/context-workspace.js";
 import { describeImageBytes } from "./image-preview.js";
-import { buildPolisherTurnContext, validatePolishedMessages, type PolisherTurnContext } from "./polisher.js";
+import {
+  buildPolisherTurnContext,
+  MAX_COMPOSE_BYTES,
+  validateComposedMessages,
+  validatePolishedMessages,
+  type PolisherMode,
+  type SendMessagePolisher,
+} from "./polisher.js";
 
 const READ_MAX_TEXT_CHARS = 30_000;
 const ONEBOT_GROUP_CHANNEL_PREFIX = "group:";
@@ -40,8 +48,10 @@ type DescribeImageOutput = { text: string } | { error: string };
 type SendMessageMode = "element" | "raw";
 
 type SendMessageInput = {
-  messages: string[];
+  messages?: string[];
   facts?: string[];
+  intent?: string;
+  verbatim?: string[];
   channel?: string;
   mode?: SendMessageMode;
   continue?: boolean;
@@ -49,8 +59,8 @@ type SendMessageInput = {
 };
 
 type SendMessageOutput =
-  | { ok: true; messageIds: string[]; count: number }
-  | { ok: false; error: { name: string; message: string }; sent: string[]; failedAt: number };
+  | { ok: true; messageIds: string[]; count: number; deliveredMessages?: string[] }
+  | { ok: false; error: { name: string; message: string }; sent: string[]; failedAt: number; deliveredMessages?: string[] };
 
 /** Facts about one delivered platform message, reported so the owner can announce it. */
 export interface DeliveredNotice {
@@ -79,13 +89,9 @@ export interface SendMessageToolOptions {
   readonly innerThought: boolean;
   /** Requires the explicit `facts` field when a send-message polisher owns style rendering. */
   readonly factsRequired?: boolean;
-  /** Optional pre-send rewrite. A result replaces `messages` only; failures keep the original draft. */
-  readonly polish?: (input: {
-    readonly facts: readonly string[];
-    readonly messages: readonly string[];
-    readonly turnContext: PolisherTurnContext;
-    readonly signal?: AbortSignal;
-  }) => Promise<readonly string[] | undefined>;
+  /** Missing mode keeps the legacy rewrite/fallback contract. */
+  readonly polisherMode?: PolisherMode;
+  readonly polish?: SendMessagePolisher;
   readonly onDelivered?: (notice: DeliveredNotice) => void;
   readonly onFailed?: (notice: SendFailedNotice) => void;
 }
@@ -95,29 +101,51 @@ export interface SendMessageToolOptions {
  * delivery tools can send their own content. Ends the turn unless the model asks to `continue`.
  */
 export function createSendMessageTool(options: SendMessageToolOptions): AgentTool<SendMessageInput, SendMessageOutput> {
-  const { bot, channelId: defaultChannelId, resources, pacing, innerThought, factsRequired, polish, onDelivered, onFailed } = options;
+  const { bot, channelId: defaultChannelId, resources, pacing, innerThought, polish, onDelivered, onFailed } = options;
+  const compose = options.polisherMode === "compose";
+  const factsRequired = options.factsRequired === true || compose;
   return {
     name: "send_message",
     terminal: (input) => !input.continue,
-    description: sendMessageDescription(innerThought, factsRequired === true),
+    description: sendMessageDescription(innerThought, factsRequired, compose),
     inputSchema: jsonSchema<SendMessageInput>({
       type: "object",
       properties: {
-        messages: {
-          type: "array",
-          minItems: 1,
-          items: { type: "string", minLength: 1 },
-          description: factsRequired
-            ? "本轮待发送的草稿消息；完整表达事实、判断和交流动作，不自行添加事实或承诺。每一项对应一条独立消息，润色时保留条数与顺序"
-            : "要发送的消息，每一项作为一条独立消息按顺序发出；精确文本使用 raw 或 <text>，保留事实、代码、链接和消息元素",
-        },
+        ...(compose
+          ? {
+              intent: {
+                type: "string",
+                minLength: 1,
+                maxLength: 2000,
+                description: "本次交流动作与必要约束，例如回答查询、确认收到或表达拒绝；只说明意图，不写角色台词或风格草稿",
+              },
+              verbatim: {
+                type: "array",
+                maxItems: 12,
+                items: { type: "string", minLength: 1 },
+                description: "必须逐字交付的代码、命令、精确引用或资源元素；不是回复草稿。可省略",
+              },
+            }
+          : {
+              messages: {
+                type: "array",
+                minItems: 1,
+                items: { type: "string", minLength: 1 },
+                description: factsRequired
+                  ? "本轮待发送的草稿消息；完整表达事实、判断和交流动作，不自行添加事实或承诺。每一项对应一条独立消息，润色时保留条数与顺序"
+                  : "要发送的消息，每一项作为一条独立消息按顺序发出；精确文本使用 raw 或 <text>，保留事实、代码、链接和消息元素",
+              },
+            }),
         ...(factsRequired
           ? {
               facts: {
                 type: "array",
-                minItems: 1,
+                minItems: compose ? 0 : 1,
+                maxItems: compose ? 64 : undefined,
                 items: { type: "string", minLength: 1 },
-                description: "本次回复依据的明示事实列表：哪一条来自可见消息、哪一条来自工具结果、哪一条只是你的推断；只用于发送前校验，不会发送给任何人",
+                description: compose
+                  ? "本次拟对外表达的客观信息点，保留数量、对象、条件、否定及不确定性；不写口癖、语气或角色台词。不是内部推理，也不是要求全文发送的工具日志"
+                  : "本次回复依据的明示事实列表：哪一条来自可见消息、哪一条来自工具结果、哪一条只是你的推断；只用于发送前校验，不会发送给任何人",
               },
             }
           : {}),
@@ -135,14 +163,16 @@ export function createSendMessageTool(options: SendMessageToolOptions): AgentToo
           ? {
               inner_thought: {
                 type: "string",
-                description: factsRequired
-                  ? "本次发送前的内心独白；只保留在你自己的历史里，不会发送给任何人"
-                  : "本回合简短行为判断：互动对象、可见事实与推测、是否回应和行动计划；不写角色台词或对外文本，不会发送给任何人",
+                description:
+                  factsRequired && !compose
+                    ? "本次发送前的内心独白；只保留在你自己的历史里，不会发送给任何人"
+                    : "本回合简短行为判断：互动对象、可见事实与推测、是否回应和行动计划；不写角色台词或对外文本，不会发送给任何人",
               },
             }
           : {}),
       },
-      required: factsRequired ? ["facts", "messages"] : ["messages"],
+      required: compose ? ["facts", "intent"] : factsRequired ? ["facts", "messages"] : ["messages"],
+      ...(compose ? { additionalProperties: false } : {}),
     }),
     execute: async (input, execution) => {
       const requestedTarget = input.channel ? input.channel : defaultChannelId;
@@ -151,22 +181,43 @@ export function createSendMessageTool(options: SendMessageToolOptions): AgentToo
           ? requestedTarget.slice(ONEBOT_GROUP_CHANNEL_PREFIX.length)
           : requestedTarget;
       const inputMessages = Array.isArray(input.messages) ? input.messages : [];
-      if (inputMessages.length === 0) return { ok: false, error: { name: "InvalidInput", message: "messages is empty" }, sent: [], failedAt: 0 };
-      if (inputMessages.some((message) => typeof message !== "string" || message.length === 0))
+      if (compose && !validComposeInput(input))
+        return {
+          ok: false,
+          error: { name: "InvalidInput", message: "compose requires bounded facts/intent and optional verbatim, not a messages draft" },
+          sent: [],
+          failedAt: 0,
+        };
+      if (!compose && inputMessages.length === 0) return { ok: false, error: { name: "InvalidInput", message: "messages is empty" }, sent: [], failedAt: 0 };
+      if (!compose && inputMessages.some((message) => typeof message !== "string" || message.length === 0))
         return { ok: false, error: { name: "InvalidInput", message: "messages must be non-empty strings" }, sent: [], failedAt: 0 };
       if (input.mode && input.mode !== "element" && input.mode !== "raw")
         return { ok: false, error: { name: "InvalidInput", message: `mode must be "element" or "raw"` }, sent: [], failedAt: 0 };
       const mode = input.mode ?? "element";
-      const messages = await polishedMessages(polish, input, execution.messages, execution.abortSignal);
+      const messages = compose
+        ? await composedMessages(polish, input, execution.messages, execution.abortSignal)
+        : await polishedMessages(polish, input, execution.messages, execution.abortSignal);
+      if (!messages)
+        return {
+          ok: false,
+          error: { name: "CompositionUnavailable", message: "No valid composed reply; no facts, intent or draft were sent" },
+          sent: [],
+          failedAt: 0,
+        };
       const total = messages.length;
       const sent: string[] = [];
+      const deliveredMessages: string[] = [];
+      const recordBody = compose || polish !== undefined;
       let elapsed = 0;
       const abort = (index: number, error: { name: string; message: string }): SendMessageOutput => {
         onFailed?.({ channelId: target, turnId: execution.turnId, failedAt: index, total, error });
-        return { ok: false, error, sent, failedAt: index };
+        return { ok: false, error, sent, failedAt: index, ...(recordBody ? { deliveredMessages } : {}) };
       };
       for (const [index, message] of messages.entries()) {
         try {
+          if (compose && polish?.isCurrent && !polish.isCurrent(messages))
+            return abort(index, { name: "CompositionUnavailable", message: "Polisher capability changed before delivery" });
+          const before = sent.length;
           const segments = mode === "raw" ? [[h.text(message)]] : await prepareOutputSegments(parseReply(message), resources, execution.abortSignal);
           for (const segment of segments) {
             if (sent.length > 0) {
@@ -176,10 +227,17 @@ export function createSendMessageTool(options: SendMessageToolOptions): AgentToo
               elapsed += Math.max(delay, Date.now() - startedAt);
             }
             if (execution.abortSignal?.aborted) return abort(index, { name: "AbortError", message: "send_message aborted" });
+            if (compose && polish?.isCurrent && !polish.isCurrent(messages))
+              return abort(index, { name: "CompositionUnavailable", message: "Polisher capability changed before delivery" });
             const ids = await bot.sendMessage(target, segment);
+            if (recordBody && (!ids.length || ids.some((id) => typeof id !== "string" || !id.length)))
+              return abort(index, { name: "DeliveryUnconfirmed", message: "Platform returned no valid delivery proof for a complete segment" });
             sent.push(...ids);
             for (const id of ids) onDelivered?.({ channelId: target, messageId: id, turnId: execution.turnId, text: message });
           }
+          if (recordBody && sent.length === before)
+            return abort(index, { name: "DeliveryUnconfirmed", message: "Message produced no complete delivered segment" });
+          if (sent.length > before) deliveredMessages.push(message);
         } catch (cause) {
           if (cause instanceof ResourceReadError) return abort(index, { name: cause.code, message: cause.message });
           return abort(index, {
@@ -188,7 +246,7 @@ export function createSendMessageTool(options: SendMessageToolOptions): AgentToo
           });
         }
       }
-      return { ok: true, messageIds: sent, count: total };
+      return { ok: true, messageIds: sent, count: total, ...(recordBody ? { deliveredMessages } : {}) };
     },
   };
 }
@@ -371,10 +429,10 @@ export function createContextWorkspaceTools(workspace: ContextWorkspace): AgentT
         anyOf: [{ required: ["blockId"] }, { required: ["compartmentId"] }],
         additionalProperties: false,
       }),
-      execute: (input: ContextLoadInput & { compartmentId?: string; offset?: number }) =>
+      execute: (input: ContextLoadInput & { compartmentId?: string; offset?: number }, execution) =>
         run(() => {
           if (input.offset) throw new ContextSourceError("LegacyOffsetUseCursor");
-          return workspace.load({ ...input, blockId: input.blockId ?? input.compartmentId ?? "" });
+          return workspace.load({ ...input, blockId: input.blockId ?? input.compartmentId ?? "" }, execution.abortSignal);
         }),
     },
     {
@@ -420,7 +478,7 @@ export function createExpandCompartmentTool(conversation: Conversation): AgentTo
   return {
     name: "ctx_expand",
     description:
-      "只读展开当前频道会话中的一个历史 compartment。只能使用压缩历史中明确给出的 compartmentId；按 offset/limit 分页读取原始对话，不调用模型、不修改会话。未知 ID、跨频道 ID 或没有原始边界时返回错误。",
+      "只读展开当前频道会话中的一个历史 compartment。只能使用压缩历史中明确给出的 compartmentId；按 offset/limit 分页读取历史；开启 assistantAsFacts 时只返回辅助模型提取的助手客观记录，不补回台词、不修改原始会话。未知 ID、跨频道 ID 或没有原始边界时返回错误。",
     inputSchema: jsonSchema<ExpandCompartmentInput>({
       type: "object",
       properties: {
@@ -431,9 +489,9 @@ export function createExpandCompartmentTool(conversation: Conversation): AgentTo
       required: ["compartmentId"],
       additionalProperties: false,
     }),
-    execute: async (input) => {
+    execute: async (input, execution) => {
       try {
-        const result = await conversation.expandCompartment(input.compartmentId, { offset: input.offset, limit: input.limit });
+        const result = await conversation.expandCompartment(input.compartmentId, { offset: input.offset, limit: input.limit, signal: execution.abortSignal });
         return { ok: true as const, ...result };
       } catch (cause) {
         return {
@@ -480,7 +538,8 @@ export function createDescribeImageTool(model: LanguageModel, resources: Channel
   };
 }
 
-function sendMessageDescription(innerThought: boolean, factsRequired: boolean): string {
+function sendMessageDescription(innerThought: boolean, factsRequired: boolean, compose = false): string {
+  if (compose) return composeSendMessageDescription(innerThought);
   return `向频道发送文字或消息元素。你的普通文本输出不会被发送；调用本工具才能发送 messages 中的内容。其他实际提供的发送工具可以发送它们各自支持的内容。
 
 ${factsRequired ? "调用后生成真正展示给用户的消息，可以针对某个用户或所有用户回复；只写在普通文本输出里的内容不会被送达。\n\n" : ""}# 参数
@@ -571,15 +630,78 @@ async function polishedMessages(
   currentTurnMessages: readonly AgentMessage[],
   signal: AbortSignal | undefined,
 ): Promise<readonly string[]> {
-  if (!polish) return input.messages;
+  if (!polish) return input.messages ?? [];
   try {
     const turnContext = buildPolisherTurnContext(currentTurnMessages);
     return (
-      validatePolishedMessages(input.messages, await polish({ facts: input.facts ?? [], messages: input.messages, turnContext, signal })) ?? input.messages
+      validatePolishedMessages(input.messages ?? [], await polish({ facts: input.facts ?? [], messages: input.messages ?? [], turnContext, signal })) ??
+      input.messages ??
+      []
     );
   } catch {
-    return input.messages;
+    return input.messages ?? [];
   }
+}
+
+function validComposeInput(input: SendMessageInput): boolean {
+  const validStrings = (value: unknown, max: number) =>
+    Array.isArray(value) && value.length <= max && value.every((text) => typeof text === "string" && text.trim().length > 0);
+  return (
+    input.messages === undefined &&
+    validStrings(input.facts, 64) &&
+    typeof input.intent === "string" &&
+    input.intent.trim().length > 0 &&
+    input.intent.length <= 2000 &&
+    (input.verbatim === undefined || validStrings(input.verbatim, 12)) &&
+    Buffer.byteLength(JSON.stringify([input.facts, input.intent, input.verbatim]), "utf8") <= MAX_COMPOSE_BYTES
+  );
+}
+
+async function composedMessages(
+  polish: SendMessageToolOptions["polish"],
+  input: SendMessageInput,
+  current: readonly AgentMessage[],
+  signal?: AbortSignal,
+): Promise<readonly string[] | undefined> {
+  if (!polish || signal?.aborted) return undefined;
+  try {
+    const boundedSignal = AbortSignal.any([AbortSignal.timeout(60_000), ...(signal ? [signal] : [])]);
+    const result = await withAbortSignal(
+      polish({
+        mode: "compose",
+        facts: input.facts ?? [],
+        intent: input.intent!,
+        verbatim: input.verbatim ?? [],
+        messages: [],
+        turnContext: buildPolisherTurnContext(current),
+        signal: boundedSignal,
+      }),
+      boundedSignal,
+    );
+    if (boundedSignal.aborted) return undefined;
+    return validateComposedMessages(input.facts ?? [], input.verbatim ?? [], result);
+  } catch {
+    return undefined;
+  }
+}
+
+function composeSendMessageDescription(innerThought: boolean): string {
+  return `根据客观信息和交流动作生成并发送角色回复。你负责逻辑判断、信息准确性和工具执行，不负责角色措辞或分条；独立润色模型携带当前完整人设自主组织消息。普通文本不会被发送。
+
+## facts / intent / verbatim
+facts 是本次拟对外表达的信息点；保留数量、对象、条件、否定、承诺及不确定性，不写风格草稿、口癖或夸张台词。没有事实信息时可以为空。
+intent 描述本次交流动作和必要约束（回答、确认、拒绝、澄清等），不是已写好的回复。不能把未完成操作说成已经完成，不把推测当事实。
+verbatim 可选，仅用于必须逐字发送的代码、命令、精确引用或消息资源元素，不能用它绕过事实模式提交角色草稿。
+润色阶段只组织自然表达与 messages 分条，不得添加事实、承诺或外部动作。生成失败时返回失败，不发送 facts/intent，也不自动回退主模型写台词。
+
+## channel / mode / continue
+channel 留空使用当前频道；OneBot 群频道使用裸群号而非 group: 前缀，私聊使用 private:<账号>。
+mode=raw 逐字发送纯文本；mode=element（默认）解析元素。代码和命令通常用 raw，并放入 verbatim。元素如 <at id="用户ID"/>、<quote id="消息ID"/>、<img src="资源URI"/>、<file src="资源URI"/> 放入 verbatim，URI 必须已经由工具或上下文确认存在。其他非元素文本的 <、>、& 要转义，或使用 raw。
+continue 默认 false 发送后结束；true 继续下一步。还要调用工具或其他发送能力时，必须在此调用前设为 true；多个生成的消息会在一次调用中顺序发送。
+${innerThought ? "inner_thought 只记录私有的简短行为判断，不发送给润色模型或平台，不写角色台词。" : ""}
+
+成功返回 {ok:true,messageIds,count,deliveredMessages}，count 是实际生成的消息条数。
+失败返回 {ok:false,error,sent,failedAt,deliveredMessages?}，failedAt 是生成消息的下标，deliveredMessages 仅包含完整送达的项目；已部分发送时不得重新生成或整批重发。`;
 }
 
 function pacedDelay(segment: readonly Element[], pacing: PacingConfig, elapsed: number): number {

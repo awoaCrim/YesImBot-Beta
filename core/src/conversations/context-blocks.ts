@@ -6,7 +6,7 @@ import { resolveLatestCompactBoundary } from "./boundary.js";
 import { compactSourceTimestamp, renderVisibleUserRecords, validateContinuityEntryData, type CompressionRecord } from "./compact.js";
 import { recallTerms } from "./fragment-store.js";
 import { MAX_CONTEXT_REGION_SOURCE_BYTES, renderContextRegionSource, validateContextRegionData, type ContextRegionEntry } from "./historian.js";
-import { collectDeliveredSourceRecords } from "./internal-history.js";
+import { collectAssistantSourceProofs, collectDeliveredSourceRecords } from "./internal-history.js";
 
 export type CompactEntry = Extract<AgentEntry, { type: "compact" }>;
 
@@ -76,7 +76,14 @@ export class ContextBlockStore {
   private sessionId: string | undefined;
   private epoch = 0;
 
-  public constructor(private readonly snapshot: () => Promise<ContextSourceSnapshot>) {}
+  public constructor(
+    private readonly snapshot: () => Promise<ContextSourceSnapshot>,
+    private readonly projectRecords?: (
+      records: readonly CompressionRecord[],
+      entries: readonly AgentEntry[],
+      signal?: AbortSignal,
+    ) => Promise<readonly CompressionRecord[]>,
+  ) {}
 
   public invalidate(): void {
     this.epoch += 1;
@@ -124,7 +131,9 @@ export class ContextBlockStore {
     input: { blockId: string; cursor?: string; limit?: number },
     maxBytes: number,
     excludeIds: ReadonlySet<string> = new Set(),
+    signal?: AbortSignal,
   ): Promise<ContextBlockPage> {
+    if (signal?.aborted) throw new ContextSourceError("CancelledContextRead");
     const pendingEpoch = this.epoch;
     const snapshot = await this.snapshot();
     this.checkEpoch(pendingEpoch);
@@ -170,10 +179,16 @@ export class ContextBlockStore {
     if (range.some((entry) => excludeIds.has(entry.id))) throw new ContextSourceError("ActiveTurnSource");
     if (new Set(range.map((entry) => entry.id)).size !== range.length) throw new ContextSourceError("AmbiguousRawSource");
     const rangeIds = new Set(range.map((entry) => entry.id));
-    const records = safeSourceRecords(entries).filter((record) => rangeIds.has(record.entryId));
+    const originals = safeSourceRecords(entries).filter((record) => rangeIds.has(record.entryId));
+    const records = this.projectRecords ? await this.projectRecords(originals, entries, signal) : originals;
+    this.checkEpoch(sourceEpoch);
+    if (signal?.aborted) throw new ContextSourceError("CancelledContextRead");
     // A send receipt can lie outside the range. Bind cursors to the verified readable
     // projection too, so changing that evidence cannot reuse old text offsets.
-    const fingerprint = hash(JSON.stringify([rangeFingerprint(range), records]));
+    const proofs = collectAssistantSourceProofs(entries);
+    const fingerprint = hash(
+      JSON.stringify([rangeFingerprint(range), originals, [...rangeIds].map((id) => [id, proofs.get(id)]), ...(this.projectRecords ? [records] : [])]),
+    );
     let recordIndex = 0;
     let offset = 0;
     if (input.cursor) {

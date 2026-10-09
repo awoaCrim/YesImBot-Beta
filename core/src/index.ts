@@ -18,6 +18,7 @@ export type {
   MainAgentRoleProfile,
   MainAgentRoleProvider,
   MessagePolisherCapability,
+  PolisherMode,
   PolisherPromptProfile,
   PolisherRequest,
   PolisherTurnContext,
@@ -31,7 +32,17 @@ export type {
   WillState,
 } from "./agents/index.js";
 
-export { createSendMessagePolisher, extractProtectedTokens, PolisherRegistry, validatePolishedMessages } from "./agents/index.js";
+export {
+  createSendMessagePolisher,
+  extractProtectedTokens,
+  PolisherRegistry,
+  validatePolishedMessages,
+  validateComposedMessages,
+  MAX_COMPOSE_MESSAGES,
+  MAX_COMPOSE_BYTES,
+} from "./agents/index.js";
+
+export { withAbortSignal } from "./abort.js";
 
 export type { ChannelContext, ChannelKey } from "./channels/index.js";
 

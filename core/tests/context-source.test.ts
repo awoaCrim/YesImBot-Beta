@@ -175,7 +175,7 @@ describe("verified source catalogue and pagination", () => {
     expect((await store.page({ blockId: "c1" }, 1000)).records.map((record) => record.text)).toEqual(["u1", "u2"]);
   });
   it("invalidates pagination when delivery evidence outside the compact range changes", async () => {
-    const spoken = speech("send", ["public".repeat(1000)], { ok: true, count: 1 });
+    const spoken = speech("send", ["public".repeat(1000)], { ok: true, count: 1, messageIds: ["id"] });
     const c = compact("c1", { firstEntryId: "send_call", lastEntryId: "send_call" });
     let entries = [...spoken, c];
     const store = new ContextBlockStore(async () => snapshot(entries));
@@ -211,7 +211,7 @@ describe("public source records", () => {
     const entries = [
       user("u1", "user public"),
       createEntry("message", { id: "system", timestamp: 1, role: "system", content: "PRIVATE system" }),
-      ...speech("ok", ["public<inner_thought>PRIVATE thought</inner_thought><img src='artifact://secret'/>"], { ok: true, count: 1 }),
+      ...speech("ok", ["public<inner_thought>PRIVATE thought</inner_thought><img src='artifact://secret'/>"], { ok: true, count: 1, messageIds: ["id"] }),
       ...speech("failed", ["PRIVATE failed"], { ok: false, sent: [], failedAt: 0 }),
       ...speech("unknown", ["PRIVATE unproven"]),
     ];
@@ -226,7 +226,7 @@ describe("public source records", () => {
   it("uses successful input count and completed partial boundary, not platform ID count as a message index", () => {
     const records = safeSourceRecords([
       ...speech("ok", ["a", "b"], { ok: true, count: 2, messageIds: ["one", "two", "three"] }),
-      ...speech("partial", ["c", "d", "PRIVATE failed"], { ok: false, sent: ["one"], failedAt: 2 }),
+      ...speech("partial", ["c", "d", "PRIVATE failed"], { ok: false, sent: ["one", "two", "extra-segment"], failedAt: 2 }),
     ]);
     expect(records.map((record) => record.text)).toEqual(["a", "b", "c", "d"]);
   });
@@ -238,6 +238,8 @@ describe("public source records", () => {
   });
   it.each([
     { ok: true, count: 0 },
+    { ok: true, count: 1 },
+    { ok: false, sent: ["id"], failedAt: 2 },
     { ok: true, count: 1, messageIds: [] },
     { ok: true, count: 9 },
     { ok: false, sent: ["id"], failedAt: 0 },
@@ -247,14 +249,14 @@ describe("public source records", () => {
     expect(safeSourceRecords(speech("bad", ["PRIVATE uncertain"], proof))).toEqual([]);
   });
   it("does not trust a receipt before its call or malformed control markup", () => {
-    const entries = speech("reversed", ["PRIVATE future"], { ok: true, count: 1 });
+    const entries = speech("reversed", ["PRIVATE future"], { ok: true, count: 1, messageIds: ["id"] });
     expect(safeSourceRecords([...entries].reverse())).toEqual([]);
-    expect(safeSourceRecords(speech("markup", ["<inner_thought>PRIVATE unclosed"], { ok: true, count: 1 }))).toEqual([]);
+    expect(safeSourceRecords(speech("markup", ["<inner_thought>PRIVATE unclosed"], { ok: true, count: 1, messageIds: ["id"] }))).toEqual([]);
     expect(safeSourceRecords(speech("ids", ["PRIVATE malformed"], { ok: true, messageIds: [null] }))).toEqual([]);
     expect(safeSourceRecords(speech("count", ["PRIVATE malformed"], { ok: true, count: -1, messageIds: ["id"] }))).toEqual([]);
   });
   it("denies duplicate calls or receipts instead of picking one", () => {
-    const entries = speech("duplicate", ["PRIVATE duplicate"], { ok: true, count: 1 });
+    const entries = speech("duplicate", ["PRIVATE duplicate"], { ok: true, count: 1, messageIds: ["id"] });
     expect(safeSourceRecords([...entries, entries[0]!])).toEqual([]);
     expect(safeSourceRecords([...entries, entries[1]!])).toEqual([]);
   });
