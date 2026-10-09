@@ -1,6 +1,6 @@
 # Main-Agent prompt ownership
 
-This document describes the normal, non-polished Agent path. Message-polisher execution, auxiliary-model selection, history storage and provider projection are not redesigned by this change.
+This document describes normal main-Agent ownership and its optional delegated expression paths. History extraction and delivery evidence have separate Core-owned contracts; neither requires editing Persona/card content.
 
 ## Model-visible layout
 
@@ -54,6 +54,18 @@ Edit the primary role document to change identity/personality/voice. Edit supple
 Core's prompts and tools are frozen for the runtime lifetime. Plugin registration changes participate in runtime invalidation; editing prompt files alone is not a per-turn hot-reload contract. After reviewing and backing up actual files, recreate the affected runtime through the established service lifecycle. No production files are migrated or deployed automatically by this refactor.
 
 See [the Anon reference draft](./prompts/chihaya-anon/README.md) for a full primary Persona plus minimal supplementary card fields. It is deliberately opt-in, not a copy of current production data.
+
+## Optional facts-driven expression and history
+
+The message-polisher plugin has `mode: rewrite | compose`, default **rewrite** for existing configurations. Both delegated paths remove Persona/card material from main; operator AGENTS, execution/evidence/security policy and tools remain. Rewrite keeps facts plus a same-count draft and original-draft fallback. Compose main only supplies outward facts, an exchange intent and optional exact verbatim payload; it does not draft role dialogue or control bubble organization. The dedicated expression model receives the complete live Persona/card and chooses 1–12 messages within 32 KiB. Failures send nothing: never dump facts/intent or switch back to main-generated dialogue. Core retains targets/raw-element/continue and checks accepted capability/profile revision again before delivery.
+
+The live expression profile uses the same custom/default/card-only precedence as normal assembly. A standalone card must not receive fallback Athena alongside it. Main delegated assembly does not read PERSONA at all; the send profile does. The reference context is bounded **current-turn** user and sanitized non-send tool output, not private reasoning, assistant tool arguments or full history. Token checks protect outward numeric/mention/resource/element anchors plus exact verbatim, not all incidental reference text. Natural-language equivalence remains model-guided.
+
+Separately, enable Core `session.compact.assistantAsFacts: true` with `auxiliaryModel` to remove historical own dialogue exemplars from every retained window. The utility route extracts assistant-attributed objective records; missing models, invalid output, cancellation or oversize sources yield unavailable metadata, never original-text fallback or a main-model call. Existing summaries are not migrated. Original JSONL, other user speech and active signed tool continuations remain untouched. New compression/continuity and explicit expansion consume the same proof-bound cached factual view; page offsets refer to that view.
+
+Polished receipts record actual **complete** delivered bodies rather than a draft. Partial failed items or segments without valid platform IDs cannot become proven full replies. Historical native new receipts use a transcript without rewriting signed call arguments. Disabling factual history restores legacy projection; the older compartment policy still excludes assistant when its inclusion option is false, while actual-body receipts remain authoritative wherever speech is rendered.
+
+Both features add model cost/latency and are opt-in. See [message-polisher configuration](../plugins/message-polisher/README.md). No production settings, role files or old history are changed automatically.
 
 ## Verification limits
 

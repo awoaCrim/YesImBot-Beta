@@ -34,7 +34,7 @@ export interface AgentPlugin {
   init?(runtime: AgentPluginRuntime): Awaitable<void>;
   stop?(): Awaitable<void>;
   onAppend?(entries: AgentEntry[], context: AppendHookContext): Awaitable<AgentEntry[] | void>;
-  transformEntries?(entries: readonly AgentEntry[]): Awaitable<AgentEntry[] | void>;
+  transformEntries?(entries: readonly AgentEntry[], context?: EntryTransformContext): Awaitable<AgentEntry[] | void>;
   /** @deprecated Define an explicit cache lifecycle before adding historical projection behavior. */
   transformMessages?(messages: AgentMessage[], context: MessageTransformContext): Awaitable<AgentMessage[]>;
   toModelMessages?(message: AgentMessage, context: ModelMessageContext): Awaitable<ModelMessage[] | ModelMessage | void>;
@@ -58,6 +58,11 @@ export interface HookContextBase {
 
 export interface AppendHookContext extends HookContextBase {
   readonly storage: AgentStorage;
+}
+
+/** Cancellation and turn identity for request-only historical entry transformations. */
+export interface EntryTransformContext extends HookContextBase {
+  readonly turnId?: string;
 }
 
 export interface MessageTransformContext extends HookContextBase {
@@ -112,7 +117,7 @@ export interface PluginHostRuntime extends AgentPluginRuntime {
 
 export interface PluginHostHelpers {
   onAppend(entries: AgentEntry[], context: AppendHookContext): Promise<AgentEntry[]>;
-  transformEntries(entries: readonly AgentEntry[]): Promise<readonly AgentEntry[]>;
+  transformEntries(entries: readonly AgentEntry[], context?: EntryTransformContext): Promise<readonly AgentEntry[]>;
   transformMessages(messages: AgentMessage[], context: MessageTransformContext): Promise<AgentMessage[]>;
   toModelMessages(message: AgentMessage, context: ModelMessageContext): Promise<ModelMessage[]>;
   prepareStep(messages: readonly ModelMessage[], context: PrepareStepContext): Promise<readonly ModelMessage[]>;
@@ -214,15 +219,16 @@ export function createPluginHost(options: { plugins: readonly AgentPlugin[]; run
       return current;
     },
 
-    async transformEntries(entries) {
+    async transformEntries(entries, context) {
       let current: readonly AgentEntry[] = entries;
+      const hookContext = context ?? { runtime: { id: options.runtime.id }, channel: options.runtime.channel, state: options.runtime.state };
 
       for (const plugin of activePlugins) {
         const hook = plugin?.transformEntries?.bind(plugin);
         if (!hook) continue;
 
         try {
-          const next = await hook(current);
+          const next = await hook(current, hookContext);
           if (next) current = next;
         } catch (error) {
           emitPluginError(plugin.name, error);

@@ -442,7 +442,8 @@ export function createAgent(config: AgentConfig): Agent {
           timestamp: entry.timestamp,
         });
     }
-    const projectedHistory = historyMode === "event" ? [] : await pluginHost.helpers.transformEntries(historicalEntries);
+    const projectedHistory =
+      historyMode === "event" ? [] : await pluginHost.helpers.transformEntries(historicalEntries, { runtime: { id }, channel, state, turnId, signal });
 
     // A projection may deliberately reorder persisted history (for example, moving a compact
     // summary before the retained tail). Keep that projected order intact, then append raw entries

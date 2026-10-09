@@ -14,6 +14,7 @@ import type { LanguageModel } from "ai";
 
 import type { MessageRecord } from "../messages/index.js";
 import { requestUnits } from "../runtimes/context-budget.js";
+import { AssistantHistoryFacts, type HistoryFactsModel } from "./assistant-facts.js";
 import { resolveLatestCompactBoundary } from "./boundary.js";
 import {
   compactSourceTimestamp,
@@ -35,6 +36,7 @@ import {
   resolveCompactAlias,
   resolveCompactSource,
   resolveContextRegionSource,
+  safeSourceRecords,
   validatedContextRegions,
   type CompactEntry,
   type ContextSourceSnapshot,
@@ -49,6 +51,7 @@ import {
   type ContextRegionEntry,
   type FrozenContextRegion,
 } from "./historian.js";
+import { collectActualDeliveredSourceRecords } from "./internal-history.js";
 
 const DEFAULT_COMPARTMENT_MESSAGES = 20;
 const DEFAULT_COMPARTMENT_CHARS = 12_000;
@@ -97,7 +100,7 @@ export interface ConversationCompactConfig {
   chunkMessages?: number;
   /** Maximum rendered source characters per compartment. */
   chunkChars?: number;
-  /** Include assistant output as objective facts in compartment input. */
+  /** Neutralize all retained own speech, compaction and explicit expansion via auxiliaryModel. */
   assistantAsFacts?: boolean;
   threshold?: number;
   charTokenRatio?: number;
@@ -106,6 +109,7 @@ export interface ConversationCompactConfig {
 export interface CompartmentExpansionOptions {
   readonly offset?: number;
   readonly limit?: number;
+  readonly signal?: AbortSignal;
 }
 
 export interface CompartmentExpansionResult {
@@ -119,6 +123,8 @@ export interface CompartmentExpansionResult {
 }
 
 export interface ConversationOptions {
+  /** Resolves only the configured auxiliary route for opt-in historical facts. */
+  readonly resolveHistoryFactsModel?: () => HistoryFactsModel;
   /** Magic archives carry verified local regions and uncovered raw history without whole compaction. */
   readonly magicContext?: boolean;
   /** Channel scope key used to isolate persisted fragments. */
@@ -156,6 +162,7 @@ interface ReadSession {
 }
 
 export class Conversation {
+  public readonly historyFacts: AssistantHistoryFacts | undefined;
   private readonly root: string;
   private readonly compactConfig: ConversationCompactConfig;
   private readonly options: ConversationOptions;
@@ -166,6 +173,7 @@ export class Conversation {
   private initializing: Promise<void> | undefined;
   private storageGenerationValue = 0;
   private readonly frozenRegions = new WeakSet<FrozenContextRegion>();
+  private readonly frozenFactProofs = new WeakMap<FrozenContextRegion, ReadonlyMap<string, string>>();
   private failures = 0;
   private readonly compactSourceIndex = new Map<
     string,
@@ -177,6 +185,13 @@ export class Conversation {
     this.compactConfig = compactConfig;
     this.options = options;
     this.inlineFragments = Math.max(1, Math.floor(compactConfig.inlineFragments ?? 3));
+    this.historyFacts =
+      compactConfig.assistantAsFacts === true
+        ? new AssistantHistoryFacts({
+            scope: () => `${this.currentSessionId()}:${this.storageGeneration}`,
+            resolveModel: options.resolveHistoryFactsModel,
+          })
+        : undefined;
   }
 
   public get storage(): AgentStorage<AgentEntry> {
@@ -187,6 +202,7 @@ export class Conversation {
       clear: () =>
         this.mutateStorage(async () => {
           this.storageGenerationValue += 1;
+          this.historyFacts?.clear();
           await this.currentStorage().clear();
         }),
     };
@@ -210,6 +226,19 @@ export class Conversation {
     return this.storageGenerationValue;
   }
 
+  public projectAssistantRecords(
+    records: readonly CompressionRecord[],
+    signal?: AbortSignal,
+    proofs?: ReadonlyMap<string, string>,
+  ): Promise<readonly CompressionRecord[]> {
+    return this.historyFacts ? this.historyFacts.projectRecords(records, signal, proofs) : Promise.resolve(records);
+  }
+
+  public projectFrozenAssistantRecords(frozen: FrozenContextRegion, signal?: AbortSignal): Promise<readonly CompressionRecord[]> {
+    if (!this.frozenRegions.has(frozen)) throw new Error("InvalidContextRegionSource");
+    return this.projectAssistantRecords(frozen.records, signal, this.frozenFactProofs.get(frozen));
+  }
+
   /** A short canonical read; auxiliary generation happens after this mutation queue is released. */
   public async freezeContextRegion(sourceEntryIds: readonly string[]): Promise<FrozenContextRegion> {
     const sourceIds = [...sourceEntryIds];
@@ -229,6 +258,7 @@ export class Conversation {
         records: Object.freeze(source.records.map((record) => Object.freeze(record))),
       });
       this.frozenRegions.add(frozen);
+      if (this.historyFacts) this.frozenFactProofs.set(frozen, this.historyFacts.proofsForEntries(entries));
       return frozen;
     });
   }
@@ -539,7 +569,15 @@ export class Conversation {
         return { entry: first, reused: true };
       }
 
-      const sourceChunks = renderContinuitySourceChunks(sourceEntries);
+      const sourceChunks = renderContinuitySourceChunks(sourceEntries, {
+        deliveredRecords: collectActualDeliveredSourceRecords(entries),
+        ...(this.historyFacts
+          ? {
+              assistantAsFacts: true,
+              assistantFacts: await this.historyFacts.factsForEntries(entries, input.signal),
+            }
+          : {}),
+      });
       if (sourceChunks.length === 0) throw new Error("ContinuitySourceUnavailable");
       const drafts = [];
       for (const content of sourceChunks) drafts.push(await executeContinuity({ model: input.model, conversation: content, signal: input.signal }));
@@ -640,10 +678,16 @@ export class Conversation {
     return candidates.slice(0, limit).map(({ entry }) => entry);
   }
 
-  /** Expands one compartment's canonical raw source without calling a model or writing storage. */
+  /** Expands canonical source read-only; opt-in own speech uses bounded auxiliary factual views. */
   public async expandCompartment(compartmentId: string, options: CompartmentExpansionOptions = {}): Promise<CompartmentExpansionResult> {
     if (!this.storagePathValue) throw new Error("Conversation has not been initialized");
+    const generation = this.storageGenerationValue;
+    const check = () => {
+      if (options.signal?.aborted) throw new Error("CancelledContextRead");
+      if (generation !== this.storageGenerationValue) throw new Error("StaleContextRead");
+    };
     await this.storageTail;
+    check();
     if (typeof compartmentId !== "string" || compartmentId.trim().length === 0) throw new Error("Compartment ID must be a non-empty string");
     const offset = options.offset ?? 0;
     if (!Number.isInteger(offset) || offset < 0) throw new Error("Compartment expansion offset must be a non-negative integer");
@@ -655,19 +699,26 @@ export class Conversation {
     const region = (await validatedContextRegions(snapshot)).find((entry) => entry.id === compartmentId);
     if (region) {
       const source = await resolveContextRegionSource(snapshot, region);
-      const entries = source.records.slice(offset, offset + limit);
+      const records = await this.projectAssistantRecords(source.records, options.signal, this.historyFacts?.proofsForEntries(source.entries));
+      check();
+      const entries = records.slice(offset, offset + limit);
       return {
         compartmentId: region.id,
         label: "historical region",
         offset,
         limit,
-        total: source.records.length,
+        total: records.length,
         entries,
-        ...(offset + entries.length < source.records.length ? { nextOffset: offset + entries.length } : {}),
+        ...(offset + entries.length < records.length ? { nextOffset: offset + entries.length } : {}),
       };
     }
     const source = await resolveCompactSource(snapshot, compartmentId);
-    const records = source.range.flatMap(renderCompressionRecords);
+    const actual = collectActualDeliveredSourceRecords(source.entries);
+    const originalRecords = this.historyFacts
+      ? safeSourceRecords(source.entries).filter((record) => source.range.some((entry) => entry.id === record.entryId))
+      : source.range.flatMap((entry) => actual.get(entry.id) ?? renderCompressionRecords(entry));
+    const records = await this.projectAssistantRecords(originalRecords, options.signal, this.historyFacts?.proofsForEntries(source.entries));
+    check();
     const entries = records.slice(offset, offset + limit);
     const nextOffset = offset + entries.length < records.length ? offset + entries.length : undefined;
     return {
@@ -693,7 +744,12 @@ export class Conversation {
     const messages = sourceForCompaction.filter((entry) => entry.type === "message");
     if (!input.force && messages.length < this.compactConfig.minMessages) return { compacted: false, reason: "minimum_messages" };
     if (messages.length === 0) return { compacted: false, reason: "empty_input" };
-    const content = filterEntriesForCompression(sourceForCompaction, { assistantAsFacts: this.compactConfig.assistantAsFacts });
+    const assistantFacts = await this.historyFacts?.factsForEntries(entries, input.signal);
+    const content = filterEntriesForCompression(sourceForCompaction, {
+      assistantAsFacts: this.compactConfig.assistantAsFacts,
+      assistantFacts,
+      deliveredRecords: collectActualDeliveredSourceRecords(entries),
+    });
     if (!content) return { compacted: false, reason: "empty_input" };
     try {
       // Only raw entries after the latest boundary are summarized. The previous summary is never
@@ -754,6 +810,9 @@ export class Conversation {
     if (!input.force && messages.length < this.compactConfig.minMessages) return { compacted: false, reason: "minimum_messages" };
     if (messages.length === 0) return { compacted: false, reason: "empty_input" };
 
+    const canonical = await this.readStorage();
+    const assistantFacts = await this.historyFacts?.factsForEntries(canonical, input.signal);
+    const deliveredRecords = collectActualDeliveredSourceRecords(canonical);
     const chunks = buildCompactionChunks(sourceForCompaction, {
       maxMessages: this.compactConfig.chunkMessages ?? DEFAULT_COMPARTMENT_MESSAGES,
       maxChars: this.compactConfig.chunkChars ?? DEFAULT_COMPARTMENT_CHARS,
@@ -762,7 +821,12 @@ export class Conversation {
     let parentCompactId = boundary?.compact.id;
     let lineageId = boundary?.compact.data.lineageId ?? parentCompactId;
     for (const [chunkIndex, chunk] of chunks.entries()) {
-      const content = filterEntriesForCompression(chunk.entries, { mode: "compartment", assistantAsFacts: this.compactConfig.assistantAsFacts });
+      const content = filterEntriesForCompression(chunk.entries, {
+        mode: "compartment",
+        assistantAsFacts: this.compactConfig.assistantAsFacts,
+        assistantFacts,
+        deliveredRecords,
+      });
       if (!content) continue;
       try {
         const summary = (
@@ -819,6 +883,7 @@ export class Conversation {
 
   private setStorage(path: string): void {
     this.storageGenerationValue += 1;
+    this.historyFacts?.clear();
     this.storagePathValue = path;
     this.fileStorageValue = createJsonlStorage(path);
   }

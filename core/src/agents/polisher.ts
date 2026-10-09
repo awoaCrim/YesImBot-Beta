@@ -1,11 +1,23 @@
 import type { Awaitable, Logger } from "koishi";
 
+import { withAbortSignal } from "../abort.js";
 import type { ChannelContext } from "../channels/index.js";
+
+export const MAX_COMPOSE_MESSAGES = 12;
+
+export const MAX_COMPOSE_BYTES = 32 * 1024;
 
 // Structural element tags, resource URIs, @ mentions, and numeric expressions must survive a
 // rewrite exactly. This is a conservative token check, not a proof of semantic equivalence.
 const PROTECTED_TOKEN_PATTERN =
   /<\/?[a-z][a-z0-9-]*\b[^<>]*>|[a-z][a-z0-9+.-]*:\/\/[^\s<>"'()[\]{}，。！？；：、]+|@[\p{L}\p{N}\p{M}_.-]+|[+\-−]?\d+(?:[.,，．/／]\d+)*(?:[%％])?/giu;
+
+export type PolisherMode = "rewrite" | "compose";
+
+export type SendMessagePolisher = ((request: PolisherSendRequest) => Promise<readonly string[] | undefined>) & {
+  /** Checked again at the actual compose sender boundary after asynchronous resource work. */
+  readonly isCurrent?: (messages?: readonly string[]) => boolean;
+};
 
 /** The complete bounded current-turn reference passed to the independent polisher. */
 export type PolisherTurnContext = readonly PolisherTurnEntry[];
@@ -35,8 +47,11 @@ export interface PolisherTurnEntry {
   readonly toolName?: string;
 }
 
-/** Explicit facts, current-turn reference data, and the main Agent's draft. */
+/** Rewrite receives a draft; compose receives outward facts/intent and no drafted dialogue. */
 export interface PolisherRequest {
+  readonly mode?: PolisherMode;
+  readonly intent?: string;
+  readonly verbatim?: readonly string[];
   readonly facts: readonly string[];
   readonly messages: readonly string[];
   readonly profile: PolisherPromptProfile;
@@ -49,6 +64,8 @@ export interface PolisherRequest {
  */
 export interface MessagePolisherCapability {
   readonly name: string;
+  /** Missing mode retains the third-party rewrite contract. */
+  readonly mode?: PolisherMode;
   polish(request: PolisherRequest, context: ChannelContext, signal?: AbortSignal): Awaitable<readonly string[] | undefined>;
 }
 
@@ -62,9 +79,19 @@ export interface PolisherRegistryOptions {
   readonly logger?: Logger;
 }
 
+export interface PolisherSendRequest {
+  readonly mode?: PolisherMode;
+  readonly intent?: string;
+  readonly verbatim?: readonly string[];
+  readonly facts: readonly string[];
+  readonly messages: readonly string[];
+  readonly turnContext: PolisherTurnContext;
+  readonly signal?: AbortSignal;
+}
+
 /**
  * Core-owned capability registry. "Polisher active" means a registered capability reports itself
- * registered for the channel; auxiliary model availability is checked only when rewriting.
+ * registered for the channel; dedicated model availability is checked only when generating expression.
  */
 export class PolisherRegistry {
   private readonly capabilities = new Set<MessagePolisherCapability>();
@@ -156,28 +183,64 @@ export function validatePolishedMessages(original: readonly string[], candidate:
   return result;
 }
 
+/** Compose may organize bubbles freely, but may not change outward anchors or exact payloads. */
+export function validateComposedMessages(facts: readonly string[], verbatim: readonly string[], candidate: unknown): string[] | undefined {
+  if (
+    !Array.isArray(candidate) ||
+    !candidate.length ||
+    candidate.length > MAX_COMPOSE_MESSAGES ||
+    !candidate.every((text) => typeof text === "string" && text.trim().length > 0)
+  )
+    return undefined;
+  const messages = candidate as string[];
+  if (Buffer.byteLength(JSON.stringify(messages), "utf8") > MAX_COMPOSE_BYTES) return undefined;
+  const before = extractProtectedTokens([...facts, ...verbatim].join("\n")).sort();
+  const after = extractProtectedTokens(messages.join("\n")).sort();
+  if (before.length !== after.length || before.some((token, index) => token !== after[index])) return undefined;
+  const body = messages.join("\n");
+  if (verbatim.some((text) => !body.includes(text))) return undefined;
+  return messages;
+}
+
 /** Resolves the active capability and current prompt profile; validation belongs to the sender. */
 export function createSendMessagePolisher(input: {
   readonly registry: PolisherRegistry;
   readonly resolveProfile: () => Promise<PolisherPromptProfile>;
   readonly context: ChannelContext;
-}): (request: {
-  readonly facts: readonly string[];
-  readonly messages: readonly string[];
-  readonly turnContext: PolisherTurnContext;
-  readonly signal?: AbortSignal;
-}) => Promise<readonly string[] | undefined> {
-  return async ({ facts, messages, turnContext, signal }) => {
+  readonly capability?: MessagePolisherCapability;
+}): SendMessagePolisher {
+  const accepted = new WeakMap<readonly string[], { revision: number; capability: MessagePolisherCapability }>();
+  let latest: readonly string[] | undefined;
+  const polish: SendMessagePolisher = async ({ facts, messages, turnContext, signal, mode, intent, verbatim }) => {
     const revision = input.registry.revision;
-    const polisher = input.registry.resolve();
-    if (!polisher) return undefined;
-
-    const profile = await input.resolveProfile();
+    const polisher = input.capability ?? input.registry.resolve();
+    if (!polisher || input.registry.resolve() !== polisher || (mode ?? "rewrite") !== (polisher.mode ?? "rewrite")) return undefined;
+    const boundedSignal = mode === "compose" ? AbortSignal.any([AbortSignal.timeout(60_000), ...(signal ? [signal] : [])]) : signal;
+    if (boundedSignal?.aborted) return undefined;
+    const profile = await withAbortSignal(input.resolveProfile(), boundedSignal);
     if (input.registry.revision !== revision || input.registry.resolve() !== polisher) return undefined;
 
-    const result = await polisher.polish({ facts, messages, profile, turnContext }, input.context, signal);
-    return input.registry.revision === revision && input.registry.resolve() === polisher ? result : undefined;
+    const result = await withAbortSignal(
+      polisher.polish(
+        { facts, messages, profile, turnContext, ...(mode === "compose" ? { mode, intent, verbatim: verbatim ?? [] } : {}) },
+        input.context,
+        boundedSignal,
+      ),
+      boundedSignal,
+    );
+    if (input.registry.revision !== revision || input.registry.resolve() !== polisher || boundedSignal?.aborted) return undefined;
+    if (result) {
+      accepted.set(result, { revision, capability: polisher });
+      latest = result;
+    }
+    return result;
   };
+  return Object.assign(polish, {
+    isCurrent: (messages: readonly string[] | undefined = latest) => {
+      const snapshot = messages ? accepted.get(messages) : undefined;
+      return snapshot !== undefined && input.registry.revision === snapshot.revision && input.registry.resolve() === snapshot.capability;
+    },
+  });
 }
 
 function hasSameProtectedTokens(original: string, candidate: string): boolean {

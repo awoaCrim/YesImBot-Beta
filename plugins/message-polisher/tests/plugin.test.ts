@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const generateText = vi.hoisted(() => vi.fn());
 vi.mock("ai", async (importOriginal) => ({ ...(await importOriginal<typeof import("ai")>()), generateText }));
@@ -19,7 +19,12 @@ const request: PolisherRequest = {
   ],
 };
 
-function setup(model: unknown = { id: "polisher" }, modelId = "test:polisher") {
+afterEach(() => {
+  generateText.mockReset();
+  vi.restoreAllMocks();
+});
+
+function setup(model: unknown = { id: "polisher" }, modelId = "test:polisher", mode: "rewrite" | "compose" = "rewrite") {
   const dispose = vi.fn();
   const use = vi.fn(() => dispose);
   const resolveChatModel = vi.fn(() => {
@@ -34,7 +39,7 @@ function setup(model: unknown = { id: "polisher" }, modelId = "test:polisher") {
     on: vi.fn(),
     yesimbot: { polisher: { use }, model: { resolveChatModel, resolveAuxiliaryModel } },
   } as never;
-  const plugin = new MessagePolisherPlugin(ctx, { model: modelId, temperature: 0.4, timeoutMs: 1000 });
+  const plugin = new MessagePolisherPlugin(ctx, { model: modelId, mode, temperature: 0.4, timeoutMs: 1000 });
   return { plugin, use, dispose, resolveChatModel, resolveAuxiliaryModel };
 }
 
