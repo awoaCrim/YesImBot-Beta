@@ -26,7 +26,8 @@ const MAX_BATCHES = 4;
 const MAX_CACHE_ENTRIES = 2048;
 const MAX_CACHE_BYTES = 4 * 1024 * 1024;
 const FAILURE_BACKOFF_MS = 30_000;
-const EXTRACTION_TIMEOUT_MS = 30_000;
+/** Per-batch deadline. Batches run serially, so this must not be shared across them. */
+const EXTRACTION_TIMEOUT_MS = 60_000;
 const UNAVAILABLE: FactValue = Object.freeze({ facts: [], available: false });
 // Old recall receipts may contain pre-feature raw dialogue and bypass the objective boundary.
 const HISTORICAL_RAW_RECALL_TOOLS = new Set(["ctx_expand", "ctx_load"]);
@@ -280,21 +281,22 @@ export class AssistantHistoryFacts {
     }
     if (batch.length) batches.push(batch);
     if (!batches.length) return keys.map((key) => result.get(key) ?? UNAVAILABLE);
-    const timeout = AbortSignal.timeout(EXTRACTION_TIMEOUT_MS);
-    const abortSignal = AbortSignal.any([controller.signal, timeout, ...(signal ? [signal] : [])]);
+    // Batches are serial: a single shared deadline would let earlier batches starve later ones.
+    // Binding the deadline to the lifecycle signal keeps external cancellation immediate.
+    const stopping = AbortSignal.any([controller.signal, ...(signal ? [signal] : [])]);
     for (const records of batches.slice(0, MAX_BATCHES)) {
-      if (abortSignal.aborted || !resolved) break;
+      if (stopping.aborted || !resolved) break;
       const signature = hash(JSON.stringify(records.map(([key]) => key)));
       let pending = this.pending.get(signature);
       if (!pending) {
-        pending = this.generate(records, resolved.model, abortSignal).finally(() => {
+        pending = this.generate(records, resolved.model, AbortSignal.any([stopping, AbortSignal.timeout(EXTRACTION_TIMEOUT_MS)])).finally(() => {
           if (this.pending.get(signature) === pending) this.pending.delete(signature);
         });
         this.pending.set(signature, pending);
       }
       let values: ReadonlyMap<string, FactValue>;
       try {
-        values = await withAbortSignal(pending, AbortSignal.any([controller.signal, ...(signal ? [signal] : [])]));
+        values = await withAbortSignal(pending, stopping);
       } catch {
         break;
       }
