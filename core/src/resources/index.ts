@@ -173,27 +173,42 @@ export async function prepareOutputSegments(
   resources: ChannelResources,
   signal?: AbortSignal,
 ): Promise<Element[][]> {
-  const prepared: Element[][] = [];
+  return (await prepareOutputSegmentsWithProjection(segments, resources, signal)).map((segment) => segment.elements);
+}
+
+/** Materialized transport and its surviving public source, without expanded resource bytes. */
+export async function prepareOutputSegmentsWithProjection(
+  segments: readonly (readonly Element[])[],
+  resources: ChannelResources,
+  signal?: AbortSignal,
+): Promise<{ elements: Element[]; source: Element[] }[]> {
+  const prepared: { elements: Element[]; source: Element[] }[] = [];
   for (const segment of segments) {
     const next = await Promise.all(segment.map((element) => prepareElement(element, resources, signal)));
-    const filtered = next.filter((element): element is Element => element !== undefined);
-    if (filtered.length) prepared.push(filtered);
+    const filtered = next.filter((element) => element !== undefined);
+    if (filtered.length) prepared.push({ elements: filtered.map((value) => value.element), source: filtered.map((value) => value.source) });
   }
   return prepared;
 }
 
-export { detectImageMediaType } from "./media.js";
-export { type ImageFailureCode, formatImageFailure, imageFailureLabel, isImageFailureCode } from "./image-failure.js";
-
-async function prepareElement(element: Element, resources: ChannelResources, signal?: AbortSignal): Promise<Element | undefined> {
-  if (element.children.length)
-    return h(
-      element.type,
-      element.attrs,
-      (await Promise.all(element.children.map((child) => prepareElement(child, resources, signal)))).filter((child): child is Element => child !== undefined),
-    );
+async function prepareElement(element: Element, resources: ChannelResources, signal?: AbortSignal): Promise<{ element: Element; source: Element } | undefined> {
+  if (element.children.length) {
+    const children = (await Promise.all(element.children.map((child) => prepareElement(child, resources, signal)))).filter((child) => child !== undefined);
+    return {
+      element: h(
+        element.type,
+        element.attrs,
+        children.map((child) => child.element),
+      ),
+      source: h(
+        element.type,
+        element.attrs,
+        children.map((child) => child.source),
+      ),
+    };
+  }
   const src = element.attrs.src;
-  if (typeof src !== "string" || !RESOURCE_SOURCE.test(src) || (element.type !== "img" && element.type !== "file")) return element;
+  if (typeof src !== "string" || !RESOURCE_SOURCE.test(src) || (element.type !== "img" && element.type !== "file")) return { element, source: element };
   if (element.type === "img" && !/^asset:\/\/[a-f0-9]{32}$/.test(src)) {
     // ponytail: full 32-hex ID required for output resolution; prefix/short IDs are not resolvable
     const scheme = src.slice(0, src.indexOf(":"));
@@ -210,7 +225,7 @@ async function prepareElement(element: Element, resources: ChannelResources, sig
   const detected = detectImageMediaType(opened.bytes);
   if (element.type === "img" && !detected) return undefined;
   const mediaType = detected ?? opened.mediaType ?? "application/octet-stream";
-  return h(element.type, { ...element.attrs, src: `data:${mediaType};base64,${Buffer.from(opened.bytes).toString("base64")}` });
+  return { element: h(element.type, { ...element.attrs, src: `data:${mediaType};base64,${Buffer.from(opened.bytes).toString("base64")}` }), source: element };
 }
 
 function parseUri(value: string): URL | undefined {
@@ -245,6 +260,10 @@ function normalize(value: unknown): ResourceOpenResult {
   if (result.filename !== undefined && (result.filename.length === 0 || /[\\/\0]/.test(result.filename))) throw new Error("Invalid resource filename");
   return result as ResourceOpenResult;
 }
+
+export { detectImageMediaType } from "./media.js";
+
+export { type ImageFailureCode, formatImageFailure, imageFailureLabel, isImageFailureCode } from "./image-failure.js";
 
 export { type ArtifactOpenResult, type ArtifactStore, type ArtifactWriter } from "./artifact.js";
 

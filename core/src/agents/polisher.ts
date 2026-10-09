@@ -2,6 +2,7 @@ import type { Awaitable, Logger } from "koishi";
 
 import { withAbortSignal } from "../abort.js";
 import type { ChannelContext } from "../channels/index.js";
+import type { ReplyLayoutComposer, ReplyLayoutComposeRequest, ReplyLayoutDraft } from "./reply.js";
 
 export const MAX_COMPOSE_MESSAGES = 12;
 
@@ -67,6 +68,18 @@ export interface MessagePolisherCapability {
   /** Missing mode retains the third-party rewrite contract. */
   readonly mode?: PolisherMode;
   polish(request: PolisherRequest, context: ChannelContext, signal?: AbortSignal): Awaitable<readonly string[] | undefined>;
+  /**
+   * Explicitly versioned mixed-layout extension. A declared version greater than the supported one
+   * fails closed instead of falling back to old draft generation; an undeclared capability keeps the
+   * legacy text-array lane.
+   */
+  readonly replyLayout?: MessagePolisherReplyLayout;
+}
+
+export interface MessagePolisherReplyLayout {
+  readonly version: number;
+  supportsImages?(context: ChannelContext): boolean;
+  compose(request: ReplyLayoutComposeRequest, context: ChannelContext, signal?: AbortSignal): Awaitable<ReplyLayoutDraft | undefined>;
 }
 
 /** Supplies the current role/character prompt without injecting it into the main Agent. */
@@ -138,6 +151,26 @@ export class PolisherRegistry {
   /** Registration alone activates delegated mode; model failures cannot switch persona routing. */
   public resolve(): MessagePolisherCapability | undefined {
     return this.capabilities.values().next().value;
+  }
+
+  /** Only a supported version-1 mixed composer selects the modern B lane. */
+  public resolveComposer(channelContext?: ChannelContext): ReplyLayoutComposer | undefined {
+    const capability = this.resolve();
+    const layout = capability?.replyLayout;
+    if (!capability || !layout || layout.version !== 1) return undefined;
+    const revision = this.revision;
+    const isCurrent = () => this.revision === revision && this.resolve() === capability;
+    return {
+      name: capability.name,
+      version: 1,
+      isCurrent,
+      supportsImages: (context) => isCurrent() && layout.supportsImages?.(channelContext ?? (context as ChannelContext)) === true,
+      compose: async (request, context, signal) => {
+        if (!isCurrent() || signal?.aborted) return undefined;
+        const result = await withAbortSignal(layout.compose(request, channelContext ?? (context as ChannelContext), signal), signal);
+        return isCurrent() && !signal?.aborted ? result : undefined;
+      },
+    };
   }
 
   public async resolveProfile(context: ChannelContext): Promise<Omit<PolisherPromptProfile, "persona"> | undefined> {

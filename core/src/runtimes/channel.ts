@@ -5,6 +5,7 @@ import {
   createEntry,
   createEventEntry,
   createInternalEvent,
+  createRandomId,
   createSystemMessage,
   EphemeralImageProjectionStore,
   type Agent,
@@ -12,14 +13,18 @@ import {
   type AgentHistoryMode,
   type AgentInternalEvent,
   type AgentPlugin,
+  type AgentTool,
   type AgentToolSet,
   type TurnStepEvent,
 } from "@yesimbot/agent-runtime";
 import type { AssistantContent, LanguageModel, ModelMessage, ToolSet } from "ai";
 import { Universal, type Bot, type Context, type Logger } from "koishi";
 
+import { createImagePreviewCapability } from "../agents/image-preview.js";
 import type { MainAgentRoleProfile } from "../agents/index.js";
-import type { MessagePolisherCapability } from "../agents/polisher.js";
+import { buildPolisherTurnContext, type MessagePolisherCapability } from "../agents/polisher.js";
+import { createReplyTools, type ReplyToolSet } from "../agents/reply-tools.js";
+import type { ReplyLayoutComposer, ReplyStickerProvider } from "../agents/reply.js";
 import {
   createDescribeImageTool,
   createExpandCompartmentTool,
@@ -50,6 +55,7 @@ import {
 } from "../conversations/fragment-store.js";
 import type { CompactInput, CompactReason, CompactResult, Conversation } from "../conversations/index.js";
 import { createInternalHistoryProjectionPlugin } from "../conversations/internal-history.js";
+import { beginReplyJournal, createReplyJournalHistoryPlugin } from "../conversations/reply-journal.js";
 import type { MessageBatchController, MessageBatchInput, MessageBatchPlugin } from "../message-batches/index.js";
 import {
   createEvent,
@@ -126,6 +132,16 @@ export interface ChannelRuntimeOptions {
   readonly polisher?: MessagePolisherCapability;
   /** Resolves the current registered polisher and live profile immediately before sending. */
   readonly polish?: SendMessageToolOptions["polish"];
+  /** Optional modern reply-delivery capability collected before runtime construction. */
+  readonly sticker?: ReplyStickerProvider;
+  /** Versioned mixed-layout composer; present only for the official B lane. */
+  readonly composer?: ReplyLayoutComposer;
+  /** Resolves the complete live role profile for the expression owner (B lane only). */
+  readonly resolveRoleProfile?: () => Promise<{ persona: string; roleInstructions?: string; characterDefinition?: string }>;
+  /** Set false only for the explicit legacy third-party lane. */
+  readonly modernDelivery?: boolean;
+  /** Bound registry/setup/model generation; checked at every modern await/transport boundary. */
+  readonly replyStillCurrent?: () => boolean;
 }
 
 interface CompactionStartOptions {
@@ -136,6 +152,7 @@ interface TurnDeliveryTracker {
   readonly reservationId?: string;
   turnId?: string;
   delivered: boolean;
+  active: boolean;
   deliveredMessageId?: string;
   settled: boolean;
   settlement?: Promise<void>;
@@ -164,8 +181,11 @@ export class ChannelRuntime {
   private compactionController: AbortController | undefined;
   /** Largest provider-reported prompt size seen since the last consumed compaction trigger. */
   private promptLimitCompact: { readonly inputTokens: number; readonly turnId: string } | undefined;
-  /** Turns started by a silent post; `send_message` is blocked for them. */
+  /** Turns started by a silent post; `send_message` and preparation are blocked for them. */
   private readonly silentTurns = new Set<string>();
+  private readonly modern: boolean;
+  private modernReplies: ReplyToolSet | undefined;
+  private readonly replyProofWrites = new Set<Promise<void>>();
 
   public constructor(
     private readonly ctx: Context,
@@ -176,27 +196,35 @@ export class ChannelRuntime {
     this.imageProjection = options.imageProjection ?? new EphemeralImageProjectionStore();
     this.logger = ctx.logger("yesimbot/channel-runtime");
     this.logger.level = options.config.logLevel ?? 2;
-    const tools: AgentToolSet = [
-      createSendMessageTool({
-        bot: options.bot,
-        channelId: this.context.channelId,
-        resources: options.channel.resources,
-        pacing: options.config.pacing,
-        innerThought: options.config.customInnerThought,
-        ...(options.polisher
-          ? {
-              factsRequired: true,
-              polisherMode: options.polisher.mode ?? "rewrite",
-              ...(options.polish ? { polish: options.polish } : {}),
-            }
-          : {}),
-        onDelivered: (notice) => this.announceDelivered(notice),
-        onFailed: (notice) => this.announceSendFailed(notice),
-      }),
-      createReadTool(options.channel.resources, options.readImagePolicy, this.imageProjection),
-      ...(options.config.session.magicContext?.enabled ? [] : [createExpandCompartmentTool(options.channel.conversation)]),
-      createFinishTool(),
-    ];
+    this.modern = options.modernDelivery === true;
+    const tools: AgentToolSet = this.modern
+      ? [
+          ...this.createModernReplyTools(options),
+          createReadTool(options.channel.resources, options.readImagePolicy, this.imageProjection),
+          ...(options.config.session.magicContext?.enabled ? [] : [createExpandCompartmentTool(options.channel.conversation)]),
+          createFinishTool(),
+        ]
+      : [
+          createSendMessageTool({
+            bot: options.bot,
+            channelId: this.context.channelId,
+            resources: options.channel.resources,
+            pacing: options.config.pacing,
+            innerThought: options.config.customInnerThought,
+            ...(options.polisher
+              ? {
+                  factsRequired: true,
+                  polisherMode: options.polisher.mode ?? "rewrite",
+                  ...(options.polish ? { polish: options.polish } : {}),
+                }
+              : {}),
+            onDelivered: (notice) => this.announceDelivered(notice),
+            onFailed: (notice) => this.announceSendFailed(notice),
+          }),
+          createReadTool(options.channel.resources, options.readImagePolicy, this.imageProjection),
+          ...(options.config.session.magicContext?.enabled ? [] : [createExpandCompartmentTool(options.channel.conversation)]),
+          createFinishTool(),
+        ];
     if (options.visionModel && options.readImagePolicy.mode !== "native") {
       tools.push(createDescribeImageTool(options.visionModel, options.channel.resources));
     }
@@ -261,14 +289,27 @@ export class ChannelRuntime {
           channel: this.context,
           selfId: this.selfId,
           customInnerThought: options.config.customInnerThought,
-          delegated: options.polisher !== undefined,
+          delegated: options.polisher !== undefined || (this.modern && options.composer !== undefined),
           polisherMode: options.polisher?.mode,
+          replyOwnership: this.modern ? (options.polisher || options.composer ? "delegated" : "authored") : undefined,
           roleProfile: options.roleProfile,
           logger: this.logger,
         }),
       tools,
       providerTools: options.providerTools,
       plugins: [
+        ...(this.modern
+          ? [
+              createReplyJournalHistoryPlugin(),
+              {
+                name: "core.reply-lifecycle",
+                onTurnFinish: async (_result: import("@yesimbot/agent-runtime").TurnResult, context: { turnId: string }) => {
+                  await this.modernReplies?.finishTurn(context.turnId);
+                  await Promise.allSettled([...this.replyProofWrites]);
+                },
+              },
+            ]
+          : []),
         // Capture compact anchors from canonical entries before the history projection replaces
         // compact records with request-only system messages.
         ...(this.contextWorkspace
@@ -303,6 +344,70 @@ export class ChannelRuntime {
         ...options.plugins,
       ],
     });
+  }
+
+  /**
+   * One modern tool set per runtime: A installs the ordered `parts` sender; the official B lane
+   * installs `prepare_reply` plus a ready-only sender. No model-visible legacy draft/sticker bypass
+   * exists in either lane.
+   */
+  private createModernReplyTools(options: ChannelRuntimeOptions): AgentTool[] {
+    const conversation = options.channel.conversation;
+    const turnScoped = (turnId: string) =>
+      !this.stopped && !this.silentTurns.has(turnId) && this.agent.getActiveTurnId() === turnId && (options.replyStillCurrent?.() ?? true);
+    const descriptor = options.visionModel
+      ? createImagePreviewCapability({ policy: { mode: "vision", visionModel: options.visionModel }, projection: this.imageProjection })
+      : undefined;
+    const set = createReplyTools({
+      bot: options.bot,
+      channelId: this.context.channelId,
+      resources: options.channel.resources,
+      pacing: options.config.pacing,
+      innerThought: options.config.customInnerThought,
+      delegated: options.polisher !== undefined || options.composer !== undefined,
+      previewAvailable: options.readImagePolicy.mode !== "unavailable",
+      stillAllowed: () => !this.stopped && (options.replyStillCurrent?.() ?? true),
+      ...(descriptor
+        ? {
+            describeFrames: (view: import("../agents/reply.js").ReplyStickerView, signal?: AbortSignal) =>
+              descriptor.describe({
+                frames: view.frames ?? [],
+                question: "描述实际提供的表情画面、可见文字与动作，区分事实和推测；采样之外无法确认。",
+                signal,
+              }),
+          }
+        : {}),
+      ...(options.composer ? { composer: options.composer } : {}),
+      ...(options.sticker ? { sticker: options.sticker } : {}),
+      resolveProfile: async () => (options.resolveRoleProfile ? await options.resolveRoleProfile() : { persona: "" }),
+      turnContext: (messages) => buildPolisherTurnContext(messages, { replyLayout: true }),
+      journal: {
+        begin: (input) => {
+          const sessionId = conversation.currentSessionId();
+          return beginReplyJournal({
+            ...input,
+            sink: conversation.replyProofSink(),
+            onWrite: (task) => {
+              this.replyProofWrites.add(task);
+              void task.then(
+                () => this.replyProofWrites.delete(task),
+                () => this.replyProofWrites.delete(task),
+              );
+            },
+            sessionId,
+            generation: conversation.storageGeneration,
+            invocationId: createRandomId(),
+          });
+        },
+      },
+      onDelivered: (notice) => this.announceDelivered(notice),
+      onFailed: (notice) => this.announceSendFailed(notice),
+      onWarn: (reason, detail) => this.logger.warn(reason, detail),
+    });
+    // The silent-turn boundary is rechecked at preparation, admission and every transport.
+    set.setTurnAllowed(turnScoped);
+    this.modernReplies = set;
+    return set.tools;
   }
 
   public isBoundTo(bot: Bot): boolean {
@@ -457,6 +562,7 @@ export class ChannelRuntime {
       reason: "stop",
     });
     this.stopped = true;
+    this.modernReplies?.invalidate();
     const batchController = this.messageBatchController;
     this.messageBatchController = undefined;
     this.pendingBatchInputs.clear();
@@ -468,6 +574,8 @@ export class ChannelRuntime {
         this.schedule(async () => {
           await this.agent.interrupt("stop");
           await this.agent.stop();
+          await this.modernReplies?.coordinator.settle();
+          await Promise.allSettled([...this.replyProofWrites]);
           await Promise.allSettled([...this.streams]);
           await Promise.allSettled(compactionTask ? [compactionTask] : []);
         }),
@@ -622,7 +730,7 @@ export class ChannelRuntime {
   private announceDelivered(notice: DeliveredNotice): void {
     if (notice.channelId !== this.context.channelId || !notice.messageId) return;
     const tracker = this.turnDeliveryTrackers.get(notice.turnId);
-    if (tracker && !tracker.delivered) {
+    if (tracker?.active && !tracker.settled && !tracker.delivered) {
       tracker.delivered = true;
       tracker.deliveredMessageId = notice.messageId;
       if (tracker.reservationId) {
@@ -683,7 +791,7 @@ export class ChannelRuntime {
       this.agent.send(input, { ifBusy: "join" });
       return { kind: "join", eventId: input.id, turnId: activeTurnId };
     }
-    const tracker: TurnDeliveryTracker = { delivered: false, settled: false, ...(reservationId ? { reservationId } : {}) };
+    const tracker: TurnDeliveryTracker = { delivered: false, active: true, settled: false, ...(reservationId ? { reservationId } : {}) };
     const stream = this.agent.run(input, {
       ifBusy: ifBusy === "join" ? "defer" : ifBusy,
       historyMode: historyMode ?? (isEvent(input) ? "event" : "conversation"),
@@ -723,6 +831,7 @@ export class ChannelRuntime {
         }
         if (event.type === "turn.done") {
           terminal = "done";
+          tracker.active = false;
           this.logger.debug("runtime.turn.done", { turnId: event.turnId });
           continue;
         }
@@ -748,11 +857,13 @@ export class ChannelRuntime {
         }
         if (event.type === "turn.failed") {
           terminal = "failed";
+          tracker.active = false;
           this.logger.warn("runtime.turn.failed", { turnId: event.turnId, error: event.error.message });
           break;
         }
         if (event.type === "turn.aborted") {
           terminal = "aborted";
+          tracker.active = false;
           this.logger.warn("runtime.turn.aborted", { turnId: event.turnId, reason: event.reason });
           break;
         }
@@ -765,6 +876,7 @@ export class ChannelRuntime {
       consumeFailed = true;
       this.logger.warn("runtime.turn.consume_failed", { turnId, cause });
     } finally {
+      tracker.active = false;
       if (tracker.reservationId) {
         const outcome: WillReservationOutcome =
           tracker.delivered && tracker.turnId && tracker.deliveredMessageId

@@ -3,8 +3,8 @@ import type { Element } from "koishi";
 import { parseReply, type AssetStore, type ChannelContext } from "koishi-plugin-yesimbot";
 
 import type { StickerClassifier } from "./classifier.js";
+import { StickerDeliveryService } from "./delivery.js";
 import { detectImageMediaType, sha256Hex } from "./files.js";
-import { prepareStaticGif } from "./frames.js";
 import type { StickerPreviewGate, StickerSendSlot } from "./preview-evidence.js";
 import type { StickerSender } from "./sender.js";
 import type { StickerStore } from "./store.js";
@@ -23,6 +23,8 @@ export interface StickerToolsOptions {
   sendSlot: StickerSendSlot;
   /** Exact-content read evidence produced by `sticker_preview`. */
   previewGate: StickerPreviewGate;
+  /** Shared modern/legacy delivery core; the legacy tool keeps its own strict same-step gate. */
+  delivery?: StickerDeliveryService;
 }
 
 interface StealStickerInput {
@@ -43,8 +45,9 @@ interface SearchStickerInput {
 }
 
 export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
-  const { store, classifier, sender, assets, scope, config, sendSlot, previewGate } = options;
+  const { store, classifier, sender, assets, scope, config, sendSlot, previewGate, delivery } = options;
   const scopeKey = scopeKeyFor(scope, config);
+  const deliveryService = delivery ?? new StickerDeliveryService({ store, sender, scope, config, sendSlot, previewGate });
 
   const stealTool: AgentTool<StealStickerInput, ToolResult> = {
     name: "sticker_steal",
@@ -128,70 +131,25 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
       additionalProperties: false,
     }),
     execute: async ({ sticker_id, continue: shouldContinue }, execution) => {
-      // Read gate: require exact current-turn preview evidence for this same sticker. The runtime
-      // only appends a step's tool results after that step finishes, so `execution.messages` can
-      // never contain this step's own preview: a same-step preview cannot unlock its own send.
-      const evidence = previewGate.resolve(execution.turnId, execution.messages);
       if (!sticker_id) return { ok: false, error: "sticker_preview_required" };
-      if (!evidence) return { ok: false, error: "sticker_preview_required" };
-      if (sticker_id !== evidence.stickerId) return { ok: false, error: "sticker_preview_mismatch" };
-      const sticker = await store.get(scopeKey, sticker_id).catch(() => null);
-      if (!sticker) return { ok: false, error: "sticker_not_found" };
-      if (execution.abortSignal?.aborted || previewGate.resolve(execution.turnId, execution.messages) !== evidence) {
-        return { ok: false, error: "sticker_preview_required" };
-      }
-
-      // Claim synchronously before any await so concurrent calls cannot both reach the platform.
-      const claim = sendSlot.tryClaim(execution.turnId, execution.abortSignal);
-      if (claim !== "claimed") return { ok: false, error: "sticker_send_limit_reached" };
-
-      let bytes: Uint8Array;
-      try {
-        bytes = await store.readBytes(sticker);
-      } catch (cause) {
-        sendSlot.release(execution.turnId);
-        return { ok: false, error: cause instanceof Error ? cause.message : String(cause) };
-      }
-      // Bytes no longer match what was previewed: the model never saw this content, so send nothing.
-      if (sha256Hex(bytes) !== evidence.contentHash) {
-        sendSlot.release(execution.turnId);
-        return { ok: false, error: "sticker_preview_stale" };
-      }
-
-      if (execution.abortSignal?.aborted || previewGate.resolve(execution.turnId, execution.messages) !== evidence) {
-        sendSlot.release(execution.turnId);
-        return { ok: false, error: "resource_read_aborted" };
-      }
-      let prepared;
-      try {
-        prepared = prepareStaticGif(bytes, evidence.mediaType, config.sendStaticAsGif);
-      } catch {
-        sendSlot.release(execution.turnId);
-        return { ok: false, error: "sticker_prepare_failed" };
-      }
-      try {
-        await sender.send({ bytes: prepared.bytes, mediaType: prepared.mediaType });
-      } catch {
-        // The platform may already have accepted the sticker; never invite an automatic duplicate.
-        sendSlot.markUncertain(execution.turnId);
-        return { ok: false, error: "sticker_delivery_uncertain" };
-      }
-      sendSlot.confirm(execution.turnId);
-      let usageWarning: string | undefined;
-      try {
-        await store.markUsed(scopeKey, sticker.id);
-      } catch {
-        // Delivery succeeded even if accounting failed. Never tell the model to resend it.
-        usageWarning = "sticker_usage_update_failed";
-      }
+      const prepared = await deliveryService.preflight({
+        stickerId: sticker_id,
+        turnId: execution.turnId,
+        messages: execution.messages,
+        signal: execution.abortSignal,
+        proofRequired: false,
+      });
+      if ("error" in prepared) return { ok: false, error: prepared.error };
+      const result = await prepared.lease.send(execution.abortSignal);
+      if (result.status !== "confirmed") return { ok: false, error: result.error ?? "sticker_delivery_uncertain" };
       return {
         ok: true,
-        id: sticker.id,
-        category: sticker.category,
-        tags: sticker.tags,
+        id: prepared.lease.stickerId,
+        category: prepared.lease.category,
+        tags: prepared.lease.tags,
         continued: shouldContinue === true,
-        ...(usageWarning ? { warning: usageWarning } : {}),
-        message: `已发送 ${sticker.category} 分类的表情包`,
+        ...(result.warning ? { warning: result.warning } : {}),
+        message: `已发送 ${prepared.lease.category} 分类的表情包`,
       };
     },
   };
@@ -268,13 +226,18 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
  * quota. This returns a block reason for exactly that case and never inspects unrelated payloads.
  */
 export function stickerSendMessageBlockReason(input: unknown): string | undefined {
-  const value = input as { messages?: unknown; mode?: unknown } | null;
-  if (value?.mode === "raw" || !Array.isArray(value?.messages)) return undefined;
+  const value = input as { messages?: unknown; verbatim?: unknown; parts?: unknown; mode?: unknown } | null;
+  if (!value || value.mode === "raw") return undefined;
+  const texts = [
+    ...(Array.isArray(value.messages) ? value.messages : []),
+    ...(Array.isArray(value.verbatim) ? value.verbatim : []),
+    ...(Array.isArray(value.parts) ? value.parts.flatMap((part) => (part?.kind === "text" ? [part.text] : [])) : []),
+  ];
   const restricted = (element: Element): boolean =>
     element.type === "sticker" ||
     ((element.type === "img" || element.type === "file") && /^artifact:\/\/sticker\//i.test(String(element.attrs.src ?? ""))) ||
     element.children.some(restricted);
-  return value.messages.some((message) => typeof message === "string" && parseReply(message).some((segment) => segment.some(restricted)))
+  return texts.some((message) => typeof message === "string" && parseReply(message).some((segment) => segment.some(restricted)))
     ? "sticker_send_required"
     : undefined;
 }

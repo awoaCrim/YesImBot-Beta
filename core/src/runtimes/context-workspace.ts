@@ -14,6 +14,7 @@ import {
   type ContextRegionFailurePhase,
 } from "../conversations/historian.js";
 import type { Conversation } from "../conversations/index.js";
+import { replyHistoryContent, resolveReplyHistory } from "../conversations/reply-receipt.js";
 import {
   ContextBudgetError,
   estimateContextBase,
@@ -175,9 +176,10 @@ export class ContextWorkspace {
     const raw = entries.filter((entry) => entry.type === "message");
     this.historyIds = new Set(raw.map((entry) => entry.id));
     this.canonicalUnits.clear();
+    const modern = resolveReplyHistory(entries);
     for (const unit of requestUnits(
-      raw.map((entry) => ({ content: "content" in entry.data ? entry.data.content : [] })),
-      raw.map((entry) => ({ kind: "history" as const, sourceEntryIds: [entry.id] })),
+      raw.map((entry) => ({ content: replyHistoryContent(entry, modern.maskedCalls) })),
+      raw.map((entry) => ({ kind: "history" as const, sourceEntryIds: modern.groups.get(entry.id) ?? [entry.id] })),
     )) {
       const ids = [...unit.sourceEntryIds];
       for (const id of ids) this.canonicalUnits.set(id, { ids, mandatory: unit.mandatory });

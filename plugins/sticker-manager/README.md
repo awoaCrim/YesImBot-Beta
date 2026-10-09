@@ -33,6 +33,8 @@ node scripts/setup-koishi.mjs --create-app ../my-koishi --start
 
 群友不需要记任何命令。
 
+与支持统一回复编排的 Core 配套时，Agent 通过一次 `send_message` 交付完整的文字与表情顺序，不再使用独立的 `sticker_send`。未开启官方表达插件时由主 Agent 决定完整排版；开启后由携带完整人设的表达模型决定。搜索、预览、收藏和管理员命令保留；旧版/独立接入仍可使用原来的单独发送工具。
+
 查看表情包使用 YesImBot Core 的图片能力：主模型和传输支持图片工具结果时直接看图，否则使用 Core 配置的 `visionModel`。两条路径都不可用或查看失败时，机器人不会发送该表情包，仍可回复文字。视觉模型预览会产生额外调用费用；`classificationModel` 只负责收藏时分类，不能代替发送前查看。GIF 预览会采样多帧，发送时保留原始动画。
 
 ## 管理员常用命令
@@ -102,7 +104,7 @@ yesimbot.sticker.cleanup
 
 - `sticker_steal` 收藏时会按分类自动打 tag（`enableSteal` 关闭时该工具不提供）。
 - 新增 `sticker_tags` 工具，用于查询当前标签和数量。
-- `sticker_preview` 可传多个 `tags`，从匹配最多标签的表情包中挑选候选供查看；之后由 `sticker_send` 发送同一个 ID。
+- `sticker_preview` 可传多个 `tags`，从匹配最多标签的表情包中挑选候选供查看；确认合适后，统一回复中的 sticker 单元使用同一个 ID（旧版/独立接入使用 `sticker_send`）。
 - `sticker_search` 支持按 `tags` 过滤。
 
 开启方式：

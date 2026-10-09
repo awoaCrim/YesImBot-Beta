@@ -126,6 +126,37 @@ describe("buildPolisherTurnContext", () => {
     expect(serialized).not.toContain("raw-pixels");
   });
 
+  it("keeps legacy safe sticker results but excludes every modern outward/preview control", () => {
+    const messages = [
+      {
+        id: "tools",
+        timestamp: 1,
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolName: "sticker_preview",
+            toolCallId: "preview",
+            output: { type: "json", value: { ok: true, description: "实际视觉描述" } },
+          },
+          {
+            type: "tool-result",
+            toolName: "sticker_send",
+            toolCallId: "sticker",
+            output: { type: "json", value: { ok: true, warning: "legacy-safe-warning" } },
+          },
+          { type: "tool-result", toolName: "prepare_reply", toolCallId: "prepare", output: { type: "json", value: { reply_id: "PRIVATE_READY_ID" } } },
+          { type: "tool-result", toolName: "send_message", toolCallId: "send", output: { type: "json", value: { replyReceipt: "PRIVATE_SEND_CONTROL" } } },
+          { type: "tool-result", toolName: "lookup", toolCallId: "lookup", output: { type: "json", value: { text: "可用的查询结果" } } },
+        ],
+      },
+    ] as AgentMessage[];
+    expect(buildPolisherTurnContext(messages).map((entry) => entry.toolName)).toEqual(["sticker_preview", "sticker_send", "lookup"]);
+    const modern = buildPolisherTurnContext(messages, { replyLayout: true });
+    expect(modern.map((entry) => entry.toolName)).toEqual(["lookup"]);
+    expect(JSON.stringify(modern)).not.toMatch(/PRIVATE_|实际视觉描述|legacy-safe-warning/);
+  });
+
   it("bounds each entry and the complete current-turn reference", () => {
     const messages = [
       { id: "user", timestamp: 1, role: "user", content: [{ type: "text", text: "x".repeat(100_000) }] },

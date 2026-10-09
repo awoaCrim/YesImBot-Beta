@@ -7,6 +7,7 @@ import { compactSourceTimestamp, renderVisibleUserRecords, validateContinuityEnt
 import { recallTerms } from "./fragment-store.js";
 import { MAX_CONTEXT_REGION_SOURCE_BYTES, renderContextRegionSource, validateContextRegionData, type ContextRegionEntry } from "./historian.js";
 import { collectAssistantSourceProofs, collectDeliveredSourceRecords } from "./internal-history.js";
+import { replySourceEntryIds, resolveReplyHistory, type ReplyHistoryProof } from "./reply-receipt.js";
 
 export type CompactEntry = Extract<AgentEntry, { type: "compact" }>;
 
@@ -176,10 +177,18 @@ export class ContextBlockStore {
       entries = snapshot.entries;
       range = active.slice(first, last + 1);
     }
-    if (range.some((entry) => excludeIds.has(entry.id))) throw new ContextSourceError("ActiveTurnSource");
-    if (new Set(range.map((entry) => entry.id)).size !== range.length) throw new ContextSourceError("AmbiguousRawSource");
-    const rangeIds = new Set(range.map((entry) => entry.id));
-    const originals = safeSourceRecords(entries).filter((record) => rangeIds.has(record.entryId));
+    const modern = resolveReplyHistory(entries);
+    const rangeIds = new Set(
+      replySourceEntryIds(
+        entries,
+        range.map((entry) => entry.id),
+        modern,
+      ),
+    );
+    if ([...rangeIds].some((id) => excludeIds.has(id))) throw new ContextSourceError("ActiveTurnSource");
+    const canonical = entries.filter((entry) => rangeIds.has(entry.id));
+    if (new Set(canonical.map((entry) => entry.id)).size !== canonical.length) throw new ContextSourceError("AmbiguousRawSource");
+    const originals = safeSourceRecords(entries, rangeIds);
     const records = this.projectRecords ? await this.projectRecords(originals, entries, signal) : originals;
     this.checkEpoch(sourceEpoch);
     if (signal?.aborted) throw new ContextSourceError("CancelledContextRead");
@@ -187,7 +196,7 @@ export class ContextBlockStore {
     // projection too, so changing that evidence cannot reuse old text offsets.
     const proofs = collectAssistantSourceProofs(entries);
     const fingerprint = hash(
-      JSON.stringify([rangeFingerprint(range), originals, [...rangeIds].map((id) => [id, proofs.get(id)]), ...(this.projectRecords ? [records] : [])]),
+      JSON.stringify([rangeFingerprint(canonical), originals, [...rangeIds].map((id) => [id, proofs.get(id)]), ...(this.projectRecords ? [records] : [])]),
     );
     let recordIndex = 0;
     let offset = 0;
@@ -232,8 +241,12 @@ export class ContextBlockStore {
       pageId: hash(JSON.stringify([block.id, fingerprint, start, recordIndex, offset])),
       fingerprint,
       records: page,
-      sourceEntryIds: [...new Set(page.map((record) => record.entryId))],
-      omittedEntries: range.filter((entry) => entry.type === "message" && !records.some((record) => record.entryId === entry.id)).length,
+      sourceEntryIds: replySourceEntryIds(
+        entries,
+        page.map((record) => record.entryId),
+        modern,
+      ),
+      omittedEntries: canonical.filter((entry) => entry.type === "message" && !records.some((record) => record.entryId === entry.id)).length,
       ...(nextCursor ? { nextCursor } : {}),
     };
   }
@@ -296,7 +309,8 @@ export class ContextBlockStore {
       compact = snapshot.compacts.find((entry) => entry.id === data.parentCompactId);
     }
     const tail = snapshot.entries.slice(boundary?.tailStartIndex ?? 0);
-    for (const group of rawGroups(tail, new Set([...excludeIds, ...covered]))) {
+    const excludedSources = new Set(replySourceEntryIds(snapshot.entries, [...excludeIds, ...covered]));
+    for (const group of rawGroups(tail, excludedSources)) {
       const first = group[0]!;
       const last = group.at(-1)!;
       validateSourceIds([first.id, last.id]);
@@ -371,12 +385,28 @@ export async function resolveCompactSource(snapshot: ContextSourceSnapshot, id: 
   return found;
 }
 
-export function safeSourceRecords(entries: readonly AgentEntry[]): CompressionRecord[] {
+export function safeSourceRecords(entries: readonly AgentEntry[], sourceIds?: Iterable<string>): CompressionRecord[] {
   const delivered = collectDeliveredSourceRecords(entries);
+  const selected = sourceIds === undefined ? undefined : new Set(replySourceEntryIds(entries, sourceIds));
   return entries.flatMap((entry) => {
+    if (selected && !selected.has(entry.id)) return [];
     const users = renderVisibleUserRecords(entry);
     return [...users, ...(delivered.get(entry.id) ?? [])];
   });
+}
+
+/** Modern source ranges use real observation times, never admission, SDK completion or close times. */
+export function sourceObservationTimes(
+  entries: readonly AgentEntry[],
+  ids: Iterable<string>,
+  modern: ReplyHistoryProof = resolveReplyHistory(entries),
+): number[] {
+  const selected = new Set(replySourceEntryIds(entries, ids, modern));
+  const times = entries.flatMap((entry) =>
+    entry.type === "message" && selected.has(entry.id) && !modern.groups.has(entry.id) ? [compactSourceTimestamp(entry)] : [],
+  );
+  for (const [ownerId, journal] of modern.journals) if (selected.has(ownerId)) times.push(...journal.observedAt);
+  return times;
 }
 
 export function rangeFingerprint(entries: readonly unknown[]): string {
@@ -387,16 +417,22 @@ export function rangeFingerprint(entries: readonly unknown[]): string {
 export function contextRegionSource(entries: readonly AgentEntry[], ids: readonly string[]) {
   if (!ids.length || new Set(ids).size !== ids.length || Buffer.byteLength(JSON.stringify(ids), "utf8") > MAX_CONTEXT_REGION_SOURCE_BYTES)
     throw new Error("ContextRegionSourceUnavailable");
-  const wanted = new Set(ids);
+  const original = entries.filter((entry) => ids.includes(entry.id));
+  if (original.length !== ids.length || new Set(original.map((entry) => entry.id)).size !== ids.length) throw new Error("ContextRegionSourceConflict");
+  const modern = resolveReplyHistory(entries);
+  const sourceEntryIds = replySourceEntryIds(entries, ids, modern);
+  if (Buffer.byteLength(JSON.stringify(sourceEntryIds), "utf8") > MAX_CONTEXT_REGION_SOURCE_BYTES) throw new Error("ContextRegionSourceUnavailable");
+  const wanted = new Set(sourceEntryIds);
   const selected = entries.filter((entry) => wanted.has(entry.id));
-  if (selected.length !== ids.length || new Set(selected.map((entry) => entry.id)).size !== ids.length || selected.some((entry) => entry.type !== "message"))
-    throw new Error("ContextRegionSourceConflict");
-  const sourceEntryIds = selected.map((entry) => entry.id);
-  const records = safeSourceRecords(entries).filter((record) => wanted.has(record.entryId));
+  if (selected.length !== wanted.size || selected.some((entry) => entry.type !== "message")) throw new Error("ContextRegionSourceConflict");
+  const records = safeSourceRecords(entries, sourceEntryIds);
   renderContextRegionSource(records);
   const sourceProjectionFingerprint = rangeFingerprint(records);
+  // Legacy v1 region identity stays readable. Modern groups include every checkpoint and mirror,
+  // including malformed/unknown evidence outside the originally requested range.
   const sourceFingerprint = rangeFingerprint([rangeFingerprint(selected), sourceProjectionFingerprint]);
-  const timestamps = selected.map((entry) => compactSourceTimestamp(entry as Extract<AgentEntry, { type: "message" }>));
+  const timestamps = sourceObservationTimes(entries, sourceEntryIds, modern);
+  if (!timestamps.length) throw new Error("ContextRegionSourceUnavailable");
   return {
     sourceEntryIds,
     records,

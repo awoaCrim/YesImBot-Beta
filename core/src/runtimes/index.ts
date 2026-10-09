@@ -2,7 +2,7 @@ import { EphemeralImageProjectionStore } from "@yesimbot/agent-runtime";
 import type { Bot, Context, Logger, Session } from "koishi";
 
 import { createImagePreviewCapability } from "../agents/image-preview.js";
-import { Agents } from "../agents/index.js";
+import { Agents, type ReplyStickerProvider } from "../agents/index.js";
 import { createSendMessagePolisher, PolisherRegistry } from "../agents/polisher.js";
 import type { ReadImagePolicy } from "../agents/tools.js";
 import type { Channel, Channels } from "../channels/index.js";
@@ -124,6 +124,15 @@ export class Runtimes {
       const imageProjection = new EphemeralImageProjectionStore();
       const readImagePolicy = resolveReadImagePolicy(chat, vision, this.config.imageInput);
       const polisher = this.polishers.resolve();
+      const composer = this.polishers.resolveComposer(channel.context);
+      const modernDelivery = !polisher || polisher.replyLayout !== undefined;
+      const registriesCurrent = () =>
+        !this.stopped &&
+        this.agents.revision === agentRevision &&
+        this.messageBatches.revision === messageRevision &&
+        this.model.revision === modelRevision &&
+        this.polishers.revision === polisherRevision &&
+        this.config.chatModel === chatModelId;
       const polish =
         polisher === undefined
           ? undefined
@@ -134,20 +143,55 @@ export class Runtimes {
               capability: polisher,
             });
       const roleProfile = polisher === undefined ? await this.agents.resolveRoleProfile(channel.context) : undefined;
-      if (this.agents.revision !== agentRevision) {
+      if (!registriesCurrent()) {
         retry = true;
         return;
       }
       const willContext: ChannelContext = channel.context.type === "direct" ? channel.context : { ...channel.context, selfId: bot.selfId };
       const will = await this.agents.setupWill(willContext, session);
-      const plugins = await this.agents.setup(channel.context, bot, {
-        imageProjection,
-        imagePreview: createImagePreviewCapability({ policy: readImagePolicy, projection: imageProjection }),
-        polisherActive: polisher !== undefined,
-        rolePromptsManaged: polisher === undefined,
-      });
-      // Setup may await while plugins are replaced. Retire before init can seed a greeting.
-      if (this.agents.revision !== agentRevision) {
+      // The channel-local holder collects exactly one typed sticker provider before the runtime is
+      // frozen. Capability generation changes invalidate prepared phases.
+      let providerGeneration = 0;
+      let frozen = false;
+      let stickerProvider: ReplyStickerProvider | undefined;
+      const plugins = await this.agents
+        .setup(channel.context, bot, {
+          imageProjection,
+          imagePreview: createImagePreviewCapability({ policy: readImagePolicy, projection: imageProjection }),
+          polisherActive: polisher !== undefined,
+          rolePromptsManaged: polisher === undefined,
+          ...(modernDelivery
+            ? {
+                replyDelivery: {
+                  version: 1 as const,
+                  ownership: polisher ? ("delegated" as const) : ("authored" as const),
+                  registerSticker: (provider: ReplyStickerProvider) => {
+                    if (frozen || stickerProvider) throw new Error("Sticker delivery setup is frozen or already registered");
+                    stickerProvider = provider;
+                    providerGeneration++;
+                    return () => {
+                      if (stickerProvider === provider) {
+                        stickerProvider = undefined;
+                        providerGeneration++;
+                      }
+                    };
+                  },
+                },
+              }
+            : {}),
+        })
+        .catch((cause) => {
+          frozen = true;
+          stickerProvider = undefined;
+          providerGeneration++;
+          throw cause;
+        });
+      frozen = true;
+      const boundSticker = stickerProvider;
+      const selectedProviderGeneration = providerGeneration;
+      const stillCurrent = () => registriesCurrent() && providerGeneration === selectedProviderGeneration && stickerProvider === boundSticker;
+      // Setup may await while any owning registry changes. Retire before init can seed a greeting.
+      if (!stillCurrent()) {
         for (const plugin of plugins.reverse()) {
           try {
             await plugin.stop?.();
@@ -177,6 +221,16 @@ export class Runtimes {
         roleProfile,
         polisher,
         polish,
+        modernDelivery,
+        replyStillCurrent: stillCurrent,
+        ...(composer ? { composer } : {}),
+        ...(stickerProvider ? { sticker: stickerProvider } : {}),
+        ...(polisher
+          ? {
+              resolveRoleProfile: async () =>
+                resolvePolisherPromptProfile(this.config.basePath, await this.polishers.resolveProfile(channel.context), this.logger),
+            }
+          : {}),
         messageBatch: this.messageBatches.select(channel.context),
         archiveMaxBytes: this.config.session.archive.maxKB * 1024,
         ...(this.channels.compactFragments ? { compactFragments: this.channels.compactFragments } : {}),
@@ -188,6 +242,11 @@ export class Runtimes {
         throw cause;
       }
       // Already-persisted greeting/history is canonical; retrying never rolls it back.
+      if (!stillCurrent()) {
+        await runtime.stop();
+        retry = true;
+        return;
+      }
       if (this.agents.revision !== agentRevision) {
         this.logger.warn("runtimes.get.agent_revision_changed", { key, selectedRevision: agentRevision, latestRevision: this.agents.revision });
         await runtime.stop();

@@ -17,7 +17,6 @@ import { requestUnits } from "../runtimes/context-budget.js";
 import { AssistantHistoryFacts, type HistoryFactsModel } from "./assistant-facts.js";
 import { resolveLatestCompactBoundary } from "./boundary.js";
 import {
-  compactSourceTimestamp,
   CONTINUITY_PROMPT_VERSION,
   executeCompact,
   executeContinuity,
@@ -37,6 +36,7 @@ import {
   resolveCompactSource,
   resolveContextRegionSource,
   safeSourceRecords,
+  sourceObservationTimes,
   validatedContextRegions,
   type CompactEntry,
   type ContextSourceSnapshot,
@@ -52,6 +52,8 @@ import {
   type FrozenContextRegion,
 } from "./historian.js";
 import { collectActualDeliveredSourceRecords } from "./internal-history.js";
+import type { ReplyJournalSink } from "./reply-journal.js";
+import { replyHistoryContent, replySourceEntryIds, resolveReplyHistory } from "./reply-receipt.js";
 
 const DEFAULT_COMPARTMENT_MESSAGES = 20;
 const DEFAULT_COMPARTMENT_CHARS = 12_000;
@@ -224,6 +226,25 @@ export class Conversation {
 
   public get storageGeneration(): number {
     return this.storageGenerationValue;
+  }
+
+  /**
+   * Generation-bound append-only writer for the Core actual-delivery journal. It is deliberately
+   * independent of the SDK execution signal: effects that already happened locally stay readable
+   * after an abort discards the normal tool receipt. A session/generation change rejects late writes
+   * instead of repopulating a replacement history.
+   */
+  public replyProofSink(): ReplyJournalSink {
+    return {
+      append: (entry, expected) =>
+        this.mutateStorage(async () => {
+          if (!this.storagePathValue) throw new Error("Conversation has not been initialized");
+          expected.signal?.throwIfAborted();
+          if (this.storageGenerationValue !== expected.generation || this.currentSessionId() !== expected.sessionId)
+            throw new Error("ReplyProofGenerationChanged");
+          await this.currentStorage().append(entry);
+        }),
+    };
   }
 
   public projectAssistantRecords(
@@ -534,8 +555,14 @@ export class Conversation {
         }
       });
       if (positions.size !== sourceIds.length) throw new Error("ContinuitySourceUnavailable");
-      const sourceEntries = sourceIds.map((id) => entries[positions.get(id)!]!).sort((left, right) => positions.get(left.id)! - positions.get(right.id)!);
-      if (sourceEntries.some((entry) => entry.type !== "message")) throw new Error("ContinuitySourceUnavailable");
+      const canonicalIds = replySourceEntryIds(entries, sourceIds);
+      const sourceEntries = entries.filter((entry) => canonicalIds.includes(entry.id));
+      if (
+        sourceEntries.length > 256 ||
+        new Set(sourceEntries.map((entry) => entry.id)).size !== sourceEntries.length ||
+        sourceEntries.some((entry) => entry.type !== "message")
+      )
+        throw new Error("ContinuitySourceUnavailable");
       const sourceFingerprint = rangeFingerprint(sourceEntries);
       const sourceSession = this.currentSessionId();
       const verifiedLineageId = continuityLineage(entries, sourceSession);
@@ -543,8 +570,9 @@ export class Conversation {
       const lineageId = verifiedLineageId;
       const firstEntryId = sourceEntries[0]!.id;
       const lastEntryId = sourceEntries.at(-1)!.id;
-      const timestamps = sourceEntries.map((entry) => compactSourceTimestamp(entry as Extract<AgentEntry, { type: "message" }>));
       const sourceManifest = sourceEntries.map((entry) => entry.id);
+      const timestamps = sourceObservationTimes(entries, sourceManifest);
+      if (!timestamps.length) throw new Error("ContinuitySourceUnavailable");
       const existing = entries
         .filter((entry): entry is ContinuityEntry => entry.type === "continuity")
         .filter((entry) => {
@@ -714,9 +742,15 @@ export class Conversation {
     }
     const source = await resolveCompactSource(snapshot, compartmentId);
     const actual = collectActualDeliveredSourceRecords(source.entries);
+    const sourceIds = new Set(
+      replySourceEntryIds(
+        source.entries,
+        source.range.map((entry) => entry.id),
+      ),
+    );
     const originalRecords = this.historyFacts
-      ? safeSourceRecords(source.entries).filter((record) => source.range.some((entry) => entry.id === record.entryId))
-      : source.range.flatMap((entry) => actual.get(entry.id) ?? renderCompressionRecords(entry));
+      ? safeSourceRecords(source.entries, sourceIds)
+      : source.entries.filter((entry) => sourceIds.has(entry.id)).flatMap((entry) => actual.get(entry.id) ?? renderCompressionRecords(entry));
     const records = await this.projectAssistantRecords(originalRecords, options.signal, this.historyFacts?.proofsForEntries(source.entries));
     check();
     const entries = records.slice(offset, offset + limit);
@@ -737,9 +771,15 @@ export class Conversation {
     if (this.failures >= this.compactConfig.maxFailures) return { compacted: false, reason: "failure_limit" };
     const entries = await this.readStorage();
     const boundary = resolveLatestCompactBoundary(entries);
-    const sourceEntries = entries.slice(boundary?.tailStartIndex ?? 0);
+    const sourceIds = new Set(
+      replySourceEntryIds(
+        entries,
+        entries.slice(boundary?.tailStartIndex ?? 0).map((entry) => entry.id),
+      ),
+    );
+    const sourceEntries = entries.filter((entry) => sourceIds.has(entry.id));
     if (this.compactConfig.mode === "compartment") return this.compactCompartments(reason, input, sourceEntries, boundary);
-    const excluded = new Set(input.excludeMessageIds ?? []);
+    const excluded = new Set(replySourceEntryIds(entries, input.excludeMessageIds ?? []));
     const sourceForCompaction = sourceEntries.filter((entry) => entry.type !== "message" || !excluded.has(entry.id));
     const messages = sourceForCompaction.filter((entry) => entry.type === "message");
     if (!input.force && messages.length < this.compactConfig.minMessages) return { compacted: false, reason: "minimum_messages" };
@@ -768,7 +808,10 @@ export class Conversation {
         return { compacted: false, reason: "empty_summary" };
       }
       const compactId = createRandomId();
-      const timestamps = messages.map(compactSourceTimestamp);
+      const timestamps = sourceObservationTimes(
+        entries,
+        messages.map((entry) => entry.id),
+      );
       const parentCompactId = boundary?.compact.id;
       const compact = createEntry(
         "compact",
@@ -804,13 +847,13 @@ export class Conversation {
     sourceEntries: readonly AgentEntry[],
     boundary: ReturnType<typeof resolveLatestCompactBoundary>,
   ): Promise<CompactResult> {
-    const excluded = new Set(input.excludeMessageIds ?? []);
+    const canonical = await this.readStorage();
+    const excluded = new Set(replySourceEntryIds(canonical, input.excludeMessageIds ?? []));
     const sourceForCompaction = sourceEntries.filter((entry) => entry.type !== "message" || !excluded.has(entry.id));
     const messages = sourceForCompaction.filter((entry) => entry.type === "message" && entry.data.role !== "tool");
     if (!input.force && messages.length < this.compactConfig.minMessages) return { compacted: false, reason: "minimum_messages" };
     if (messages.length === 0) return { compacted: false, reason: "empty_input" };
 
-    const canonical = await this.readStorage();
     const assistantFacts = await this.historyFacts?.factsForEntries(canonical, input.signal);
     const deliveredRecords = collectActualDeliveredSourceRecords(canonical);
     const chunks = buildCompactionChunks(sourceForCompaction, {
@@ -840,7 +883,10 @@ export class Conversation {
         ).slice(0, 30_000);
         if (!summary) throw new Error("Compaction produced an empty summary.");
         const compactId = createRandomId();
-        const timestamps = chunk.messages.map(compactSourceTimestamp);
+        const timestamps = sourceObservationTimes(
+          canonical,
+          chunk.entries.map((entry) => entry.id),
+        );
         const nextLineageId = lineageId ?? compactId;
         const compact = createEntry(
           "compact",
@@ -962,13 +1008,15 @@ export class Conversation {
         }
       }
       const messages = entries.filter((entry) => entry.type === "message");
+      const modern = resolveReplyHistory(entries);
       const units = requestUnits(
-        messages.map((entry) => ({ content: "content" in entry.data ? entry.data.content : [] })),
-        messages.map((entry) => ({ kind: "history" as const, sourceEntryIds: [entry.id] })),
+        messages.map((entry) => ({ content: replyHistoryContent(entry, modern.maskedCalls) })),
+        messages.map((entry) => ({ kind: "history" as const, sourceEntryIds: modern.groups.get(entry.id) ?? [entry.id] })),
       );
       const removable = new Set<string>();
+      const canonicalCovered = new Set(replySourceEntryIds(entries, covered, modern));
       for (const unit of units) {
-        if (!unit.mandatory && [...unit.sourceEntryIds].every((id) => covered.has(id))) for (const id of unit.sourceEntryIds) removable.add(id);
+        if (!unit.mandatory && [...unit.sourceEntryIds].every((id) => canonicalCovered.has(id))) for (const id of unit.sourceEntryIds) removable.add(id);
       }
       // Original files remain untouched. Carry only verified semantic regions and uncovered
       // protocol units; the non-Magic history adapter can render regions after a mode switch.
@@ -994,7 +1042,8 @@ export class Conversation {
   private archiveSeed(entries: readonly AgentEntry[]): AgentEntry[] {
     const boundary = resolveLatestCompactBoundary(entries);
     const resident = this.residentCompacts(entries);
-    const tail = boundary ? entries.slice(boundary.tailStartIndex).filter((entry) => entry.type !== "compact") : [];
+    const tailIds = new Set(replySourceEntryIds(entries, boundary ? entries.slice(boundary.tailStartIndex).map((entry) => entry.id) : []));
+    const tail = entries.filter((entry) => tailIds.has(entry.id) && entry.type !== "compact");
     return [...resident, ...tail];
   }
 
@@ -1102,17 +1151,20 @@ function buildCompactionChunks(entries: readonly AgentEntry[], options: { readon
     chars = 0;
   };
 
-  for (const entry of entries) {
-    if (entry.type !== "message" || entry.data.role === "tool") {
-      current.push(entry);
-      continue;
-    }
-    const entryChars = renderCompressionRecords(entry).reduce((total, record) => total + record.text.length, 0);
-    if (messages.length > 0 && (messages.length >= maxMessages || chars + entryChars > maxChars)) flush();
+  const modern = resolveReplyHistory(entries);
+  const positions = new Map(entries.map((entry, index) => [entry.id, index]));
+  let indivisibleUntil = -1;
+  for (const [index, entry] of entries.entries()) {
+    const group = modern.groups.get(entry.id);
+    const last = group ? Math.max(...group.map((id) => positions.get(id) ?? index)) : index;
+    const entryChars = (modern.records.get(entry.id) ?? renderCompressionRecords(entry)).reduce((total, record) => total + record.text.length, 0);
+    if (index > indivisibleUntil && messages.length > 0 && (messages.length >= maxMessages || chars + entryChars > maxChars)) flush();
+    indivisibleUntil = Math.max(indivisibleUntil, last);
     current.push(entry);
-    messages.push(entry);
+    if (entry.type === "message" && entry.data.role !== "tool") messages.push(entry);
     chars += entryChars;
-    if (messages.length >= maxMessages || chars >= maxChars) flush();
+    // Safety maxima guide chunks, but never sever the admission/checkpoint/mirror proof unit.
+    if (index >= indivisibleUntil && (messages.length >= maxMessages || chars >= maxChars)) flush();
   }
   flush();
   return chunks;
@@ -1213,7 +1265,8 @@ async function continuitySourceAvailable(snapshot: ContextSourceSnapshot, data: 
         data.sourceEntryIds.at(-1) !== data.lastEntryId ||
         sourcePositions.some((position, index) => position < 0 || (index > 0 && position <= sourcePositions[index - 1]!)) ||
         sourceEntries.length !== data.sourceCount ||
-        rangeFingerprint(sourceEntries) !== data.sourceFingerprint
+        rangeFingerprint(sourceEntries) !== data.sourceFingerprint ||
+        JSON.stringify(replySourceEntryIds(entries, data.sourceEntryIds)) !== JSON.stringify(data.sourceEntryIds)
       )
         return false;
     } else {

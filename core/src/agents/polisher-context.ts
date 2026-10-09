@@ -37,7 +37,7 @@ const DROPPED_CONTEXT_KEYS = new Set([
  * deliberately ignored, so tool-call inputs and the main Agent's hidden reasoning cannot cross the
  * Core/polisher boundary.
  */
-export function buildPolisherTurnContext(messages: readonly AgentMessage[]): readonly PolisherTurnEntry[] {
+export function buildPolisherTurnContext(messages: readonly AgentMessage[], options: { readonly replyLayout?: boolean } = {}): readonly PolisherTurnEntry[] {
   const entries: PolisherTurnEntry[] = [];
 
   for (const message of messages) {
@@ -48,7 +48,12 @@ export function buildPolisherTurnContext(messages: readonly AgentMessage[]): rea
     for (const part of message.content as readonly unknown[]) {
       if (!isRecord(part) || part.type !== "tool-result") continue;
       const toolName = asString(part.toolName) ?? "unknown";
-      if (toolName === "send_message") continue;
+      if (
+        toolName === "send_message" ||
+        toolName === "prepare_reply" ||
+        (options.replyLayout && (toolName === "sticker_send" || toolName === "sticker_preview"))
+      )
+        continue;
       const output = part.output;
       if (isImageOutput(toolName, output)) continue;
       const content = serializeToolOutput(output);
