@@ -12,6 +12,7 @@ import {
 import type { HistoryProjectionMode } from "../models/index.js";
 import { compactSourceTimestamp, type CompressionRecord } from "./compact.js";
 import { createDeliveredTranscriptMessage, isDeliveredTranscript, type DeliveredTranscriptData } from "./delivered-transcript.js";
+import { excludeCurrentReplyJournal, isReplyDeliveryProof, resolveReplyHistory } from "./reply-receipt.js";
 
 /**
  * Internal tool arguments and historical platform output are useful in durable diagnostics but are not
@@ -23,7 +24,7 @@ export const INTERNAL_HISTORY_PROJECTION_PLUGIN: AgentPlugin = createInternalHis
 /** The send_message tool is the only Core path that delivers model-authored text to a platform. */
 const HISTORICAL_OUTPUT_TOOL_NAME = "send_message";
 /** Image artifacts are ephemeral side effects; replaying their tool trace can resurrect an old image task. */
-const HISTORICAL_EPHEMERAL_TOOL_NAMES = new Set(["edit_image", "generate_image"]);
+const HISTORICAL_EPHEMERAL_TOOL_NAMES = new Set(["edit_image", "generate_image", "prepare_reply"]);
 /** Legacy durable records may still carry the delivered-message envelope this projection used to emit. */
 const LEGACY_DELIVERED_OPEN = "[DELIVERED_MESSAGE]";
 const LEGACY_DELIVERED_CLOSE = "[/DELIVERED_MESSAGE]";
@@ -45,7 +46,7 @@ export function createInternalHistoryProjectionPlugin(mode: HistoryProjectionMod
   return {
     name: "core.internal-history-projection",
     enforce: "pre",
-    transformEntries: (entries) => stripInternalAssistantInputs(entries, mode, projection),
+    transformEntries: (entries, context) => stripInternalAssistantInputs(entries, mode, projection, context?.turnId),
   };
 }
 
@@ -53,8 +54,11 @@ export function stripInternalAssistantInputs(
   entries: readonly AgentEntry[],
   mode: HistoryProjectionMode = "default",
   projection?: AgentRequestProjection,
+  turnId?: string,
 ): AgentEntry[] {
-  const sendResults = collectHistoricalSendResults(entries);
+  entries = excludeCurrentReplyJournal(entries, turnId);
+  const modern = resolveReplyHistory(entries);
+  const sendResults = collectHistoricalSendResults(entries, false, modern.maskedCalls);
   const geminiSendCalls = mode === "gemini-native" ? collectSafeGeminiSendCalls(entries, sendResults) : new Map<string, readonly string[]>();
   const removedToolCallIds = new Set(
     entries.flatMap((entry) =>
@@ -69,6 +73,29 @@ export function stripInternalAssistantInputs(
       continue;
     }
 
+    if (isReplyDeliveryProof(entry.data)) {
+      const records = modern.records.get(entry.id);
+      if (records?.length) {
+        for (const [index, record] of records.entries()) {
+          const transcript = createTranscriptEntry(
+            { ...entry, timestamp: record.timestamp },
+            {
+              messages: [record.text],
+              deliveredCount: 1,
+              partial: modern.journals.get(entry.id)?.status !== "complete",
+            },
+            index,
+          );
+          if (transcript.type === "message")
+            projection?.inherit(
+              transcript.data,
+              entries.flatMap((source) => (source.type === "message" && (modern.groups.get(entry.id) ?? [entry.id]).includes(source.id) ? [source.data] : [])),
+            );
+          transcripts.push(transcript);
+        }
+      }
+      continue;
+    }
     if (entry.data.role === "custom" && entry.data.type === "yesimbot.event") {
       // Runtime events are external observations, not historical user requests. Keep them durable,
       // but never offer their untrusted payload as a later model-history message.
@@ -118,7 +145,7 @@ export function stripInternalAssistantInputs(
 /** Public-output evidence used by block loading. No internal assistant text or failed send is exposed. */
 export function collectDeliveredSourceRecords(entries: readonly AgentEntry[]): ReadonlyMap<string, readonly CompressionRecord[]> {
   const results = collectHistoricalSendResults(entries, true);
-  const records = new Map<string, readonly CompressionRecord[]>();
+  const records = new Map<string, readonly CompressionRecord[]>(resolveReplyHistory(entries).records);
   for (const entry of entries) {
     if (entry.type !== "message" || entry.data.role !== "assistant" || !Array.isArray(entry.data.content)) continue;
     const output: CompressionRecord[] = [];
@@ -149,6 +176,7 @@ export function collectDeliveredSourceRecords(entries: readonly AgentEntry[]): R
 
 /** Source/body/proof identity without exposing original private fields to derived prompts. */
 export function collectAssistantSourceProofs(entries: readonly AgentEntry[]): ReadonlyMap<string, string> {
+  const modern = resolveReplyHistory(entries);
   const receipts = new Map<string, object[]>();
   for (const entry of entries) {
     if (entry.type !== "message" || entry.data.role !== "tool" || !Array.isArray(entry.data.content)) continue;
@@ -167,7 +195,9 @@ export function collectAssistantSourceProofs(entries: readonly AgentEntry[]): Re
       for (const part of entry.data.content)
         if (part.type === "tool-call" && part.toolName === HISTORICAL_OUTPUT_TOOL_NAME) origins.push(...(receipts.get(part.toolCallId) ?? []));
     }
-    result.set(entry.id, createHash("sha256").update(JSON.stringify(origins)).digest("hex"));
+    const group = modern.groups.get(entry.id);
+    const proof = group ? entries.filter((source) => group.includes(source.id)) : origins;
+    result.set(entry.id, createHash("sha256").update(JSON.stringify(proof)).digest("hex"));
   }
   return result;
 }
@@ -185,13 +215,15 @@ export function collectActualDeliveredSourceRecords(entries: readonly AgentEntry
     }
   }
   const delivered = collectDeliveredSourceRecords(entries);
-  const result = new Map<string, readonly CompressionRecord[]>();
+  const modern = resolveReplyHistory(entries);
+  const result = new Map<string, readonly CompressionRecord[]>(modern.records);
+  for (const id of modern.journalEntryIds) if (!result.has(id)) result.set(id, []);
   for (const entry of entries) {
     if (
       entry.type === "message" &&
       entry.data.role === "assistant" &&
       Array.isArray(entry.data.content) &&
-      entry.data.content.some((part) => part.type === "tool-call" && calls.has(part.toolCallId))
+      entry.data.content.some((part) => part.type === "tool-call" && (calls.has(part.toolCallId) || modern.maskedCalls.has(part.toolCallId)))
     )
       result.set(entry.id, delivered.get(entry.id) ?? []);
   }
@@ -346,7 +378,11 @@ function stripToolContent(
   return content.length === 0 ? null : { ...message, content: content as AgentToolMessage["content"] };
 }
 
-function collectHistoricalSendResults(entries: readonly AgentEntry[], strict = false): ReadonlyMap<string, HistoricalSendResult> {
+function collectHistoricalSendResults(
+  entries: readonly AgentEntry[],
+  strict = false,
+  maskedCalls = resolveReplyHistory(entries).maskedCalls,
+): ReadonlyMap<string, HistoricalSendResult> {
   const calls = new Map<string, { index: number; count: number }>();
   const receiptCounts = new Map<string, number>();
   for (const [index, entry] of entries.entries()) {
@@ -363,7 +399,7 @@ function collectHistoricalSendResults(entries: readonly AgentEntry[], strict = f
     if (entry.type !== "message" || entry.data.role !== "tool" || !Array.isArray(entry.data.content)) continue;
     for (const sourcePart of entry.data.content as readonly unknown[]) {
       if (!isRecord(sourcePart) || sourcePart.type !== "tool-result" || sourcePart.toolName !== HISTORICAL_OUTPUT_TOOL_NAME) continue;
-      if (typeof sourcePart.toolCallId !== "string") continue;
+      if (typeof sourcePart.toolCallId !== "string" || maskedCalls.has(sourcePart.toolCallId)) continue;
       const result = decodeHistoricalSendResult(sourcePart, strict);
       const call = calls.get(sourcePart.toolCallId);
       // Only legacy receipts retain permissive compatibility. Actual-body receipts must have

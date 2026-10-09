@@ -3,6 +3,7 @@ import type { Awaitable, Bot, Context, Logger, Session } from "koishi";
 
 import type { ChannelContext } from "../channels/index.js";
 import type { ImagePreviewCapability } from "./image-preview.js";
+import type { ReplyStickerProvider } from "./reply.js";
 import { defaultWillEngine, type WillEngine, type WillPlugin } from "./will.js";
 
 type Disposer = () => void;
@@ -29,6 +30,18 @@ export interface ChannelPluginSetupContext {
   readonly polisherActive: boolean;
   /** Core assembles this opted-in provider's role material in its frozen role section. */
   readonly rolePromptsManaged?: boolean;
+  /**
+   * Optional modern reply-delivery seam. A plugin registers one typed sticker provider (catalog,
+   * exact prior-step evidence, private lease and real transport IDs) and receives a disposer. Core
+   * never imports plugin storage or types; absence keeps standalone plugin behavior intact.
+   */
+  readonly replyDelivery?: ReplyDeliverySetupContext;
+}
+
+export interface ReplyDeliverySetupContext {
+  readonly version: 1;
+  readonly ownership: "authored" | "delegated";
+  readonly registerSticker: (provider: ReplyStickerProvider) => Disposer;
 }
 
 export interface ChannelPlugin {
@@ -156,3 +169,35 @@ export {
   type ImagePreviewFrame,
   type ImagePreviewRequest,
 } from "./image-preview.js";
+
+export {
+  fingerprintReplyPhaseInput,
+  layoutAnchorError,
+  normalizeReplyParts,
+  preflightReplyPhase,
+  projectDeliveredText,
+  REPLY_MAX_PHASE_BYTES,
+  REPLY_MAX_UNITS,
+  replyComposerImageInput,
+  ReplyCoordinator,
+  validateReplyParts,
+  type PreparedReplyUnit,
+  type ReplyDeliveryNotice,
+  type ReplyJournalWriter,
+  type ReplyLayoutComposeRequest,
+  type ReplyLayoutComposer,
+  type ReplyLayoutDraft,
+  type ReplyMode,
+  type ReplyPart,
+  type ReplyProofWriter,
+  type ReplySendFailureNotice,
+  type ReplyStickerCatalogEntry,
+  type ReplyStickerFrame,
+  type ReplyStickerLease,
+  type ReplyStickerProvider,
+  type ReplyStickerStatus,
+  type ReplyStickerTransport,
+  type ReplyStickerView,
+} from "./reply.js";
+
+export { createReplyTools, type ReplyToolSet, type ReplyToolsOptions } from "./reply-tools.js";

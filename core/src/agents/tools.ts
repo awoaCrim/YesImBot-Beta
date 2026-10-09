@@ -538,6 +538,32 @@ export function createDescribeImageTool(model: LanguageModel, resources: Channel
   };
 }
 
+export function pacedDelay(segment: readonly Element[], pacing: PacingConfig, elapsed: number): number {
+  const characters = segment.reduce((total, element) => total + elementTextLength(element), 0);
+  const delay = Math.min(Math.max(250, Math.ceil((characters / pacing.charactersPerSecond) * 1000)), 10_000);
+  return elapsed + delay >= pacing.maxTotalDelayMs ? 250 : Math.round(delay);
+}
+
+export function elementTextLength(element: Element): number {
+  return (
+    (typeof element.attrs.content === "string" ? element.attrs.content.length : 0) +
+    element.children.reduce((total, child) => total + elementTextLength(child), 0)
+  );
+}
+
+export function sleep(timeout: number, signal?: AbortSignal): Promise<void> {
+  if (timeout <= 0 || signal?.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeout);
+    signal?.addEventListener("abort", finish, { once: true });
+  });
+}
+
 function sendMessageDescription(innerThought: boolean, factsRequired: boolean, compose = false): string {
   if (compose) return composeSendMessageDescription(innerThought);
   return `向频道发送文字或消息元素。你的普通文本输出不会被发送；调用本工具才能发送 messages 中的内容。其他实际提供的发送工具可以发送它们各自支持的内容。
@@ -702,32 +728,6 @@ ${innerThought ? "inner_thought 只记录私有的简短行为判断，不发送
 
 成功返回 {ok:true,messageIds,count,deliveredMessages}，count 是实际生成的消息条数。
 失败返回 {ok:false,error,sent,failedAt,deliveredMessages?}，failedAt 是生成消息的下标，deliveredMessages 仅包含完整送达的项目；已部分发送时不得重新生成或整批重发。`;
-}
-
-function pacedDelay(segment: readonly Element[], pacing: PacingConfig, elapsed: number): number {
-  const characters = segment.reduce((total, element) => total + elementTextLength(element), 0);
-  const delay = Math.min(Math.max(250, Math.ceil((characters / pacing.charactersPerSecond) * 1000)), 10_000);
-  return elapsed + delay >= pacing.maxTotalDelayMs ? 250 : Math.round(delay);
-}
-
-function elementTextLength(element: Element): number {
-  return (
-    (typeof element.attrs.content === "string" ? element.attrs.content.length : 0) +
-    element.children.reduce((total, child) => total + elementTextLength(child), 0)
-  );
-}
-
-function sleep(timeout: number, signal?: AbortSignal): Promise<void> {
-  if (timeout <= 0 || signal?.aborted) return Promise.resolve();
-  return new Promise<void>((resolve) => {
-    const finish = () => {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", finish);
-      resolve();
-    };
-    const timer = setTimeout(finish, timeout);
-    signal?.addEventListener("abort", finish, { once: true });
-  });
 }
 
 function describeBytes(bytes: Uint8Array, mediaType?: string): string {

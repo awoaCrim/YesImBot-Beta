@@ -353,7 +353,14 @@ export function filterEntriesForCompression(entries: readonly AgentEntry[], opti
     // The canonical owner still carries the extracted source and its verified receipt proof.
     const records =
       facts && entry.type === "message"
-        ? [{ entryId: entry.id, timestamp: compactSourceTimestamp(entry), role: "assistant" as const, text: facts.join("；") }]
+        ? [
+            {
+              entryId: entry.id,
+              timestamp: options.deliveredRecords?.get(entry.id)?.[0]?.timestamp ?? compactSourceTimestamp(entry),
+              role: "assistant" as const,
+              text: facts.join("；"),
+            },
+          ]
         : (options.deliveredRecords?.get(entry.id) ?? renderCompressionRecords(entry));
     for (const record of records) {
       // Summary mode keeps the legacy renderer: ordinary Agent `user` messages were never

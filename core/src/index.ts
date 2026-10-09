@@ -11,6 +11,18 @@ export default YesImBotService;
 export type {
   ChannelPlugin,
   ChannelPluginSetupContext,
+  ReplyDeliverySetupContext,
+  ReplyLayoutComposeRequest,
+  ReplyLayoutComposer,
+  ReplyLayoutDraft,
+  ReplyPart,
+  ReplyStickerFrame,
+  ReplyStickerView,
+  ReplyStickerProvider,
+  ReplyStickerLease,
+  ReplyStickerTransport,
+  ReplyToolsOptions,
+  ReplyToolSet,
   ImagePreviewCapability,
   ImagePreviewFrame,
   ImagePreviewRequest,
@@ -43,6 +55,10 @@ export {
 } from "./agents/index.js";
 
 export { withAbortSignal } from "./abort.js";
+
+export { normalizeReplyParts, validateReplyParts, createReplyTools, ReplyCoordinator, REPLY_MAX_PHASE_BYTES, REPLY_MAX_UNITS } from "./agents/index.js";
+
+export { replyPlatformIds } from "./conversations/reply-receipt.js";
 
 export type { ChannelContext, ChannelKey } from "./channels/index.js";
 

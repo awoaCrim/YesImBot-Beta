@@ -1788,7 +1788,8 @@ describe("Runtimes identity", () => {
       expect(await runtimes.get(channel, oldBot as never)).toBe(first);
       expect(setup.mock.calls.at(-1)?.[1]).toBe(oldBot);
       const oldSend = oldAgent.tools?.find((tool) => tool.name === "send_message");
-      await oldSend?.execute?.({ messages: ["before reconnect"] }, { toolCallId: "before", turnId: "before" });
+      state.active = "before";
+      await oldSend?.execute?.({ parts: [{ kind: "text", text: "before reconnect" }], mode: "raw" }, { toolCallId: "before", turnId: "before", messages: [] });
       expect(oldBot.sendMessage).toHaveBeenCalledOnce();
       oldBot.sendMessage.mockRejectedValue(new Error("old transport closed"));
 
@@ -1811,7 +1812,10 @@ describe("Runtimes identity", () => {
       expect(await channel.conversation.storage.read()).toEqual(before);
       expect(before).toContainEqual(entry);
       const newSend = newAgent.tools?.find((tool) => tool.name === "send_message");
-      await expect(newSend?.execute?.({ messages: ["after reconnect"] }, { toolCallId: "after", turnId: "after" })).resolves.toMatchObject({ ok: true });
+      state.active = "after";
+      await expect(
+        newSend?.execute?.({ parts: [{ kind: "text", text: "after reconnect" }], mode: "raw" }, { toolCallId: "after", turnId: "after", messages: [] }),
+      ).resolves.toMatchObject({ ok: true });
       expect(newBot.sendMessage).toHaveBeenCalledOnce();
       expect(oldBot.sendMessage).toHaveBeenCalledOnce();
     } finally {
@@ -2700,23 +2704,21 @@ describe("Runtimes polisher revisions", () => {
       releaseSetup();
       const runtime = await pending;
 
-      expect(vi.mocked(createAgent).mock.calls.length - before).toBe(2);
+      // Registry drift during setup is retired before init, so no stale Agent/greeting is created.
+      expect(vi.mocked(createAgent).mock.calls.length - before).toBe(1);
       expect(activeStates).toEqual([true, false]);
-      const discarded = vi.mocked(createAgent).mock.calls.at(-2)?.[0];
       const current = vi.mocked(createAgent).mock.calls.at(-1)?.[0];
-      if (!discarded || !current) throw new Error("Runtime Agent configurations were not captured");
+      if (!current) throw new Error("Runtime Agent configuration was not captured");
       const promptOf = (agentConfig: NonNullable<typeof current>) => {
         if (typeof agentConfig.systemPrompt !== "function") throw new Error("Agent system prompt was not captured");
         return agentConfig.systemPrompt as () => Promise<Array<{ content: unknown }>>;
       };
-      const discardedPrompt = (await promptOf(discarded)()).map((block) => String(block.content)).join("\n");
       const currentPrompt = (await promptOf(current)()).map((block) => String(block.content)).join("\n");
       const currentSend = current.tools?.find((tool) => tool.name === "send_message");
       if (!currentSend) throw new Error("send_message tool was not captured");
 
-      expect(discardedPrompt).not.toContain("<persona>");
       expect(currentPrompt).toContain("<persona>");
-      expect((currentSend.inputSchema as { jsonSchema: { required?: string[] } }).jsonSchema.required).toEqual(["messages"]);
+      expect((currentSend.inputSchema as { jsonSchema: { required?: string[] } }).jsonSchema.required).toEqual(["parts"]);
       expect(runtime).toBeDefined();
       await runtimes.stop();
     } finally {

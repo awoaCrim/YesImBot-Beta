@@ -1,5 +1,5 @@
 import { h, type Bot, type Element } from "koishi";
-import type { ChannelContext } from "koishi-plugin-yesimbot";
+import { replyPlatformIds, type ChannelContext } from "koishi-plugin-yesimbot";
 
 const ANIMATED_STICKER_FILENAME = "sticker.gif";
 const ANIMATED_STICKER_SUMMARY = "[动画表情]";
@@ -10,7 +10,10 @@ export interface StickerSendInput {
 }
 
 export interface StickerSender {
+  /** Legacy/admin path: unchanged void contract. */
   send(input: StickerSendInput): Promise<void>;
+  /** Narrow modern proof path returning the real platform IDs. */
+  sendWithProof?(input: StickerSendInput): Promise<readonly string[]>;
 }
 
 export class BotStickerSender implements StickerSender {
@@ -21,6 +24,12 @@ export class BotStickerSender implements StickerSender {
 
   public async send(input: StickerSendInput): Promise<void> {
     await this.bot.sendMessage(this.scope.channelId, [createStickerImageElement(input.bytes, input.mediaType)]);
+  }
+
+  /** Same transport, bounded actual IDs. An empty/invalid result stays unknown, never invented. */
+  public async sendWithProof(input: StickerSendInput): Promise<readonly string[]> {
+    const ids = await this.bot.sendMessage(this.scope.channelId, [createStickerImageElement(input.bytes, input.mediaType)]);
+    return replyPlatformIds(ids) ?? [];
   }
 }
 

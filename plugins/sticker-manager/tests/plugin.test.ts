@@ -2,7 +2,7 @@
 import { createAgent, createUserMessage, createToolMessage, EphemeralImageProjectionStore, jsonSchema, type AgentPlugin } from "@yesimbot/agent-runtime";
 import type { ModelMessage } from "ai";
 import { convertArrayToReadableStream, MockLanguageModelV3 } from "ai/test";
-import type { ChannelContext, ChannelPluginSetupContext } from "koishi-plugin-yesimbot";
+import type { ChannelContext, ChannelPluginSetupContext, ReplyStickerProvider } from "koishi-plugin-yesimbot";
 import { PNG } from "pngjs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -23,6 +23,7 @@ vi.mock("koishi", () => {
   };
 });
 
+import type { StickerDeliveryService } from "../src/delivery.js";
 import StickerManagerPlugin from "../src/index.js";
 import type { StickerConfig, StickerProjection, StickerRow } from "../src/types.js";
 import { createMemoryModel } from "./helpers.js";
@@ -79,7 +80,7 @@ describe("StickerManagerPlugin", () => {
   });
 
   function createHarness(overrides: Partial<StickerConfig> = {}) {
-    const model = createMemoryModel<StickerRow>();
+    const model = createMemoryModel<{ [K in keyof StickerRow]: StickerRow[K] }>();
     const { commands, command } = createCommandMock();
     const agentDispose = { current: undefined as (() => void) | undefined };
     const logger = { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
@@ -177,6 +178,91 @@ describe("StickerManagerPlugin", () => {
     );
   });
 
+  it.each(["authored", "delegated"] as const)("modern %s hides standalone delivery and registers one disposable capability", async (ownership) => {
+    const harness = createHarness({ enableSteal: false, tagMode: true });
+    const unregister = vi.fn();
+    const registerSticker = vi.fn((_provider: ReplyStickerProvider) => unregister);
+    const runtime = {
+      imageProjection: new EphemeralImageProjectionStore(),
+      polisherActive: ownership === "delegated",
+      replyDelivery: { version: 1, ownership, registerSticker },
+    } as ChannelPluginSetupContext;
+    const plugin = await harness.start({ selfId: "bot" }, scope, runtime);
+    expect(registerSticker).toHaveBeenCalledOnce();
+    await expectToolNames(plugin, ["sticker_preview", "sticker_categories", "sticker_search", "sticker_tags"]);
+    const prompt = await pluginPrompt(plugin);
+    expect(prompt).not.toContain("sticker_send");
+    expect(prompt).not.toContain("continue 设为 true");
+    expect(prompt).toContain(ownership === "authored" ? "完整 parts" : "prepare_reply");
+    const tools = typeof plugin?.tools === "function" ? await plugin.tools({} as never) : [];
+    expect(tools?.find((tool) => tool.name === "sticker_preview")?.description).not.toContain("sticker_send");
+    const provider = registerSticker.mock.calls[0]![0];
+    const revision = provider.revision;
+    expect(provider.status("turn")).toBe("eligible");
+    await plugin?.stop?.();
+    await plugin?.stop?.();
+    expect(unregister).toHaveBeenCalledOnce();
+    expect(provider.revision).toBeGreaterThan(revision);
+    expect(provider.status("turn")).toBe("unavailable");
+    await expect(provider.preflight({ stickerId: "s", turnId: "turn", messages: [] })).resolves.toEqual({ error: "StickerCapabilityRetired" });
+    expect(harness.commands.map((command) => command.name)).toContain("yesimbot.sticker.import");
+  });
+
+  it("binds each lease preflight to provider disposal and Core's later permission", async () => {
+    const harness = createHarness();
+    await harness.start();
+    if (!registeredPlugin) throw new Error("missing plugin");
+    const registerSticker = vi.fn((_provider: ReplyStickerProvider) => vi.fn());
+    const runtime: ChannelPluginSetupContext = {
+      imageProjection: new EphemeralImageProjectionStore(),
+      polisherActive: false,
+      replyDelivery: { version: 1, ownership: "authored", registerSticker },
+    };
+    const preflight = vi.fn(async (_input: Parameters<StickerDeliveryService["preflight"]>[0]) => ({ error: "test_preflight" }));
+    const delivery = { preflight } as unknown as StickerDeliveryService;
+    const unregister = registeredPlugin.registerDelivery(scope, {} as never, runtime, delivery);
+    const provider = registerSticker.mock.calls[0]![0];
+    let coreAllowed = true;
+    await provider.preflight({ stickerId: "s", turnId: "turn", messages: [], stillAllowed: () => coreAllowed });
+    const bound = preflight.mock.calls[0]![0].stillAllowed!;
+    expect(bound()).toBe(true);
+    coreAllowed = false;
+    expect(bound()).toBe(false);
+    coreAllowed = true;
+    await harness.stop();
+    expect(bound()).toBe(false); // Existing lease carries this callback past later byte awaits.
+    unregister?.();
+  });
+
+  it("modern guards reject legacy sticker resources in A parts and B exact payloads before output", async () => {
+    const harness = createHarness();
+    const plugin = await harness.start({ selfId: "bot" }, scope, {
+      imageProjection: new EphemeralImageProjectionStore(),
+      polisherActive: true,
+      replyDelivery: { version: 1, ownership: "delegated", registerSticker: () => () => {} },
+    });
+    const blocked = [
+      { toolName: "send_message", args: { parts: [{ kind: "text", text: '<img src="artifact://sticker/old.png"/>' }] } },
+      { toolName: "prepare_reply", args: { facts: [], intent: "react", verbatim: ['<sticker id="s"/>'] } },
+    ];
+    for (const call of blocked) expect(await plugin?.beforeToolCall?.(call as never, {} as never)).toMatchObject({ type: "block" });
+    expect(
+      await plugin?.beforeToolCall?.({ toolName: "send_message", args: { parts: [{ kind: "sticker", sticker_id: "viewed-id" }] } } as never, {} as never),
+    ).toBeUndefined();
+  });
+
+  it("does not infer modern delivery from an unsupported setup seam", async () => {
+    const harness = createHarness();
+    const registerSticker = vi.fn();
+    const plugin = await harness.start({ selfId: "bot" }, scope, {
+      imageProjection: new EphemeralImageProjectionStore(),
+      polisherActive: false,
+      replyDelivery: { version: 2, ownership: "authored", registerSticker },
+    } as unknown as ChannelPluginSetupContext);
+    expect(registerSticker).not.toHaveBeenCalled();
+    expect(await toolNames(plugin)).toContain("sticker_send");
+  });
+
   it("requires sticker_send instead of advertising direct sticker output", async () => {
     const harness = createHarness({ enableSteal: false, stickerElement: true });
     const agentPlugin = await harness.start();
@@ -198,7 +284,7 @@ describe("StickerManagerPlugin", () => {
     expect(prompt).not.toContain("需要发图时可直接输出");
     expect(prompt).not.toContain("不需要调用 sticker_send");
 
-    const tools = (await agentPlugin?.tools?.({} as never)) ?? [];
+    const tools = typeof agentPlugin?.tools === "function" ? ((await agentPlugin.tools({} as never)) ?? []) : [];
     const sendTool = tools.find((tool) => tool.name === "sticker_send");
     expect(sendTool?.description).toContain("已经用 sticker_preview 查看过");
     expect(sendTool?.description).toContain("continue=true");
@@ -445,7 +531,7 @@ describe("StickerManagerPlugin", () => {
     vi.spyOn(registeredPlugin.store, "readBytes").mockResolvedValue(new Uint8Array(PNG.sync.write(png)));
     vi.spyOn(registeredPlugin.store, "markUsed").mockResolvedValue(sticker);
 
-    const tool = () => agentPlugin.tools?.({} as never);
+    const tool = async () => (typeof agentPlugin.tools === "function" ? ((await agentPlugin.tools({} as never)) ?? []) : []);
     const firstTools = await tool();
     const firstTool = firstTools?.find((candidate) => candidate.name === "sticker_send");
     const preview = firstTools?.find((candidate) => candidate.name === "sticker_preview");

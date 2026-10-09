@@ -5,6 +5,7 @@ import type { ChannelPluginSetupContext, ChannelResources, ChannelContext } from
 import { ModelStickerClassifier } from "./classifier.js";
 import { registerStickerCommands } from "./commands.js";
 import { StickerConfigSchema } from "./config.js";
+import { StickerDeliveryService } from "./delivery.js";
 import { StickerFileStore } from "./files.js";
 import { StickerPreviewGate, StickerSendSlot } from "./preview-evidence.js";
 import { createStickerPreviewTool } from "./preview-tool.js";
@@ -30,6 +31,7 @@ export default class StickerManagerPlugin {
   public readonly store: StickerStore;
 
   private started = false;
+  private capabilityRevisionValue = 0;
   private classifier: ModelStickerClassifier | undefined;
   private disposeAgentPlugin?: () => void;
   private disposeCommands?: () => void;
@@ -69,6 +71,36 @@ export default class StickerManagerPlugin {
     return this.createAgentPlugin(scope, bot, resources, classifier, runtime);
   }
 
+  /** Registers one typed modern capability for this channel; the disposer is idempotent. */
+  public registerDelivery(scope: ChannelContext, bot: Bot, runtime: ChannelPluginSetupContext, delivery: StickerDeliveryService): (() => void) | undefined {
+    const register = runtime.replyDelivery?.registerSticker;
+    if (!register || runtime.replyDelivery?.version !== 1) return undefined;
+    let disposed = false;
+    let generation = 0;
+    const getRevision = () => this.capabilityRevision;
+    const revision = getRevision();
+    const current = () => !disposed && getRevision() === revision;
+    const dispose = register({
+      get revision() {
+        return getRevision() + generation;
+      },
+      status: (turnId) => (current() ? delivery.status(turnId) : "unavailable"),
+      catalog: () => (current() ? delivery.catalog() : Promise.resolve([])),
+      view: (turnId, messages) => (current() ? delivery.view(turnId, messages) : Promise.resolve(undefined)),
+      isViewCurrent: (view, turnId) => current() && delivery.isViewCurrent(view, turnId),
+      preflight: (input) =>
+        current()
+          ? delivery.preflight({ ...input, stillAllowed: () => current() && (input.stillAllowed?.() ?? true) })
+          : Promise.resolve({ error: "StickerCapabilityRetired" }),
+    });
+    return () => {
+      if (disposed) return;
+      disposed = true;
+      generation++;
+      dispose();
+    };
+  }
+
   private createAgentPlugin(
     scope: ChannelContext,
     bot: Bot,
@@ -76,10 +108,27 @@ export default class StickerManagerPlugin {
     classifier: ModelStickerClassifier,
     runtime: ChannelPluginSetupContext | undefined,
   ): AgentPlugin {
+    const modern = runtime?.replyDelivery?.version === 1;
     const artifactIds = new Map<string, string>();
     const sendSlot = new StickerSendSlot();
     const previewGate = new StickerPreviewGate();
     const scopeKey = scopeKeyFor(scope, this.config);
+    const sender = new BotStickerSender(bot, scope);
+    const delivery = new StickerDeliveryService({
+      store: this.store,
+      sender,
+      scope,
+      config: this.config,
+      sendSlot,
+      previewGate,
+      onUsageWarning: (stickerId, cause) => this.logger.warn("sticker_usage_update_failed", { stickerId, cause }),
+    });
+    const disposeDelivery = this.registerDelivery(
+      scope,
+      bot,
+      runtime ?? { imageProjection: new EphemeralImageProjectionStore(), polisherActive: false },
+      delivery,
+    );
     let catalogTurnId: string | undefined;
     let catalogPromise: Promise<string | undefined> | undefined;
     return {
@@ -94,22 +143,24 @@ export default class StickerManagerPlugin {
           projection: runtime?.imageProjection ?? new EphemeralImageProjectionStore(),
           previewCapability: runtime?.imagePreview,
           gate: previewGate,
+          deliveryMode: modern ? runtime.replyDelivery!.ownership : "legacy",
         }),
         ...createStickerTools({
           store: this.store,
           classifier,
-          sender: new BotStickerSender(bot, scope),
+          sender,
           assets: resources.assets,
           scope,
           config: this.config,
           sendSlot,
           previewGate,
-        }),
+          delivery,
+        }).filter((tool) => !modern || tool.name !== "sticker_send"),
       ],
       beforeToolCall: (call) => {
         // A legacy sticker artifact URI or a bare <sticker/> element in send_message would deliver
         // unread bytes through the text-resource path, bypassing both the preview gate and the quota.
-        if (call.toolName !== "send_message") return;
+        if (call.toolName !== "send_message" && call.toolName !== "prepare_reply") return;
         const reason = stickerSendMessageBlockReason(call.args);
         return reason ? { type: "block", reason } : undefined;
       },
@@ -122,6 +173,7 @@ export default class StickerManagerPlugin {
         }
       },
       stop: () => {
+        disposeDelivery?.();
         sendSlot.clear();
         previewGate.clear();
       },
@@ -158,12 +210,17 @@ export default class StickerManagerPlugin {
           config: this.config,
           artifactIds,
         }),
-      appendSystemPrompt: () => formatStickerPrompt(this.config),
+      appendSystemPrompt: () => formatStickerPrompt(this.config, modern ? runtime.replyDelivery!.ownership : "legacy"),
     } satisfies AgentPlugin;
+  }
+
+  private get capabilityRevision(): number {
+    return this.capabilityRevisionValue;
   }
 
   public async stop(): Promise<void> {
     this.started = false;
+    this.capabilityRevisionValue += 1;
     this.disposeAgentPlugin?.();
     this.disposeAgentPlugin = undefined;
     this.classifier = undefined;
@@ -173,7 +230,18 @@ export default class StickerManagerPlugin {
   }
 }
 
-function formatStickerPrompt(config: StickerConfig): string {
+function formatStickerPrompt(config: StickerConfig, mode: "legacy" | "authored" | "delegated" = "legacy"): string {
+  if (mode !== "legacy")
+    return [
+      "表情包可选，与文字没有固定搭配，也不要求每轮发送。查看不意味着发送；不合适时省略。",
+      "必须在本轮更早的已完成步骤用 sticker_preview 看到实际画面。分类和搜索只是数据，不是画面或发送许可。",
+      mode === "authored"
+        ? "使用 send_message 的完整 parts 一起决定文字分条和表情位置，sticker 单元只填已查看的精确 sticker_id；可以单独、在文字前/后或两段文字之间。"
+        : "表达模型负责文字、分条和是否使用表情；你按 prepare_reply 的 selector 查看候选，再只用 preparation_id 继续准备，不编写视觉说明或角色草稿。",
+      "同一轮最多一次确认或不确定的表情发送；不能用 <sticker/> 或历史 artifact://sticker/ 链接绕过查看与额度。",
+      ...(config.enableSteal ? ["sticker_steal 可收藏当前消息中的图片。"] : []),
+      ...(config.tagMode ? ["sticker_tags 可查询实验性标签。"] : []),
+    ].join("\n");
   return [
     "表情包是可选的自然回应之一，和文字地位相同：开心、得意、吐槽、害羞或简短情绪反应时可以用，也可以只发文字或什么都不发。",
     "顺序由你决定：可以只发表情包、只发文字、先表情后文字、先文字后表情，或在两段文字之间发表情；没有固定搭配，不要求每轮都发表情包。",
