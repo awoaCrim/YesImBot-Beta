@@ -109,6 +109,7 @@ export default class StickerManagerPlugin {
     runtime: ChannelPluginSetupContext | undefined,
   ): AgentPlugin {
     const modern = runtime?.replyDelivery?.version === 1;
+    const deliveryMode: "legacy" | "authored" = modern ? runtime.replyDelivery!.ownership : "legacy";
     const artifactIds = new Map<string, string>();
     const sendSlot = new StickerSendSlot();
     const previewGate = new StickerPreviewGate();
@@ -123,12 +124,7 @@ export default class StickerManagerPlugin {
       previewGate,
       onUsageWarning: (stickerId, cause) => this.logger.warn("sticker_usage_update_failed", { stickerId, cause }),
     });
-    const disposeDelivery = this.registerDelivery(
-      scope,
-      bot,
-      runtime ?? { imageProjection: new EphemeralImageProjectionStore(), polisherActive: false },
-      delivery,
-    );
+    const disposeDelivery = this.registerDelivery(scope, bot, runtime ?? { imageProjection: new EphemeralImageProjectionStore() }, delivery);
     let catalogTurnId: string | undefined;
     let catalogPromise: Promise<string | undefined> | undefined;
     return {
@@ -143,7 +139,7 @@ export default class StickerManagerPlugin {
           projection: runtime?.imageProjection ?? new EphemeralImageProjectionStore(),
           previewCapability: runtime?.imagePreview,
           gate: previewGate,
-          deliveryMode: modern ? runtime.replyDelivery!.ownership : "legacy",
+          deliveryMode,
         }),
         ...createStickerTools({
           store: this.store,
@@ -160,7 +156,7 @@ export default class StickerManagerPlugin {
       beforeToolCall: (call) => {
         // A legacy sticker artifact URI or a bare <sticker/> element in send_message would deliver
         // unread bytes through the text-resource path, bypassing both the preview gate and the quota.
-        if (call.toolName !== "send_message" && call.toolName !== "prepare_reply") return;
+        if (call.toolName !== "send_message") return;
         const reason = stickerSendMessageBlockReason(call.args);
         return reason ? { type: "block", reason } : undefined;
       },
@@ -210,7 +206,7 @@ export default class StickerManagerPlugin {
           config: this.config,
           artifactIds,
         }),
-      appendSystemPrompt: () => formatStickerPrompt(this.config, modern ? runtime.replyDelivery!.ownership : "legacy"),
+      appendSystemPrompt: () => formatStickerPrompt(this.config, deliveryMode),
     } satisfies AgentPlugin;
   }
 
@@ -230,14 +226,12 @@ export default class StickerManagerPlugin {
   }
 }
 
-function formatStickerPrompt(config: StickerConfig, mode: "legacy" | "authored" | "delegated" = "legacy"): string {
+function formatStickerPrompt(config: StickerConfig, mode: "legacy" | "authored" = "legacy"): string {
   if (mode !== "legacy")
     return [
       "表情包可选，与文字没有固定搭配，也不要求每轮发送。查看不意味着发送；不合适时省略。",
       "必须在本轮更早的已完成步骤用 sticker_preview 看到实际画面。分类和搜索只是数据，不是画面或发送许可。",
-      mode === "authored"
-        ? "使用 send_message 的完整 parts 一起决定文字分条和表情位置，sticker 单元只填已查看的精确 sticker_id；可以单独、在文字前/后或两段文字之间。"
-        : "表达模型负责文字、分条和是否使用表情；你按 prepare_reply 的 selector 查看候选，再只用 preparation_id 继续准备，不编写视觉说明或角色草稿。",
+      "使用 send_message 的完整 parts 一起决定文字分条和表情位置，sticker 单元只填已查看的精确 sticker_id；可以单独、在文字前/后或两段文字之间。",
       "同一轮最多一次确认或不确定的表情发送；不能用 <sticker/> 或历史 artifact://sticker/ 链接绕过查看与额度。",
       ...(config.enableSteal ? ["sticker_steal 可收藏当前消息中的图片。"] : []),
       ...(config.tagMode ? ["sticker_tags 可查询实验性标签。"] : []),

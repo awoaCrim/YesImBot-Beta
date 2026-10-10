@@ -2,7 +2,7 @@ import { createAssistantMessage, createEntry, createSystemMessage, createToolMes
 import { describe, expect, it } from "vitest";
 
 import { createDeliveredTranscriptMessage, isDeliveredTranscript } from "../src/conversations/delivered-transcript.js";
-import { stripInternalAssistantInputs } from "../src/conversations/internal-history.js";
+import { collectActualDeliveredSourceRecords, stripInternalAssistantInputs } from "../src/conversations/internal-history.js";
 
 describe("internal model-history projection", () => {
   it("removes prior internal tool fields without changing durable entries", () => {
@@ -55,6 +55,54 @@ describe("internal model-history projection", () => {
         }),
       }),
     );
+  });
+
+  it.each(["default", "gemini-native"] as const)("hides retired reply preparation in %s history without changing durable data", (mode) => {
+    const entries = [
+      createEntry(
+        "message",
+        createAssistantMessage([
+          { type: "tool-call", toolCallId: "prepare-old", toolName: "prepare_reply", input: { facts: ["private preparation"], intent: "private intent" } },
+          { type: "tool-call", toolCallId: "read-current", toolName: "read", input: { uri: "asset://reference" } },
+        ]),
+        { id: "assistant-old", timestamp: 1 },
+      ),
+      createEntry(
+        "message",
+        createToolMessage([
+          {
+            type: "tool-result",
+            toolCallId: "prepare-old",
+            toolName: "prepare_reply",
+            output: { type: "json", value: { reply_id: "retired-id", parts: [{ kind: "text", text: "private prepared draft" }] } },
+          },
+          { type: "tool-result", toolCallId: "read-current", toolName: "read", output: { type: "json", value: { text: "durable read" } } },
+        ]),
+        { id: "tool-old", timestamp: 2 },
+      ),
+      createEntry(
+        "message",
+        createToolMessage([
+          { type: "tool-result", toolCallId: "orphan", toolName: "prepare_reply", output: { type: "json", value: { text: "private orphan draft" } } },
+        ]),
+        { id: "orphan-tool", timestamp: 3 },
+      ),
+    ];
+    const durableBefore = JSON.stringify(entries);
+    const projected = stripInternalAssistantInputs(entries, mode);
+
+    expect(projected).toHaveLength(2);
+    expect(projected[0]).toMatchObject({
+      id: "assistant-old",
+      data: { content: [{ type: "tool-call", toolCallId: "read-current", toolName: "read", input: { uri: "asset://reference" } }] },
+    });
+    expect(projected[1]).toMatchObject({
+      id: "tool-old",
+      data: { content: [{ type: "tool-result", toolCallId: "read-current", toolName: "read", output: { type: "json", value: { text: "durable read" } } }] },
+    });
+    expect(JSON.stringify(projected)).not.toMatch(/prepare_reply|private|retired-id/);
+    expect(JSON.stringify(entries)).toBe(durableBefore);
+    expect(stripInternalAssistantInputs(projected, mode)).toEqual(projected);
   });
 
   it("hides ephemeral image traces but keeps durable reads", () => {
@@ -157,6 +205,101 @@ describe("internal model-history projection", () => {
     expect(JSON.stringify(projected)).not.toContain("artifact://old-image");
     expect(JSON.stringify(projected)).not.toContain("send_message");
     expect(stripInternalAssistantInputs(projected)).toEqual(projected);
+  });
+
+  it.each(["default", "gemini-native"] as const)("reads old actual-body receipts in %s mode without reviving expression inputs", (mode) => {
+    const entries = [
+      createEntry(
+        "message",
+        createAssistantMessage([
+          { type: "tool-call", toolCallId: "old-compose", toolName: "send_message", input: { facts: ["private old fact"], intent: "private old intent" } },
+        ]),
+        { id: "old-assistant", timestamp: 1 },
+      ),
+      createEntry(
+        "message",
+        createToolMessage([
+          {
+            type: "tool-result",
+            toolCallId: "old-compose",
+            toolName: "send_message",
+            output: { type: "json", value: { ok: true, messageIds: ["platform-1"], count: 1, deliveredMessages: ["old delivered body"] } },
+          },
+        ]),
+        { id: "old-result", timestamp: 2 },
+      ),
+    ];
+    const durableBefore = JSON.stringify(entries);
+    const projected = stripInternalAssistantInputs(entries, mode);
+
+    expect(projected).toHaveLength(1);
+    expect(projected[0]).toMatchObject({
+      data: { type: "yesimbot.delivered-transcript", data: { messages: ["old delivered body"], deliveredCount: 1, partial: false } },
+    });
+    expect(collectActualDeliveredSourceRecords(entries).get("old-assistant")).toEqual([
+      expect.objectContaining({ role: "assistant", text: "old delivered body" }),
+    ]);
+    expect(JSON.stringify(projected)).not.toMatch(/private old|send_message/);
+    expect(JSON.stringify(entries)).toBe(durableBefore);
+  });
+
+  it("reads only the complete prefix from an old partial actual-body receipt", () => {
+    const entries = [
+      createEntry(
+        "message",
+        createAssistantMessage([
+          { type: "tool-call", toolCallId: "old-partial", toolName: "send_message", input: { messages: ["unsent draft", "failed draft"] } },
+        ]),
+        { id: "old-assistant", timestamp: 1 },
+      ),
+      createEntry(
+        "message",
+        createToolMessage([
+          {
+            type: "tool-result",
+            toolCallId: "old-partial",
+            toolName: "send_message",
+            output: { type: "json", value: { ok: false, sent: ["platform-1"], failedAt: 1, deliveredMessages: ["actual complete prefix"] } },
+          },
+        ]),
+        { id: "old-result", timestamp: 2 },
+      ),
+    ];
+    expect(stripInternalAssistantInputs(entries)[0]).toMatchObject({
+      data: { type: "yesimbot.delivered-transcript", data: { messages: ["actual complete prefix"], deliveredCount: 1, partial: true } },
+    });
+    expect(collectActualDeliveredSourceRecords(entries).get("old-assistant")).toEqual([expect.objectContaining({ text: "actual complete prefix" })]);
+  });
+
+  it.each(["missing IDs", "mismatched count", "duplicate result", "result before call"])("fails closed for an old actual-body receipt with %s", (issue) => {
+    const assistant = createEntry(
+      "message",
+      createAssistantMessage([{ type: "tool-call", toolCallId: "old-send", toolName: "send_message", input: { messages: ["unproven draft"] } }]),
+      { id: "old-assistant", timestamp: 1 },
+    );
+    const tool = createEntry(
+      "message",
+      createToolMessage([
+        {
+          type: "tool-result",
+          toolCallId: "old-send",
+          toolName: "send_message",
+          output: {
+            type: "json",
+            value: {
+              ok: true,
+              messageIds: issue === "missing IDs" ? [] : ["platform-1"],
+              count: issue === "mismatched count" ? 2 : 1,
+              deliveredMessages: ["unproven receipt body"],
+            },
+          },
+        },
+      ]),
+      { id: "old-result", timestamp: 2 },
+    );
+    const entries = issue === "result before call" ? [tool, assistant] : issue === "duplicate result" ? [assistant, tool, tool] : [assistant, tool];
+    for (const mode of ["default", "gemini-native"] as const) expect(stripInternalAssistantInputs(entries, mode)).toEqual([]);
+    expect(collectActualDeliveredSourceRecords(entries).get("old-assistant")).toEqual([]);
   });
 
   it("moves all delivered transcripts ahead of ordinary history", () => {

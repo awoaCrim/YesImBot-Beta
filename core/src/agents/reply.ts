@@ -24,24 +24,20 @@ import {
 } from "../conversations/reply-receipt.js";
 import { parseReply } from "../messages/index.js";
 import { prepareOutputSegmentsWithProjection, ResourceReadError, type ChannelResources } from "../resources/index.js";
-import { extractProtectedTokens, type PolisherTurnContext } from "./polisher.js";
 import { pacedDelay, sleep } from "./tools.js";
 
-export const MAX_PREPARATION_MS = 60_000;
-
-export const MAX_EXPRESSION_PASSES = 2;
-
 export const validPlatformIds = replyPlatformIds;
+
+// Structural element tags, resource URIs, @ mentions, and numeric expressions must survive element
+// parsing exactly. This is a conservative token check used by outgoing-anchor verification.
+const PROTECTED_TOKEN_PATTERN =
+  /<\/?[a-z][a-z0-9-]*\b[^<>]*>|[a-z][a-z0-9+.-]*:\/\/[^\s<>"'()[\]{}，。！？；：、]+|@[\p{L}\p{N}\p{M}_.-]+|[+\-−]?\d+(?:[.,，．/／]\d+)*(?:[%％])?/giu;
 
 export type ReplyMode = "element" | "raw";
 
 export type ReplyStickerStatus = "eligible" | "reserved" | "consumed" | "unavailable";
 
 export type ReplyPart = { readonly kind: "text"; readonly text: string } | { readonly kind: "sticker"; readonly stickerId: string };
-
-export type ReplyLayoutDraft =
-  | { readonly kind: "layout"; readonly parts: readonly ReplyPart[] }
-  | { readonly kind: "preview"; readonly selector: { readonly category: string } };
 
 export interface ReplyStickerFrame {
   readonly bytes: Uint8Array;
@@ -95,34 +91,6 @@ export interface ReplyStickerProvider {
     /** Server-owned permission recheck after lease awaits and immediately before transport. */
     readonly stillAllowed?: () => boolean;
   }): Promise<{ readonly lease: ReplyStickerLease } | { readonly error: string }>;
-}
-
-export interface ReplyLayoutComposeRequest {
-  readonly mode: "reply-layout";
-  readonly stage: 1 | 2;
-  readonly facts: readonly string[];
-  readonly intent: string;
-  readonly verbatim: readonly string[];
-  readonly turnContext: PolisherTurnContext;
-  readonly profile: { readonly persona: string; readonly roleInstructions?: string; readonly characterDefinition?: string };
-  readonly sticker: {
-    readonly status: ReplyStickerStatus;
-    readonly catalog: readonly ReplyStickerCatalogEntry[];
-    readonly view?: ReplyStickerView;
-    readonly consumed?: boolean;
-    readonly imageInput?: boolean;
-    readonly previewAvailable?: boolean;
-  };
-  readonly previous?: { readonly error: string };
-}
-
-export interface ReplyLayoutComposer {
-  readonly name: string;
-  readonly version: 1;
-  readonly imageInput?: boolean;
-  readonly supportsImages?: (context: unknown) => boolean;
-  readonly isCurrent?: () => boolean;
-  compose(request: ReplyLayoutComposeRequest, context: unknown, signal?: AbortSignal): Promise<ReplyLayoutDraft | undefined>;
 }
 
 export interface PreparedReplyUnit {
@@ -179,8 +147,6 @@ export interface TryDeliverReplyInput {
   readonly allowed: boolean;
   readonly stillAllowed?: () => boolean;
   readonly keepGoing?: boolean;
-  readonly facts?: readonly string[];
-  readonly intent?: string;
   readonly verbatim?: readonly string[];
 }
 
@@ -268,7 +234,6 @@ export class ReplyCoordinator {
       mode,
       resources: this.deps.resources,
       signal: input.signal,
-      facts: input.facts,
       verbatim: input.verbatim,
     });
     if (!preflight.ok || !preflight.units)
@@ -316,8 +281,6 @@ export class ReplyCoordinator {
           channelId: target,
           expectedUnits: replyExpectedUnits(units),
           inputFingerprint: fingerprintReplyPhaseInput({
-            facts: input.facts ?? [],
-            intent: input.intent ?? "",
             verbatim: input.verbatim ?? [],
             target,
             mode,
@@ -532,6 +495,11 @@ export class ReplyCoordinator {
   }
 }
 
+/** Outward anchors (elements, URIs, mentions, numbers) that parsed delivery must still contain. */
+export function extractProtectedTokens(text: string): string[] {
+  return text.match(PROTECTED_TOKEN_PATTERN) ?? [];
+}
+
 /** Accept the wire spelling sticker_id and the typed internal spelling, but never extra fields. */
 export function normalizeReplyParts(value: unknown): ReplyPart[] | undefined {
   if (!Array.isArray(value) || !value.length || value.length > REPLY_MAX_UNITS) return undefined;
@@ -573,21 +541,7 @@ export function projectDeliveredText(input: { readonly source: string; readonly 
   return input.mode === "raw" ? input.source : projectElements(parseReply(input.source));
 }
 
-export function layoutAnchorError(input: {
-  readonly facts: readonly string[];
-  readonly verbatim: readonly string[];
-  readonly texts: readonly string[];
-}): string | undefined {
-  const required = extractProtectedTokens([...input.facts, ...input.verbatim].join("\n")).sort();
-  const produced = extractProtectedTokens(input.texts.join("\n")).sort();
-  if (required.length !== produced.length || required.some((token, index) => token !== produced[index])) return "必须保留的精确内容发生了变化";
-  if (input.verbatim.some((payload) => !input.texts.some((text) => text.includes(payload)))) return "逐字内容必须完整出现在同一条文本中";
-  return undefined;
-}
-
 export function fingerprintReplyPhaseInput(input: {
-  readonly facts: readonly string[];
-  readonly intent: string;
   readonly verbatim: readonly string[];
   readonly target: string;
   readonly mode: ReplyMode;
@@ -602,7 +556,6 @@ export async function preflightReplyPhase(options: {
   readonly mode: ReplyMode;
   readonly resources: ChannelResources;
   readonly signal?: AbortSignal;
-  readonly facts?: readonly string[];
   readonly verbatim?: readonly string[];
 }): Promise<ReplyPreflightResult> {
   const fail = (index: number, errorName: string): ReplyPreflightResult => ({ ok: false, totalUnits: options.parts.length, failedUnitIndex: index, errorName });
@@ -640,11 +593,6 @@ export async function preflightReplyPhase(options: {
       return fail(Math.max(0, index), "VerbatimErased");
     }
   }
-  if (options.facts !== undefined) {
-    const required = publicAnchorTokens([...options.facts, ...(options.verbatim ?? [])].join("\n"), options.mode);
-    const delivered = publicAnchorTokens(units.flatMap((unit) => (unit.kind === "text" ? [unit.text!] : [])).join("\n"), options.mode);
-    if (required.length !== delivered.length || required.some((token, index) => token !== delivered[index])) return fail(0, "ReplyAnchorsErased");
-  }
   return { ok: true, totalUnits: units.length, failedUnitIndex: 0, units };
 }
 
@@ -655,12 +603,6 @@ export function replyExpectedUnits(units: readonly PreparedReplyUnit[]): { kind:
 export function replyPreflightFailure(name: string, message: string, phaseId = createRandomId(), totalUnits = 0, failedUnitIndex = 0): ReplyDeliveryOutcome {
   const receipt = createPreflightFailureReceipt({ phaseId, totalUnits, failedUnitIndex });
   return { output: { ok: false, error: { name, message }, sent: [], failedAt: receipt.failedUnitIndex, replyReceipt: receipt }, receipt };
-}
-
-export function replyComposerImageInput(
-  view: ReplyStickerView | undefined,
-): { readonly frames: readonly ReplyStickerFrame[]; readonly labels: readonly string[] } | undefined {
-  return view?.mode === "native" && view.frames?.length ? { frames: view.frames, labels: view.frames.map((frame) => frame.label) } : undefined;
 }
 
 /** Literal text is kept literal; public element identities/attributes survive without expanded bytes. */
@@ -674,17 +616,6 @@ function projectElements(segments: readonly (readonly Element[])[]): string {
   };
   const elementText = (element: Element): string => (element.type === "text" ? String(element.attrs.content ?? "") : String(sanitizeElement(element)));
   return segments.map((segment) => segment.map(elementText).join("")).join("\n");
-}
-
-/** Parsing-only wrappers are not outward anchors; their inner numeric/URI/text anchors still are. */
-function publicAnchorTokens(text: string, mode: ReplyMode): string[] {
-  return extractProtectedTokens(text)
-    .flatMap((token) => {
-      if (mode === "raw") return [token];
-      if (/^<\/?(?:text|message|inner_thought)\b[^<>]*>$/i.test(token)) return [];
-      return extractProtectedTokens(projectDeliveredText({ source: token, mode }));
-    })
-    .sort();
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

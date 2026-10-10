@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createAssistantMessage, createEntry, createMessageEntry, createToolMessage, type AgentEntry } from "@yesimbot/agent-runtime";
+import { h, Universal } from "koishi";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const generateText = vi.hoisted(() => vi.fn());
@@ -20,6 +21,7 @@ import {
   resolveReplyHistory,
   type ReplyDeliveryProofData,
 } from "../src/conversations/reply-receipt.js";
+import { createMessage } from "../src/messages/index.js";
 
 const roots: string[] = [];
 const firstBody = "已确认的第一条";
@@ -105,10 +107,7 @@ async function fixture(factual = false, magicContext = true) {
   const conversation = new Conversation(
     root,
     { minMessages: 1, maxFailures: 3, mode: "compartment", assistantAsFacts: factual, chunkMessages: 1 },
-    {
-      magicContext,
-      resolveHistoryFactsModel: () => ({ key: "aux:1", model: { id: "aux" } as never }),
-    },
+    { magicContext },
   );
   await conversation.init();
   const entries = phase(conversation.currentSessionId());
@@ -130,23 +129,12 @@ async function fixture(factual = false, magicContext = true) {
   return { conversation, entries, root, path: join(root, "sessions", conversation.currentSessionId() + ".jsonl") };
 }
 
-function decodeSource(prompt: string): Array<{ id: string; messages: string[]; messageTimestamps?: number[] }> {
-  return JSON.parse(
-    prompt.split("\n")[1]!.replaceAll("&quot;", '"').replaceAll("&apos;", "'").replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&"),
-  );
-}
 beforeEach(() => {
-  generateText.mockImplementation(async (input) =>
-    input.model.id === "aux"
-      ? {
-          text: JSON.stringify({ records: decodeSource(input.prompt).map(({ id }) => ({ id, facts: ["助手已确认历史条件，但没有证明外部操作完成。"] })) }),
-          finishReason: "stop",
-        }
-      : {
-          text: JSON.stringify({ goal: "核对历史条件", decisions: [], constraints: [], facts: ["已确认历史条件"], unresolved: [], completed: [], pending: [] }),
-          finishReason: "stop",
-        },
-  );
+  // Only the continuity model may run; no auxiliary per-message extraction route remains.
+  generateText.mockImplementation(async () => ({
+    text: JSON.stringify({ goal: "核对历史条件", decisions: [], constraints: [], facts: ["已确认历史条件"], unresolved: [], completed: [], pending: [] }),
+    finishReason: "stop",
+  }));
 });
 afterEach(async () => {
   generateText.mockReset();
@@ -181,21 +169,18 @@ describe("canonical mixed reply history source", () => {
     const open = stripInternalAssistantInputs(entries.slice(1, 3), mode);
     expect(open.flatMap((entry) => (entry.type === "message" && isDeliveredTranscript(entry.data) ? [entry.data.data.partial] : []))).toEqual([true]);
   });
-  it.each([false, true])("shares full canonical proof across expansion, facts and frozen regions (facts=%s)", async (factual) => {
+  it.each([false, true])("shares full canonical proof across expansion and frozen regions without extraction (facts=%s)", async (factual) => {
     const f = await fixture(factual);
     const before = await readFile(f.path);
-    if (factual) await f.conversation.historyFacts!.projectEntries(f.entries);
     const expanded = await f.conversation.expandCompartment("compact");
-    expect(expanded.entries).toHaveLength(factual ? 1 : 2);
+    // Legacy assistantAsFacts parsing must not start an auxiliary per-message extractor.
+    expect(expanded.entries.map((record) => record.text)).toEqual([firstBody, secondBody]);
+    expect(JSON.stringify(expanded)).not.toMatch(/PRIVATE|SIGNED/);
     const frozen = await f.conversation.freezeContextRegion(["checkpoint-0"]);
     expect(frozen.sourceEntryIds).toEqual(f.entries.map((entry) => entry.id));
     expect([frozen.sourceStartAt, frozen.sourceEndAt]).toEqual([100, 200]);
-    await f.conversation.projectFrozenAssistantRecords(frozen);
-    if (factual) {
-      expect(generateText).toHaveBeenCalledOnce();
-      expect(decodeSource(generateText.mock.calls[0]![0].prompt)[0]).toMatchObject({ messages: [firstBody, secondBody], messageTimestamps: [100, 200] });
-      expect(JSON.stringify(expanded)).not.toMatch(/已确认的第|PRIVATE|SIGNED/);
-    } else expect(expanded.entries.map((record) => record.text)).toEqual([firstBody, secondBody]);
+    expect(frozen.records.map((record) => record.text)).toEqual([firstBody, secondBody]);
+    expect(generateText).not.toHaveBeenCalled();
     expect(await readFile(f.path)).toEqual(before);
   });
   it.each([1, 999])("a fresh Conversation reads a persisted journal-only prefix fail-closed (version=%s)", async (version) => {
@@ -295,13 +280,64 @@ describe("canonical mixed reply history source", () => {
     expect(active.filter((entry) => f.entries.some((source) => source.id === entry.id)).map((entry) => entry.id)).toEqual(f.entries.map((entry) => entry.id));
     expect(safeSourceRecords(active).map((record) => record.text)).toEqual([firstBody, secondBody]);
   });
-  it("continuity manifests include the entire phase and use actual delivery observation times", async () => {
-    const f = await fixture();
+  it.each([
+    { mode: "summary" as const, assistantAsFacts: false },
+    { mode: "summary" as const, assistantAsFacts: true },
+    { mode: "compartment" as const, assistantAsFacts: false },
+    { mode: "compartment" as const, assistantAsFacts: true },
+  ])("keeps actual bodies and old compression behavior with $mode / assistantAsFacts=$assistantAsFacts", async ({ mode, assistantAsFacts }) => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-reply-compact-"));
+    roots.push(root);
+    const conversation = new Conversation(root, { minMessages: 1, maxFailures: 3, mode, assistantAsFacts, chunkMessages: 100 });
+    await conversation.init();
+    const user = createMessageEntry(
+      createMessage({
+        platform: "test",
+        selfId: "bot",
+        channel: { id: "room", type: Universal.Channel.Type.TEXT },
+        user: { id: "user", name: "Alice" },
+        timestamp: 1,
+        messageId: "user-message",
+        elements: [h.text("public user fact")],
+      }),
+      { id: "user-entry", timestamp: 1 },
+    );
+    await conversation.storage.append(user, ...phase(conversation.currentSessionId()));
+    const path = join(root, "sessions", conversation.currentSessionId() + ".jsonl");
+    const before = await readFile(path);
+    const model = { id: "ordinary-compact" } as never;
+    expect(await conversation.compact("manual", { model, force: true })).toMatchObject({ compacted: true });
+    expect(generateText).toHaveBeenCalledOnce();
+    const request = generateText.mock.calls[0]![0];
+    expect(request.model).toBe(model);
+    expect(request.prompt).toContain("public user fact");
+    expect(request.prompt).not.toMatch(/PRIVATE|SIGNED/);
+    if (mode === "summary" || assistantAsFacts) {
+      expect(request.prompt).toContain(firstBody);
+      expect(request.prompt).toContain(secondBody);
+      if (assistantAsFacts) expect(request.prompt).toContain("assistant 曾输出原文");
+    } else {
+      expect(request.prompt).not.toContain(firstBody);
+      expect(request.prompt).not.toContain(secondBody);
+    }
+    const compact = (await conversation.storage.read()).find((entry) => entry.type === "compact");
+    if (!compact) throw new Error("missing compact fixture");
+    const expanded = await conversation.expandCompartment(compact.id);
+    expect(expanded.entries.map((record) => record.text)).toEqual(["public user fact", firstBody, secondBody]);
+    expect(generateText).toHaveBeenCalledOnce();
+    expect((await readFile(path)).subarray(0, before.length)).toEqual(before);
+  });
+  it.each([false, true])("continuity keeps actual bodies without extraction (assistantAsFacts=%s)", async (assistantAsFacts) => {
+    const f = await fixture(assistantAsFacts);
     const result = await f.conversation.ensureContinuity({ model: {} as never, sourceEntryIds: ["checkpoint-0"] });
     expect(result.entry.data.sourceEntryIds).toEqual(f.entries.map((entry) => entry.id));
     expect([result.entry.data.sourceStartAt, result.entry.data.sourceEndAt]).toEqual([100, 200]);
+    expect(generateText).toHaveBeenCalledOnce();
+    expect(generateText.mock.calls[0]![0].prompt).toContain(firstBody);
+    expect(generateText.mock.calls[0]![0].prompt).toContain(secondBody);
     expect(JSON.stringify(generateText.mock.calls[0])).not.toMatch(/PRIVATE|SIGNED/);
     expect((await f.conversation.ensureContinuity({ model: {} as never, sourceEntryIds: ["result"] })).reused).toBe(true);
+    expect(generateText).toHaveBeenCalledOnce();
   });
   it("a shared SDK entry joins multiple invocation groups transitively without duplicating owners", () => {
     const first = phase();

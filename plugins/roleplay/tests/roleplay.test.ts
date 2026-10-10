@@ -30,7 +30,7 @@ function createCard(): CharacterCardV3 {
 }
 
 describe("roleplay agent plugin", () => {
-  it("delegates the same card instructions and definition without injecting them into the main Agent", async () => {
+  it("omits Core-placed card material from the main Agent while greeting initialization still runs", async () => {
     const card = createCard();
     card.data.system_prompt = "Roleplay as {{char}} for {{user}}";
     card.data.post_history_instructions = "Always speak in character to {{user}}";
@@ -42,7 +42,7 @@ describe("roleplay agent plugin", () => {
     const channel = createAgentChannel();
     const state = createStateManager({ storage });
     const host = createPluginHost({
-      plugins: [createRoleplayPlugin({ card, greeting: "Hello {{user}}", userName: "direct-user", delegatePrompts: true })],
+      plugins: [createRoleplayPlugin({ card, greeting: "Hello {{user}}", userName: "direct-user", managedPrompts: true })],
       runtime: { id: "channel", channel, state, storage },
     });
     await host.init();

@@ -92,7 +92,7 @@ describe("RoleplayPlugin", () => {
     await plugin.start();
     const scope = { type: "direct", platform: "test", selfId: "bot", channelId: "user" } as const;
     const profile = await agents.resolveRoleProfile(scope);
-    const plugins = await agents.setup(scope, {} as never, { polisherActive: false, rolePromptsManaged: true } as never);
+    const plugins = await agents.setup(scope, {} as never, { rolePromptsManaged: true } as never);
     const systemPrompt = vi.fn(() => buildCoreSystemPrompt({ basePath, channel: scope, selfId: "bot", roleProfile: profile }));
     const requests: string[] = [];
     const agent = createAgent({
@@ -141,19 +141,17 @@ describe("RoleplayPlugin", () => {
     const path = await createCardFile();
     const dispose = vi.fn();
     const use = vi.fn(() => dispose);
-    const profile = vi.fn(() => vi.fn());
     const ctx = {
       baseDir: join(path, ".."),
       logger: () => ({}),
       on: vi.fn(),
-      yesimbot: { agent: { use }, polisher: { profile } },
+      yesimbot: { agent: { use } },
     } as unknown as Context;
     const plugin = new RoleplayPlugin(ctx, { characterCard: "card.png" });
     const loading = plugin.start();
     await plugin.stop();
     await loading;
     expect(use).not.toHaveBeenCalled();
-    expect(profile).not.toHaveBeenCalled();
     // A later deliberate start still works and its registration can be disposed.
     await plugin.start();
     expect(use).toHaveBeenCalledOnce();
@@ -165,8 +163,6 @@ describe("RoleplayPlugin", () => {
     const path = await createCardFile();
     const plugins: RoleplayPlugin[] = [];
     const dispose = vi.fn();
-    const disposeProfile = vi.fn();
-    const profile = vi.fn(() => disposeProfile);
     const ctx = {
       baseDir: join(path, ".."),
       logger: vi.fn(() => ({ error: vi.fn(), info: vi.fn(), success: vi.fn() })),
@@ -178,7 +174,6 @@ describe("RoleplayPlugin", () => {
             return dispose;
           }),
         },
-        polisher: { profile },
       },
     } as unknown as Context;
     vi.spyOn(Math, "random").mockReturnValue(0.99);
@@ -194,14 +189,12 @@ describe("RoleplayPlugin", () => {
     ]);
     await expect(entries(shared as never)).resolves.toEqual([]);
     expect(Math.random).toHaveBeenCalledOnce();
-    expect(profile).toHaveBeenCalledWith(plugin);
     expect(plugin.resolve({ type: "direct", platform: "test", selfId: "bot", channelId: "direct-user" })).toEqual({ characterDefinition: "Name: Athena" });
     await plugin.stop();
-    expect(disposeProfile).toHaveBeenCalledOnce();
     expect(dispose).toHaveBeenCalledOnce();
   });
 
-  it("shares per-channel card placeholder choices between the polisher profile and greeting", async () => {
+  it("keeps per-channel card placeholder choices stable between the role profile and greeting", async () => {
     const path = await createCardFile({
       description: "Mood: {{pick:calm,bright}}.",
       firstMes: "I am {{pick:calm,bright}}.",
@@ -218,12 +211,53 @@ describe("RoleplayPlugin", () => {
 
     await plugin.start();
     const profile = plugin.resolve(scope);
-    const delegated = plugin.setup(scope, {} as never, { polisherActive: true } as never);
+    const managed = plugin.setup(scope, {} as never, { rolePromptsManaged: true } as never);
 
     expect(profile?.characterDefinition).toContain("Mood: bright.");
-    await expect(entries(delegated)).resolves.toEqual([
-      expect.objectContaining({ type: "message", data: expect.objectContaining({ content: "I am bright." }) }),
+    await expect(entries(managed)).resolves.toEqual([expect.objectContaining({ type: "message", data: expect.objectContaining({ content: "I am bright." }) })]);
+    await plugin.stop();
+  });
+
+  it("freezes random and roll role fields per bot across repeated resolution and managed setup", async () => {
+    const path = await createCardFile({
+      description: "Mood: {{random:calm,bright}}. Roll: {{roll:d6}}. Voice: {{pick:quiet,loud}}.",
+      firstMes: "Hello {{user}}, {{pick:quiet,loud}}.",
+    });
+    const ctx = {
+      baseDir: join(path, ".."),
+      logger: () => ({}),
+      on: vi.fn(),
+      yesimbot: { agent: { use: vi.fn(() => vi.fn()) } },
+    } as unknown as Context;
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.99).mockReturnValueOnce(0.01).mockReturnValueOnce(0.01).mockReturnValueOnce(0.01);
+    const plugin = new RoleplayPlugin(ctx, { characterCard: "card.png" });
+    const firstScope = { type: "direct", platform: "test", selfId: "bot-a", channelId: "user", userId: "user" } as const;
+    const secondScope = { ...firstScope, selfId: "bot-b" };
+    await plugin.start();
+
+    const first = await plugin.roleProfile.resolve(firstScope);
+    expect(first?.characterDefinition).toContain("Mood: calm. Roll: 1. Voice: quiet.");
+    expect(await plugin.roleProfile.resolve(firstScope)).toBe(first);
+    const managed = plugin.setup(firstScope, {} as never, { rolePromptsManaged: true } as never);
+    await expect(entries(managed)).resolves.toEqual([
+      expect.objectContaining({ type: "message", data: expect.objectContaining({ content: "Hello user, quiet." }) }),
     ]);
+    expect(await plugin.roleProfile.resolve(firstScope)).toBe(first);
+    expect(random).toHaveBeenCalledTimes(3);
+
+    const second = await plugin.roleProfile.resolve(secondScope);
+    expect(second?.characterDefinition).toContain("Mood: bright. Roll: 6. Voice: loud.");
+    expect(second).not.toBe(first);
+    expect(await plugin.roleProfile.resolve(secondScope)).toBe(second);
+    expect(await plugin.roleProfile.resolve(firstScope)).toBe(first);
+    expect(random).toHaveBeenCalledTimes(6);
+
+    await plugin.stop();
+    await plugin.start();
+    const restarted = await plugin.roleProfile.resolve(firstScope);
+    expect(restarted).not.toBe(first);
+    expect(restarted?.characterDefinition).toContain("Mood: bright. Roll: 6. Voice: loud.");
+    expect(random).toHaveBeenCalledTimes(9);
     await plugin.stop();
   });
 

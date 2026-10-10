@@ -243,14 +243,14 @@ describe("whole-phase preflight and strict proof", () => {
     ).toBe("VerbatimErased");
     expect((await preflightReplyPhase({ parts: [text("<text>echo <x></text>")], mode: "element", resources, verbatim: ["echo <x>"] })).ok).toBe(true);
   });
-  it("checks required facts after resource disappearance while allowing intentional protocol wrappers", async () => {
+  it("checks required verbatim anchors after resource disappearance while allowing intentional protocol wrappers", async () => {
     const resource = '<img src="asset://0123456789abcdef0123456789abcdef"/>';
     const missing = { open: async () => undefined } as unknown as ChannelResources;
-    expect((await preflightReplyPhase({ parts: [text(`visible${resource}`)], mode: "element", resources: missing, facts: [resource] })).errorName).toBe(
-      "ReplyAnchorsErased",
+    expect((await preflightReplyPhase({ parts: [text(`visible${resource}`)], mode: "element", resources: missing, verbatim: [resource] })).errorName).toBe(
+      "VerbatimErased",
     );
     const source = '<text>echo 12</text><message/><at id="7"/>';
-    expect((await preflightReplyPhase({ parts: [text(source)], mode: "element", resources, facts: [source] })).ok).toBe(true);
+    expect((await preflightReplyPhase({ parts: [text(source)], mode: "element", resources, verbatim: [source] })).ok).toBe(true);
   });
   it("no admission proof means no platform output", async () => {
     const f = fixture({ fail: (data) => data.kind === "start" });

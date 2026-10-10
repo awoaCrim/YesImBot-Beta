@@ -41,7 +41,6 @@ import { createAgent, createEntry, EphemeralImageProjectionStore } from "@yesimb
 import { h } from "koishi";
 
 import { Agents } from "../src/agents/index.js";
-import { PolisherRegistry, type MessagePolisherCapability } from "../src/agents/polisher.js";
 import { Channel, Channels, type ChannelContext } from "../src/channels/index.js";
 import type { Config } from "../src/config.js";
 import { createDeliveredTranscriptMessage } from "../src/conversations/delivered-transcript.js";
@@ -184,8 +183,6 @@ async function runtime(
   context: ChannelContext = { type: "guild", platform: "test", channelId: "room", guildId: "room" },
   messageBatch?: MessageBatchPlugin,
   will: Record<string, unknown> = { decide: state.decide, observe: state.observe },
-  polisher?: MessagePolisherCapability,
-  polish?: ChannelRuntimeOptions["polish"],
   compactFragments?: ChannelRuntimeOptions["compactFragments"],
   historyProjection?: ChannelRuntimeOptions["historyProjection"],
 ) {
@@ -204,8 +201,6 @@ async function runtime(
     messageBatch,
     ...(compactFragments ? { compactFragments } : {}),
     historyProjection,
-    polisher,
-    polish,
   });
   await value.init();
   return { value, channel, root };
@@ -329,7 +324,7 @@ describe("ChannelRuntime scheduling", () => {
   });
 
   it("drops delivered transcripts and merges adjacent user turns only in Gemini mode", async () => {
-    const { value, root } = await runtime(undefined, {}, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "gemini-native");
+    const { value, root } = await runtime(undefined, {}, undefined, undefined, undefined, undefined, undefined, "gemini-native");
     try {
       const plugin = vi
         .mocked(createAgent)
@@ -524,8 +519,6 @@ describe("ChannelRuntime scheduling", () => {
       undefined,
       undefined,
       undefined,
-      undefined,
-      undefined,
       { recall } as never,
     );
     try {
@@ -596,7 +589,7 @@ describe("ChannelRuntime scheduling", () => {
   });
   it("skips compact recall when the persistent store fails", async () => {
     const recall = vi.fn(async () => Promise.reject(new Error("database offline")));
-    const { value, root } = await runtime(undefined, {}, undefined, undefined, undefined, undefined, undefined, undefined, { recall } as never);
+    const { value, root } = await runtime(undefined, {}, undefined, undefined, undefined, undefined, { recall } as never);
     try {
       const plugin = vi
         .mocked(createAgent)
@@ -1124,11 +1117,21 @@ describe("ChannelRuntime scheduling", () => {
     state.run.mockImplementation(() =>
       (async function* () {
         yield { type: "turn.start", turnId: "turn-delivered" };
+        state.active = "turn-delivered";
         const send = vi
           .mocked(createAgent)
           .mock.calls.at(-1)?.[0]
           .tools?.find((tool) => tool.name === "send_message");
-        await send?.execute?.({ messages: ["first", "second"] }, { toolCallId: "call", turnId: "turn-delivered", abortSignal: undefined } as never);
+        await send?.execute?.(
+          {
+            parts: [
+              { kind: "text", text: "first" },
+              { kind: "text", text: "second" },
+            ],
+          },
+          { toolCallId: "call", turnId: "turn-delivered", abortSignal: undefined } as never,
+        );
+        state.active = null;
         yield { type: "turn.done", turnId: "turn-delivered" };
       })(),
     );
@@ -1163,11 +1166,13 @@ describe("ChannelRuntime scheduling", () => {
     state.run.mockImplementation(() =>
       (async function* () {
         yield { type: "turn.start", turnId: "turn-transient" };
+        state.active = "turn-transient";
         const send = vi
           .mocked(createAgent)
           .mock.calls.at(-1)?.[0]
           .tools?.find((tool) => tool.name === "send_message");
-        await send?.execute?.({ messages: ["hello"] }, { toolCallId: "call", turnId: "turn-transient", abortSignal: undefined });
+        await send?.execute?.({ parts: [{ kind: "text", text: "hello" }] }, { toolCallId: "call", turnId: "turn-transient", abortSignal: undefined });
+        state.active = null;
         yield { type: "turn.done", turnId: "turn-transient" };
       })(),
     );
@@ -1258,7 +1263,13 @@ describe("ChannelRuntime scheduling", () => {
           .mocked(createAgent)
           .mock.calls.at(-1)?.[0]
           .tools?.find((tool) => tool.name === "send_message");
-        await send?.execute?.({ messages: ["hello"], ...input }, { toolCallId: "call", turnId: "turn-send", abortSignal: undefined } as never);
+        state.active = "turn-send";
+        await send?.execute?.({ parts: [{ kind: "text", text: "hello" }], ...input }, {
+          toolCallId: "call",
+          turnId: "turn-send",
+          abortSignal: undefined,
+        } as never);
+        state.active = null;
         yield { type: "turn.done", turnId: "turn-send" };
       })(),
     );
@@ -1872,7 +1883,7 @@ describe("Runtimes identity", () => {
       const first = await runtimes.get(channel, bot as never);
       expect(oldSetup).toHaveBeenCalledOnce();
       expect(resolveOld).toHaveBeenCalledBefore(oldSetup);
-      expect(oldSetup.mock.calls[0]?.[2]).toMatchObject({ rolePromptsManaged: true, polisherActive: false });
+      expect(oldSetup.mock.calls[0]?.[2]).toMatchObject({ rolePromptsManaged: true });
       const firstConfig = vi.mocked(createAgent).mock.calls.at(-1)![0];
       const firstPrompt = (await (firstConfig.systemPrompt as () => Promise<Array<{ content: unknown }>>)()).map((block) => String(block.content)).join("\n");
       expect(firstPrompt).toContain("OLD_ROLE");
@@ -1982,46 +1993,6 @@ describe("Runtimes identity", () => {
       const replacement = await runtimes.get(channel, bot as never);
 
       expect(replacement).not.toBe(first);
-      await runtimes.stop();
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("proactively retires a cached runtime when polisher registration changes", async () => {
-    const root = await mkdtemp(join(tmpdir(), "yesimbot-runtimes-polisher-invalidate-"));
-    try {
-      vi.mocked(createAgent).mockClear();
-      const ctx = new Context();
-      const channels = new Channels(ctx, { basePath: root });
-      const model = {
-        resolveChatModel: vi.fn(() => ({ model: {} as never, entry: {} })),
-        resolveAuxiliaryModel: vi.fn(() => {
-          throw new Error("auxiliary unavailable");
-        }),
-      };
-      const polishers = new PolisherRegistry();
-      const dispose = polishers.use({ name: "test", polish: vi.fn(async () => undefined) });
-      const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root }, new Agents(ctx), new MessageBatchRegistry(), polishers);
-      const channel = await channels.resolve({ type: "direct", platform: "test", channelId: "user", userId: "user", selfId: "bot" });
-      const bot = { platform: "test", selfId: "bot" };
-
-      const first = await runtimes.get(channel, bot as never);
-      const firstAgent = vi.mocked(createAgent).mock.results.at(-1)?.value;
-      const firstConfig = vi.mocked(createAgent).mock.calls.at(-1)?.[0];
-      if (!firstConfig || typeof firstConfig.systemPrompt !== "function") throw new Error("Initial Agent prompt was not captured");
-      const firstPrompt = (await firstConfig.systemPrompt()).map((block) => String(block.content)).join("\n");
-      expect(firstPrompt).not.toContain("<persona>");
-
-      dispose();
-      await vi.waitFor(() => expect(firstAgent?.stop).toHaveBeenCalledOnce());
-      const replacement = await runtimes.get(channel, bot as never);
-      const replacementConfig = vi.mocked(createAgent).mock.calls.at(-1)?.[0];
-      if (!replacementConfig || typeof replacementConfig.systemPrompt !== "function") throw new Error("Replacement Agent prompt was not captured");
-      const replacementPrompt = (await replacementConfig.systemPrompt()).map((block) => String(block.content)).join("\n");
-
-      expect(replacement).not.toBe(first);
-      expect(replacementPrompt).toContain("<persona>");
       await runtimes.stop();
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -2558,11 +2529,17 @@ describe("agent message protocol enforcement", () => {
     state.run.mockImplementation(() =>
       (async function* () {
         yield { type: "turn.start", turnId: "turn-empty" };
+        state.active = "turn-empty";
         const send = vi
           .mocked(createAgent)
           .mock.calls.at(-1)?.[0]
           .tools?.find((tool) => tool.name === "send_message");
-        await send?.execute?.({ messages: ["这条没有拿到 messageId"] }, { toolCallId: "call", turnId: "turn-empty", abortSignal: undefined } as never);
+        await send?.execute?.({ parts: [{ kind: "text", text: "这条没有拿到 messageId" }] }, {
+          toolCallId: "call",
+          turnId: "turn-empty",
+          abortSignal: undefined,
+        } as never);
+        state.active = null;
         yield { type: "turn.done", turnId: "turn-empty" };
       })(),
     );
@@ -2586,12 +2563,18 @@ describe("agent message protocol enforcement", () => {
     state.run.mockImplementation(() =>
       (async function* () {
         yield { type: "turn.start", turnId: "turn-delivered" };
+        state.active = "turn-delivered";
         const send = vi
           .mocked(createAgent)
           .mock.calls.at(-1)?.[0]
           .tools?.find((tool) => tool.name === "send_message");
-        const outcome = await send?.execute?.({ messages: ["真实送达"] }, { toolCallId: "call", turnId: "turn-delivered", abortSignal: undefined } as never);
+        const outcome = await send?.execute?.({ parts: [{ kind: "text", text: "真实送达" }] }, {
+          toolCallId: "call",
+          turnId: "turn-delivered",
+          abortSignal: undefined,
+        } as never);
         expect(outcome).toMatchObject({ ok: true, messageIds: ["platform-1"] });
+        state.active = null;
         yield { type: "turn.done", turnId: "turn-delivered" };
       })(),
     );
@@ -2605,123 +2588,6 @@ describe("agent message protocol enforcement", () => {
       expect(state.settleReservation).toHaveBeenCalledWith("reservation-delivered", { kind: "commit", turnId: "turn-delivered", messageId: "platform-1" });
     } finally {
       await value.stop();
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-});
-
-describe("ChannelRuntime polisher wiring", () => {
-  it("delegates the main prompt and requires facts while a polisher is active", async () => {
-    const polisher = { name: "test", polish: vi.fn() };
-    const { value, root } = await runtime(undefined, {}, { selfId: "bot", sendMessage: vi.fn() }, undefined, undefined, undefined, polisher, async () => [
-      "draft",
-    ]);
-    try {
-      const agentConfig = vi.mocked(createAgent).mock.calls.at(-1)?.[0];
-      if (!agentConfig || typeof agentConfig.systemPrompt !== "function") throw new Error("Agent system prompt was not captured");
-      const systemPrompt = agentConfig.systemPrompt as () => Promise<Array<{ content: unknown }>>;
-      const all = (await systemPrompt()).map((block) => String(block.content)).join("\n");
-      expect(all).not.toContain("<persona>");
-      expect(all).toContain("facts");
-
-      const send = agentConfig.tools?.find((tool) => tool.name === "send_message");
-      if (!send) throw new Error("send_message tool was not captured");
-      expect((send.inputSchema as { jsonSchema: { required?: string[] } }).jsonSchema.required).toEqual(["facts", "messages"]);
-      expect(send.description).not.toContain("persona");
-      expect(send.description).not.toContain("语域");
-      expect(send.description).toContain("事实、判断和交流动作");
-    } finally {
-      await value.stop();
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("keeps the baseline prompt and schema when no polisher is active", async () => {
-    const { value, root } = await runtime();
-    try {
-      const agentConfig = vi.mocked(createAgent).mock.calls.at(-1)?.[0];
-      if (!agentConfig || typeof agentConfig.systemPrompt !== "function") throw new Error("Agent system prompt was not captured");
-      const systemPrompt = agentConfig.systemPrompt as () => Promise<Array<{ content: unknown }>>;
-      const all = (await systemPrompt()).map((block) => String(block.content)).join("\n");
-      expect(all).toContain("<persona>");
-
-      const send = agentConfig.tools?.find((tool) => tool.name === "send_message");
-      if (!send) throw new Error("send_message tool was not captured");
-      expect((send.inputSchema as { jsonSchema: { required?: string[] } }).jsonSchema.required).toEqual(["messages"]);
-      expect(all).toContain("保持同一说话身份、语域和叙述距离");
-      expect(send.description).not.toMatch(/persona|emoji|语域|说话身份/);
-    } finally {
-      await value.stop();
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-});
-
-describe("Runtimes polisher revisions", () => {
-  it("retries runtime creation when the polisher registration changes during setup", async () => {
-    const root = await mkdtemp(join(tmpdir(), "yesimbot-runtimes-polisher-race-"));
-    try {
-      const ctx = new Context();
-      const channels = new Channels(ctx, { basePath: root });
-      const model = {
-        resolveChatModel: vi.fn(() => ({ model: {} as never, entry: {} })),
-        resolveAuxiliaryModel: vi.fn(() => {
-          throw new Error("auxiliary unavailable");
-        }),
-      };
-      const agents = new Agents(ctx);
-      const polishers = new PolisherRegistry();
-      const capability: MessagePolisherCapability = { name: "test", polish: vi.fn(async () => undefined) };
-      const disposePolisher = polishers.use(capability);
-      let setupCount = 0;
-      let markSetupStarted!: () => void;
-      let releaseSetup!: () => void;
-      const setupStarted = new Promise<void>((resolve) => {
-        markSetupStarted = resolve;
-      });
-      const setupRelease = new Promise<void>((resolve) => {
-        releaseSetup = resolve;
-      });
-      const activeStates: boolean[] = [];
-      agents.use({
-        setup: vi.fn(async (_context, _bot, runtimeContext) => {
-          activeStates.push(runtimeContext?.polisherActive ?? false);
-          setupCount += 1;
-          if (setupCount === 1) {
-            markSetupStarted();
-            await setupRelease;
-          }
-          return { name: "setup-gate" };
-        }),
-      });
-      const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root }, agents, new MessageBatchRegistry(), polishers);
-      const channel = await channels.resolve({ type: "guild", platform: "test", channelId: "room", guildId: "room" });
-      const before = vi.mocked(createAgent).mock.calls.length;
-      const pending = runtimes.get(channel, { platform: "test", selfId: "bot" } as never);
-
-      await setupStarted;
-      disposePolisher();
-      releaseSetup();
-      const runtime = await pending;
-
-      // Registry drift during setup is retired before init, so no stale Agent/greeting is created.
-      expect(vi.mocked(createAgent).mock.calls.length - before).toBe(1);
-      expect(activeStates).toEqual([true, false]);
-      const current = vi.mocked(createAgent).mock.calls.at(-1)?.[0];
-      if (!current) throw new Error("Runtime Agent configuration was not captured");
-      const promptOf = (agentConfig: NonNullable<typeof current>) => {
-        if (typeof agentConfig.systemPrompt !== "function") throw new Error("Agent system prompt was not captured");
-        return agentConfig.systemPrompt as () => Promise<Array<{ content: unknown }>>;
-      };
-      const currentPrompt = (await promptOf(current)()).map((block) => String(block.content)).join("\n");
-      const currentSend = current.tools?.find((tool) => tool.name === "send_message");
-      if (!currentSend) throw new Error("send_message tool was not captured");
-
-      expect(currentPrompt).toContain("<persona>");
-      expect((currentSend.inputSchema as { jsonSchema: { required?: string[] } }).jsonSchema.required).toEqual(["parts"]);
-      expect(runtime).toBeDefined();
-      await runtimes.stop();
-    } finally {
       await rm(root, { recursive: true, force: true });
     }
   });

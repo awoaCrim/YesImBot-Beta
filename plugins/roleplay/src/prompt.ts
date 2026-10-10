@@ -29,7 +29,7 @@ export function assemblePostHistoryInstructions(card: CharacterCardV3, context: 
   return render(card.data.post_history_instructions, context);
 }
 
-/** The exact prompt material the roleplay plugin would inject, reused by an active polisher. */
+/** The exact card prompt material the roleplay plugin injects into the main Agent role section. */
 export function assembleRoleProfile(card: CharacterCardV3, context: CBSContext): { roleInstructions?: string; characterDefinition?: string } {
   const instructionExtension = assembleInstructionExtension(card, context);
   const postHistoryInstructions = assemblePostHistoryInstructions(card, context);

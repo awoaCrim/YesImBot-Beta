@@ -12,8 +12,6 @@ export interface RoleplayAgentPluginOptions {
   readonly userName: string;
   /** Shared per-channel placeholder state used by the role profile and greeting. */
   readonly context?: CBSContext;
-  /** True when an active polisher owns style, so card prompts must stay out of the main Agent. */
-  readonly delegatePrompts?: boolean;
   /** Core already placed this card in its unified role section; greeting initialization still runs. */
   readonly managedPrompts?: boolean;
 }
@@ -25,9 +23,9 @@ export function createRoleplayPlugin(options: RoleplayAgentPluginOptions): Agent
     random: options.random,
     userName: options.userName,
   };
-  const delegate = options.delegatePrompts === true || options.managedPrompts === true;
+  const delegate = options.managedPrompts === true;
   // Managed material was already rendered before setup. Do not consume random/roll placeholders again.
-  const profile = options.managedPrompts === true ? {} : assembleRoleProfile(options.card, context);
+  const profile = delegate ? {} : assembleRoleProfile(options.card, context);
   const cardSection = [profile.characterDefinition, profile.roleInstructions].filter(Boolean).join("\n\n");
   const greeting = renderCBS(options.greeting, context).text;
   const plugin: AgentPlugin = {
@@ -40,8 +38,7 @@ export function createRoleplayPlugin(options: RoleplayAgentPluginOptions): Agent
   };
 
   // Google providers reject system messages after conversation history, so card instructions stay in
-  // one complete frozen leading system block. Managed prompts are placed by Core, while delegated
-  // prompts go to the polisher profile; neither adds another card prefix to the main Agent.
+  // one complete frozen leading system block. Core-placed material does not add another card prefix.
   if (!delegate) {
     plugin.appendSystemPrompt = () => cardSection || undefined;
   }

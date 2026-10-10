@@ -11,7 +11,7 @@ vi.mock("koishi", async () => import("@koishijs/core"));
 
 import { h } from "koishi";
 
-import { createReadTool, createSendMessageTool, type ResourceReadResult } from "../src/agents/tools.js";
+import { createExpandCompartmentTool, createReadTool, createSendMessageTool, type ResourceReadResult } from "../src/agents/tools.js";
 import { ChannelArtifactStore } from "../src/resources/artifact.js";
 import { ChannelAssetStore } from "../src/resources/asset.js";
 import { ChannelResources, detectImageMediaType, prepareOutputSegments, RESOURCE_MAX_BYTES, type ResourceReader } from "../src/resources/index.js";
@@ -333,10 +333,8 @@ describe("send_message tool", () => {
     expect(tool.description).toContain("inner_thought");
     expect(tool.description).toContain("不要使用 group: 前缀");
     expect(tool.description).toContain("每一项作为一条独立消息按顺序发出");
-    expect(tool.description).toContain("精确文本使用 raw 或 <text>");
+    expect(tool.description).toContain("每项按语义和聊天节奏组织，不需要仅为分条设置 continue=true");
     expect(tool.description).not.toMatch(/persona|emoji|语域|说话身份/);
-    expect(tool.description).toContain("不要用普通文本中的空行制造消息分段");
-    expect(tool.description).toContain("messages 的独立项目");
     expect(tool.description).toContain("解析失败的资源元素会被丢弃");
     expect(JSON.stringify(tool.inputSchema)).toContain("不要使用 group: 前缀");
     expect(JSON.stringify(tool.inputSchema)).not.toMatch(/persona|emoji|语域|说话身份/);
@@ -346,6 +344,9 @@ describe("send_message tool", () => {
   });
 
   it.each([
+    [{}, "messages is empty"],
+    [{ messages: null }, "messages is empty"],
+    [{ messages: "not an array" }, "messages is empty"],
     [{ messages: [] }, "messages is empty"],
     [{ messages: [""] }, "messages must be non-empty strings"],
     [{ messages: ["valid", 1] }, "messages must be non-empty strings"],
@@ -528,6 +529,15 @@ describe("send_message tool", () => {
   });
 });
 
+describe("legacy compartment expansion tool", () => {
+  it("describes read-only proven history without the removed per-entry extraction", () => {
+    const tool = createExpandCompartmentTool({} as never);
+    expect(tool.description).toContain("有发送证明的回复");
+    expect(tool.description).toContain("不修改原始会话");
+    expect(tool.description).not.toMatch(/assistantAsFacts|辅助模型|提取/);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // ChannelResources raw open
 // ---------------------------------------------------------------------------
@@ -690,7 +700,7 @@ describe("prepareOutputSegments", () => {
     expect((await resources.open(uri))?.bytes).toEqual(PNG_BYTES);
   });
 
-  it("enforces the sticker artifact gate after polishing but allows literal URI text and raw mode", async () => {
+  it("enforces the sticker artifact gate on delivered text but allows literal URI text and raw mode", async () => {
     const resources = await createResources();
     const uri = await resources.artifacts.forTool("sticker").put(PNG_BYTES, { mediaType: "image/png" });
     const sendMessage = vi.fn(async () => ["sent"]);
@@ -701,14 +711,12 @@ describe("prepareOutputSegments", () => {
       pacing: { charactersPerSecond: 1000, maxTotalDelayMs: 0 },
       innerThought: false,
     };
-    const polish = vi.fn(async () => [`rewritten <img src="${uri}"/>`]);
-    const polished = createSendMessageTool({ ...options, polish });
     const execution = { toolCallId: "send", turnId: "turn", messages: [] } as never;
-    expect(await polished.execute({ messages: [`draft <img src="${uri}"/>`] }, execution)).toMatchObject({
+    const restricted = createSendMessageTool(options);
+    expect(await restricted.execute({ messages: [`draft <img src="${uri}"/>`] }, execution)).toMatchObject({
       ok: false,
       error: { name: "resource_delivery_restricted" },
     });
-    expect(polish).toHaveBeenCalledOnce();
     expect(sendMessage).not.toHaveBeenCalled();
     const normal = createSendMessageTool(options);
     expect(await normal.execute({ messages: [uri] }, execution)).toMatchObject({ ok: true });

@@ -57,9 +57,7 @@ export const Config: Schema<Config> = Schema.intersect([
         chunkChars: finiteInteger(1).default(12_000).description("compartment 模式每个时间块的最大输入字符数"),
         assistantAsFacts: Schema.boolean()
           .default(false)
-          .description(
-            "统一将所有历史自身回复（含近期窗口、压缩及展开）经 auxiliaryModel 抽取为客观事实并缓存；失败不回退原话。默认关闭，开启会增加辅助推理成本",
-          ),
+          .description("compartment 模式是否把历史 assistant 输出转成客观动作/事实供压缩；默认不注入 assistant 原话"),
         model: Schema.dynamic("registry.chatModels").description("压缩模型；留空则使用默认对话模型"),
       }).description("自动压缩"),
       archive: Schema.object({
