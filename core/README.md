@@ -11,9 +11,14 @@ Messenger, channel resources, and the per-channel runtime.
 - `messenger.use()` / `messenger.post()`
 - `agent.use()` / `agent.will()`
 - `resource.get()` / `resource.use()`
-- `polisher.use()` / `polisher.profile()` for optional delegated expression
 
 It also exposes the lifecycle `stop()` inherited from the Koishi service.
+
+The official `message-polisher` plugin and public `polisher.use()` / `polisher.profile()`
+API have been removed, including delegated preparation and rewrite/compose callbacks.
+Before deploying this source to an existing Koishi instance, remove its enabled
+message-polisher configuration and any third-party polisher integration. This source
+change does not edit production configuration or deploy automatically.
 
 Named channel plugins implement `setup(scope, bot)` and return an AgentPlugin
 snapshot (or `null`). Will plugins implement `match(session)` and
@@ -96,15 +101,7 @@ provider-native reasoning and existing history remain unchanged. Message splitti
 
 Prompts are frozen for each runtime, not reloaded from disk every turn. See
 [main-Agent prompt ownership](../docs/prompt-architecture.md) for precedence,
-standalone/delegated compatibility and an opt-in Anon reference draft.
-
-## Objective historical views
-
-`session.compact.assistantAsFacts` defaults to false. When true, Conversation uses only the configured `auxiliaryModel` utility route to extract/cache objective assistant-attributed records for every retained historical own reply, including recent history, new compression/continuity and explicit expansion. Failures retain safe unavailable metadata, never old dialogue or a main-model fallback. Cache is channel/session/model/proof-bound and ephemeral; original JSONL, other user messages and current signed tool continuations remain unchanged. Existing committed summaries are not automatically migrated.
-
-## Optional expression delegation
-
-The [message-polisher plugin](../plugins/message-polisher/README.md) supports default-compatible `rewrite` and opt-in `compose`. Rewrite receives facts plus a same-count draft and falls back once to that draft. Compose main provides facts/intent/optional verbatim without Persona/card or dialogue; the dedicated expression model receives the complete live profile and organizes bounded variable-count messages. Compose failure sends nothing, never internal facts/intent. Core retains all delivery controls. This plugin's dedicated model is separate from historical extraction's auxiliaryModel.
+plugin-managed role sections and an opt-in Anon reference draft.
 
 ## Output and delivery
 
@@ -112,21 +109,28 @@ Model text output is never delivered. It is recorded in history and logged as th
 model's internal working space, which removes the whole class of `保持沉默` /
 `无需回复` literals reaching a channel.
 
-`send_message` owns text/message-element delivery end to end. Plugin-owned sending
-tools may deliver their own supported content:
+The main model submits a complete ordered reply through `send_message.parts`.
+Core owns preflight, pacing and FIFO delivery; there is no second expression model.
+Plugin-owned sending tools may still deliver their own supported content:
 
-- `messages` is a list; each item becomes one platform message.
-- `channel` defaults to the current channel and may target any other channel.
+- Each text part is one meaningful communication unit; sticker parts use an exact
+  ID viewed in an earlier completed step. Text-only, sticker-only and either mixed
+  order are supported. Splitting is explicit, not inferred from punctuation or blank lines.
+- `channel` defaults to the current channel. Text-only replies may target another
+  channel; replies containing a sticker stay in the current channel.
 - `mode` selects `element` (default, Koishi element parsing plus resource URI
   resolution) or `raw` (literal text, no parsing or escaping).
-- `continue` (default `false`) decides whether the turn ends. The tool is
-  terminal through a predicate over its own input, so one tool covers both
-  "reply and stop" and "reply and keep working".
-- Adjacent messages are paced by `pacing`; a failure stops the remaining items
-  and returns `{ok:false, error, sent, failedAt}`. Polished receipts also carry
-  `deliveredMessages`, containing only complete items with valid segment IDs.
-  Counts/indexes refer to accepted generated items, not drafts or physical segments;
-  partially sent failed items are not promoted to full historical replies.
+- `continue` (default `false`) decides whether the turn ends. A preliminary
+  acknowledgement can use `true` before further tool work; splitting a single
+  reply into parts does not require continuation.
+- Core checks the whole phase before sending. Failure stops later output without
+  resending its prefix. Real platform IDs and `replyReceipt` describe actual effects;
+  only journal-proven complete units become historical speech, including after SDK cancellation.
+
+The ordinary legacy text-array sender remains available to direct callers, but is
+not the main runtime's parts bypass. Old actual-body receipts remain readable;
+new sends do not invoke polishing or generate `deliveredMessages` through it.
+See [reply delivery details](../docs/prompt-architecture.md#unified-reply-authorship).
 
 `finish` ends a turn without sending anything. Because delivery requires an
 explicit tool call, plain model text is not a delivered reply. Core requires a

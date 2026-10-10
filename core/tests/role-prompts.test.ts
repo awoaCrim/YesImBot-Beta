@@ -75,14 +75,6 @@ describe("unified main-Agent role ownership", () => {
     expect(await readFile(join(basePath, "PERSONA.md"), "utf8")).toBe("CUSTOM_PERSONA_SENTINEL");
   });
 
-  it("keeps card and persona out of the delegated main Agent", async () => {
-    const basePath = await root();
-    await writeFile(join(basePath, "PERSONA.md"), "CUSTOM_PERSONA_SENTINEL");
-    const all = JSON.stringify(await buildCoreSystemPrompt({ basePath, channel: scope, selfId: "bot", roleProfile: card, delegated: true }));
-    expect(all).not.toMatch(/CUSTOM_PERSONA_SENTINEL|CARD_DEFINITION_SENTINEL|EXAMPLE_SENTINEL/);
-    expect(all).toContain("facts");
-  });
-
   it("resolves in registration order, ignores empty providers, and rejects competing identities", async () => {
     const agents = new Agents(new Context());
     const empty = vi.fn(() => ({ characterDefinition: "  " }));
@@ -103,7 +95,7 @@ describe("unified main-Agent role ownership", () => {
     const otherSetup = vi.fn(() => null);
     agents.use({ roleProfile: { resolve: () => ({}) }, setup: roleSetup });
     agents.use({ setup: otherSetup });
-    await agents.setup(scope, {} as never, { imageProjection: new EphemeralImageProjectionStore(), polisherActive: false, rolePromptsManaged: true });
+    await agents.setup(scope, {} as never, { imageProjection: new EphemeralImageProjectionStore(), rolePromptsManaged: true });
     expect(roleSetup.mock.calls[0]?.[2]).toMatchObject({ rolePromptsManaged: true });
     expect(otherSetup.mock.calls[0]?.[2]).toMatchObject({ rolePromptsManaged: false });
   });

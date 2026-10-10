@@ -51,10 +51,9 @@ export interface CompressionRecord {
 
 export interface CompressionRenderOptions {
   readonly mode?: CompressionMode;
+  /** Objective record view: assistant speech is quoted as a delivered record, never a role example. */
   readonly assistantAsFacts?: boolean;
-  /** Auxiliary-extracted factual views keyed by canonical entry, never original dialogue. */
-  readonly assistantFacts?: ReadonlyMap<string, readonly string[]>;
-  /** Actual-body receipts take precedence even when objective history is disabled. */
+  /** Actual-body receipts take precedence over the legacy plan/draft renderer. */
   readonly deliveredRecords?: ReadonlyMap<string, readonly CompressionRecord[]>;
 }
 
@@ -99,8 +98,8 @@ export function renderContinuitySource(entries: readonly AgentEntry[], options: 
 
 /** Splits only at complete rendered records, or at UTF-8-safe code-point boundaries for one long record. */
 export function renderContinuitySourceChunks(entries: readonly AgentEntry[], options: CompressionRenderOptions = {}): string[] {
-  // Preserve the pre-feature continuity source when disabled. This quoting is compatibility
-  // rendering, not the new objective extractor: enabled input must never include these lines.
+  // Continuity keeps the pre-existing quoted-output source; assistant text is a delivered record,
+  // not an instruction example.
   const rendered =
     options.assistantAsFacts === true
       ? filterEntriesForCompression(entries, { ...options, mode: "compartment" })
@@ -346,35 +345,17 @@ export function formatRecalledContinuities(
 export function filterEntriesForCompression(entries: readonly AgentEntry[], options: CompressionRenderOptions = {}): string {
   const mode = options.mode ?? "summary";
   const lines: string[] = [];
-  const factualEntries = new Set<string>();
   for (const entry of entries) {
-    const facts = options.assistantAsFacts === true ? options.assistantFacts?.get(entry.id) : undefined;
-    // Compose/typed legacy transcript owners need not have any raw renderable dialogue.
-    // The canonical owner still carries the extracted source and its verified receipt proof.
-    const records =
-      facts && entry.type === "message"
-        ? [
-            {
-              entryId: entry.id,
-              timestamp: options.deliveredRecords?.get(entry.id)?.[0]?.timestamp ?? compactSourceTimestamp(entry),
-              role: "assistant" as const,
-              text: facts.join("；"),
-            },
-          ]
-        : (options.deliveredRecords?.get(entry.id) ?? renderCompressionRecords(entry));
-    for (const record of records) {
+    // Actual delivered bodies replace the plan/legacy renderer wherever speech is rendered.
+    for (const record of options.deliveredRecords?.get(entry.id) ?? renderCompressionRecords(entry)) {
       // Summary mode keeps the legacy renderer: ordinary Agent `user` messages were never
       // treated as platform conversation input; compartment mode intentionally includes them.
       if (mode === "summary" && record.role === "user" && record.speaker === undefined) continue;
       if (mode === "compartment" && record.role === "assistant" && options.assistantAsFacts !== true) continue;
       const stamp = formatCompactTimestamp(record.timestamp);
       const label = compressionLabel(record, mode);
-      if (record.role === "assistant" && options.assistantAsFacts === true && factualEntries.has(entry.id)) continue;
-      if (record.role === "assistant") factualEntries.add(entry.id);
-      const text =
-        record.role === "assistant" && options.assistantAsFacts === true
-          ? (options.assistantFacts?.get(entry.id)?.join("；") ?? "助手有历史输出记录；没有可确认的客观正文，不能补回原始台词。")
-          : record.text;
+      // Quoting marks assistant history as a delivered record, never as a role/dialogue example.
+      const text = record.role === "assistant" && options.assistantAsFacts === true ? `assistant 曾输出原文：“${record.text}”` : record.text;
       lines.push(`[${stamp}] [${label}]: ${text}`);
     }
   }

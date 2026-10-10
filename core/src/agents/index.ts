@@ -8,7 +8,7 @@ import { defaultWillEngine, type WillEngine, type WillPlugin } from "./will.js";
 
 type Disposer = () => void;
 
-/** Stable character material for the main Agent; independent of send-message polishing. */
+/** Stable character material for the main Agent, which authors the final reply. */
 export interface MainAgentRoleProfile {
   readonly characterDefinition?: string;
   readonly roleInstructions?: string;
@@ -26,8 +26,6 @@ export interface ChannelPluginSetupContext {
    * working image route, so a plugin must not claim it displayed any content.
    */
   readonly imagePreview?: ImagePreviewCapability;
-  /** True when an active polisher owns style rendering, so role prompts must not reach the main Agent. */
-  readonly polisherActive: boolean;
   /** Core assembles this opted-in provider's role material in its frozen role section. */
   readonly rolePromptsManaged?: boolean;
   /**
@@ -40,7 +38,7 @@ export interface ChannelPluginSetupContext {
 
 export interface ReplyDeliverySetupContext {
   readonly version: 1;
-  readonly ownership: "authored" | "delegated";
+  readonly ownership: "authored";
   readonly registerSticker: (provider: ReplyStickerProvider) => Disposer;
 }
 
@@ -146,23 +144,6 @@ export class Agents {
 export type { WillBatchDecision, WillDebug, WillEngine, WillPlugin, WillReservationOutcome, WillState } from "./will.js";
 
 export {
-  createSendMessagePolisher,
-  extractProtectedTokens,
-  PolisherRegistry,
-  validatePolishedMessages,
-  validateComposedMessages,
-  MAX_COMPOSE_MESSAGES,
-  MAX_COMPOSE_BYTES,
-  type PolisherMode,
-  type MessagePolisherCapability,
-  type PolisherPromptProfile,
-  type PolisherRequest,
-  type PolisherTurnContext,
-  type PolisherTurnEntry,
-  type RolePromptProfileProvider,
-} from "./polisher.js";
-
-export {
   createImagePreviewCapability,
   type ImageDescribeRequest,
   type ImagePreviewCapability,
@@ -171,22 +152,18 @@ export {
 } from "./image-preview.js";
 
 export {
+  extractProtectedTokens,
   fingerprintReplyPhaseInput,
-  layoutAnchorError,
   normalizeReplyParts,
   preflightReplyPhase,
   projectDeliveredText,
   REPLY_MAX_PHASE_BYTES,
   REPLY_MAX_UNITS,
-  replyComposerImageInput,
   ReplyCoordinator,
   validateReplyParts,
   type PreparedReplyUnit,
   type ReplyDeliveryNotice,
   type ReplyJournalWriter,
-  type ReplyLayoutComposeRequest,
-  type ReplyLayoutComposer,
-  type ReplyLayoutDraft,
   type ReplyMode,
   type ReplyPart,
   type ReplyProofWriter,

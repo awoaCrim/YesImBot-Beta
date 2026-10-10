@@ -15,7 +15,6 @@ vi.mock("../src/agents/tools.js", async (original) => ({ ...(await original<obje
 import { StickerDeliveryService } from "../../plugins/sticker-manager/src/delivery.js";
 import type { StickerStore } from "../../plugins/sticker-manager/src/store.js";
 import { config as stickerConfig, createDeps, scope, stickerId } from "../../plugins/sticker-manager/tests/preview-fixtures.js";
-import type { ReplyLayoutComposer } from "../src/agents/reply.js";
 import { Channel } from "../src/channels/index.js";
 import { collectDeliveredSourceRecords } from "../src/conversations/internal-history.js";
 import { ChannelRuntime, type ChannelRuntimeOptions } from "../src/runtimes/channel.js";
@@ -33,15 +32,6 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
   vi.restoreAllMocks();
 });
-function result(messages: ModelMessage[], name: string): Record<string, unknown> {
-  for (const message of [...messages].reverse())
-    if (message.role === "tool") {
-      const part = message.content.find((part) => part.type === "tool-result" && part.toolName === name);
-      if (part?.type === "tool-result" && part.output.type === "json") return part.output.value as Record<string, unknown>;
-    }
-  throw new Error("missing scripted result");
-}
-
 function modelFor(steps: Step[]) {
   const prompts: ModelMessage[][] = [];
   return {
@@ -74,10 +64,7 @@ function modelFor(steps: Step[]) {
   };
 }
 
-async function fixture(
-  steps: Step[],
-  options: Partial<Pick<ChannelRuntimeOptions, "composer" | "polisher" | "replyStillCurrent">> & { send?: () => Promise<string[]> } = {},
-) {
+async function fixture(steps: Step[], options: Partial<Pick<ChannelRuntimeOptions, "replyStillCurrent">> & { send?: () => Promise<string[]> } = {}) {
   const root = await mkdtemp(join(tmpdir(), "yesimbot-modern-runtime-"));
   roots.push(root);
   const channel = new Channel(scope, root);
@@ -120,7 +107,6 @@ async function fixture(
     readImagePolicy: { mode: "native" },
     imageProjection: deps.projection,
     config: defaultConfig({ basePath: root, pacing: { charactersPerSecond: 100, maxTotalDelayMs: 0 }, modelRetries: 0 }),
-    modernDelivery: true,
     plugins: [plugin],
     roleProfile: { characterDefinition: "FULL NORMAL MAIN ROLE" },
     ...options,
@@ -132,7 +118,6 @@ async function fixture(
       isViewCurrent: (view, turn) => delivery.isViewCurrent(view, turn),
       preflight: (input) => delivery.preflight(input),
     },
-    resolveRoleProfile: async () => ({ persona: "FULL EXPRESSION ROLE", characterDefinition: "FULL CHARACTER CARD" }),
   });
   runtimes.push(runtime);
   await runtime.init();
@@ -207,55 +192,38 @@ describe("actual ChannelRuntime modern reply boundaries", () => {
     expect(f.settleReservation).toHaveBeenCalledOnce();
     expect(f.notices).toHaveLength(1);
   });
-  it("B main stays neutral while the expression owner receives full profile and controls stay private", async () => {
-    const compose = vi.fn<ReplyLayoutComposer["compose"]>(async () => ({ kind: "layout", parts: [text("expression output")] }));
-    const f = await fixture(
-      [
-        { toolName: "prepare_reply", input: { facts: [], intent: "react", inner_thought: "PRIVATE" } },
-        (messages) => ({ toolName: "send_message", input: { reply_id: result(messages, "prepare_reply").reply_id } }),
-      ],
-      {
-        composer: { version: 1, name: "dedicated expression", compose },
-      },
-    );
+  it("delivers only main-authored parts and keeps the complete normal role material", async () => {
+    const f = await fixture([{ toolName: "send_message", input: { parts: [text("main authored")], inner_thought: "PRIVATE" } }]);
     await f.handle();
-    expect(compose).toHaveBeenCalledOnce();
-    expect(compose.mock.calls[0]![0].profile).toMatchObject({ persona: "FULL EXPRESSION ROLE", characterDefinition: "FULL CHARACTER CARD" });
-    expect(JSON.stringify(compose.mock.calls)).not.toContain("PRIVATE");
-    expect(JSON.stringify(f.prompts)).not.toMatch(/FULL NORMAL MAIN ROLE|FULL EXPRESSION ROLE|FULL CHARACTER CARD|expression output/);
     expect(f.sendMessage).toHaveBeenCalledOnce();
+    expect(JSON.stringify(f.prompts)).toContain("FULL NORMAL MAIN ROLE");
+    expect(JSON.stringify(f.prompts)).not.toContain("PRIVATE");
+    expect([...collectDeliveredSourceRecords(await f.channel.conversation.storage.read()).values()].flat().map((record) => record.text)).toEqual([
+      "main authored",
+    ]);
   });
-  it("declared unsupported B cannot downgrade to main-authored A or legacy drafts", async () => {
-    const f = await fixture([{ toolName: "prepare_reply", input: { facts: [], intent: "react" } }, finish], {
-      polisher: { name: "unsupported", mode: "compose", polish: async () => ["legacy draft"], replyLayout: { version: 99 } } as never,
-    });
+  it("no legacy draft, facts or reply_id channel can deliver", async () => {
+    const f = await fixture([
+      { toolName: "send_message", input: { messages: ["legacy draft"], facts: ["f"], intent: "react" } },
+      { toolName: "send_message", input: { reply_id: "guessed" } },
+      finish,
+    ]);
     await f.handle();
     expect(f.sendMessage).not.toHaveBeenCalled();
-    expect(JSON.stringify(f.prompts)).not.toMatch(/FULL NORMAL MAIN ROLE|legacy draft/);
+    // The raw rejected calls stay durable, but nothing becomes delivered/role speech.
+    expect([...collectDeliveredSourceRecords(await f.channel.conversation.storage.read()).values()]).toEqual([]);
   });
-  it("a registry change during B composition closes preparation before any output", async () => {
-    let current = true;
-    const compose = vi.fn<ReplyLayoutComposer["compose"]>(async () => {
-      current = false;
-      return { kind: "layout", parts: [text("obsolete expression")] };
-    });
-    const f = await fixture([{ toolName: "prepare_reply", input: { facts: [], intent: "react" } }, finish], {
-      composer: { version: 1, name: "expression", compose },
-      replyStillCurrent: () => current,
-    });
+  it("a stale reply boundary blocks transport before any output", async () => {
+    const f = await fixture([{ toolName: "send_message", input: { parts: [text("must not send")] } }], { replyStillCurrent: () => false });
     await f.handle();
     expect(f.sendMessage).not.toHaveBeenCalled();
-    expect(JSON.stringify(await f.channel.conversation.storage.read())).not.toContain("obsolete expression");
+    expect([...collectDeliveredSourceRecords(await f.channel.conversation.storage.read()).values()]).toEqual([]);
   });
-  it("silent event turns block modern preparation and sending and cannot read ordinary history", async () => {
-    const compose = vi.fn<ReplyLayoutComposer["compose"]>(async () => ({ kind: "layout", parts: [text("must not send")] }));
-    const f = await fixture([{ toolName: "prepare_reply", input: { facts: [], intent: "react" } }, finish], {
-      composer: { version: 1, name: "expression", compose },
-    });
+  it("silent event turns block authored sending and cannot read ordinary history", async () => {
+    const f = await fixture([{ toolName: "send_message", input: { parts: [text("must not send")] } }, finish]);
     await f.channel.conversation.storage.append(createEntry("message", { role: "user", id: "ordinary", timestamp: 1, content: "ORDINARY PRIVATE HISTORY" }));
     const outcome = await f.runtime.post(deliveryFailedEvent(), { delivery: "silent", historyMode: "event" });
     if (outcome.kind === "run") await outcome.done;
-    expect(compose).not.toHaveBeenCalled();
     expect(f.sendMessage).not.toHaveBeenCalled();
     expect(JSON.stringify(f.prompts)).not.toContain("ORDINARY PRIVATE HISTORY");
   });

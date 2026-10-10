@@ -36,7 +36,7 @@ export interface StickerPreviewToolOptions {
   readonly projection: EphemeralImageProjectionStore;
   readonly previewCapability: ImagePreviewCapability | undefined;
   readonly gate: StickerPreviewGate;
-  readonly deliveryMode?: "legacy" | "authored" | "delegated";
+  readonly deliveryMode?: "legacy" | "authored";
 }
 
 interface PreviewStickerInput {
@@ -54,11 +54,9 @@ export function createStickerPreviewTool(options: StickerPreviewToolOptions): Ag
     description: [
       "查看已有表情包的实际画面。发送前必须先查看；分类、标签和搜索元数据不算看过。",
       "可传精确 sticker_id，或按 category/index/tags 选定一张；不传参数随机挑选候选供查看，不会直接发送。",
-      options.deliveryMode === "delegated"
-        ? "按 prepare_reply 的原样 selector 查看；本步骤完成后，在更后一步只用 preparation_id 继续准备，不能自行编写视觉说明或角色台词。"
-        : options.deliveryMode === "authored"
-          ? "返回实际画面或视觉描述及精确 id；查看完成后，在更后一步把同一 id 放入 send_message 完整 parts。不要并列查看和发送。"
-          : "返回实际画面或视觉描述及精确 id；等看到结果并判断合适后，再用同一 id 调用 sticker_send，不要在同一步并列调用查看与发送。",
+      options.deliveryMode === "authored"
+        ? "返回实际画面或视觉描述及精确 id；查看完成后，在更后一步把同一 id 放入 send_message 完整 parts。不要并列查看和发送。"
+        : "返回实际画面或视觉描述及精确 id；等看到结果并判断合适后，再用同一 id 调用 sticker_send，不要在同一步并列调用查看与发送。",
       "查看不会发送、不会增加使用次数，也不代表必须发送。动图可能只提供标明位置的采样帧，不要假设看到了整个动画。",
     ].join("\n"),
     inputSchema: jsonSchema<PreviewStickerInput>({

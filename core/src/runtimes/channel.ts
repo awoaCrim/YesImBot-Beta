@@ -20,27 +20,22 @@ import {
 import type { AssistantContent, LanguageModel, ModelMessage, ToolSet } from "ai";
 import { Universal, type Bot, type Context, type Logger } from "koishi";
 
-import { createImagePreviewCapability } from "../agents/image-preview.js";
 import type { MainAgentRoleProfile } from "../agents/index.js";
-import { buildPolisherTurnContext, type MessagePolisherCapability } from "../agents/polisher.js";
 import { createReplyTools, type ReplyToolSet } from "../agents/reply-tools.js";
-import type { ReplyLayoutComposer, ReplyStickerProvider } from "../agents/reply.js";
+import type { ReplyStickerProvider } from "../agents/reply.js";
 import {
   createDescribeImageTool,
   createExpandCompartmentTool,
   createContextWorkspaceTools,
   createFinishTool,
   createReadTool,
-  createSendMessageTool,
   type DeliveredNotice,
   type ReadImagePolicy,
   type SendFailedNotice,
-  type SendMessageToolOptions,
 } from "../agents/tools.js";
 import type { WillBatchDecision, WillEngine, WillReservationOutcome, WillState } from "../agents/will.js";
 import { type Channel, type ChannelContext, deriveChannelKey } from "../channels/index.js";
 import type { Config } from "../config.js";
-import { AssistantHistoryFacts } from "../conversations/assistant-facts.js";
 import { resolveLatestCompactBoundary } from "../conversations/boundary.js";
 import { formatRecalledContinuities } from "../conversations/compact.js";
 import type { ContinuityEntry } from "../conversations/context-blocks.js";
@@ -128,18 +123,8 @@ export interface ChannelRuntimeOptions {
   readonly archiveMaxBytes?: number;
   /** Core persistent overflow index for fragments older than the resident window. */
   readonly compactFragments?: CompactFragmentRecallSource;
-  /** Active send-message polisher. Absent means the baseline prompt, schema, and sender are unchanged. */
-  readonly polisher?: MessagePolisherCapability;
-  /** Resolves the current registered polisher and live profile immediately before sending. */
-  readonly polish?: SendMessageToolOptions["polish"];
-  /** Optional modern reply-delivery capability collected before runtime construction. */
+  /** Optional reply-delivery capability collected before runtime construction. */
   readonly sticker?: ReplyStickerProvider;
-  /** Versioned mixed-layout composer; present only for the official B lane. */
-  readonly composer?: ReplyLayoutComposer;
-  /** Resolves the complete live role profile for the expression owner (B lane only). */
-  readonly resolveRoleProfile?: () => Promise<{ persona: string; roleInstructions?: string; characterDefinition?: string }>;
-  /** Set false only for the explicit legacy third-party lane. */
-  readonly modernDelivery?: boolean;
   /** Bound registry/setup/model generation; checked at every modern await/transport boundary. */
   readonly replyStillCurrent?: () => boolean;
 }
@@ -181,9 +166,8 @@ export class ChannelRuntime {
   private compactionController: AbortController | undefined;
   /** Largest provider-reported prompt size seen since the last consumed compaction trigger. */
   private promptLimitCompact: { readonly inputTokens: number; readonly turnId: string } | undefined;
-  /** Turns started by a silent post; `send_message` and preparation are blocked for them. */
+  /** Turns started by a silent post; authored `send_message` is blocked for them. */
   private readonly silentTurns = new Set<string>();
-  private readonly modern: boolean;
   private modernReplies: ReplyToolSet | undefined;
   private readonly replyProofWrites = new Set<Promise<void>>();
 
@@ -196,47 +180,17 @@ export class ChannelRuntime {
     this.imageProjection = options.imageProjection ?? new EphemeralImageProjectionStore();
     this.logger = ctx.logger("yesimbot/channel-runtime");
     this.logger.level = options.config.logLevel ?? 2;
-    this.modern = options.modernDelivery === true;
-    const tools: AgentToolSet = this.modern
-      ? [
-          ...this.createModernReplyTools(options),
-          createReadTool(options.channel.resources, options.readImagePolicy, this.imageProjection),
-          ...(options.config.session.magicContext?.enabled ? [] : [createExpandCompartmentTool(options.channel.conversation)]),
-          createFinishTool(),
-        ]
-      : [
-          createSendMessageTool({
-            bot: options.bot,
-            channelId: this.context.channelId,
-            resources: options.channel.resources,
-            pacing: options.config.pacing,
-            innerThought: options.config.customInnerThought,
-            ...(options.polisher
-              ? {
-                  factsRequired: true,
-                  polisherMode: options.polisher.mode ?? "rewrite",
-                  ...(options.polish ? { polish: options.polish } : {}),
-                }
-              : {}),
-            onDelivered: (notice) => this.announceDelivered(notice),
-            onFailed: (notice) => this.announceSendFailed(notice),
-          }),
-          createReadTool(options.channel.resources, options.readImagePolicy, this.imageProjection),
-          ...(options.config.session.magicContext?.enabled ? [] : [createExpandCompartmentTool(options.channel.conversation)]),
-          createFinishTool(),
-        ];
+    const tools: AgentToolSet = [
+      ...this.createModernReplyTools(options),
+      createReadTool(options.channel.resources, options.readImagePolicy, this.imageProjection),
+      ...(options.config.session.magicContext?.enabled ? [] : [createExpandCompartmentTool(options.channel.conversation)]),
+      createFinishTool(),
+    ];
     if (options.visionModel && options.readImagePolicy.mode !== "native") {
       tools.push(createDescribeImageTool(options.visionModel, options.channel.resources));
     }
     const channelKey = deriveChannelKey(this.context);
     const projection = options.config.session.magicContext?.enabled ? new AgentRequestProjection() : undefined;
-    const historyFacts =
-      options.config.session.compact.assistantAsFacts === true
-        ? (options.channel.conversation.historyFacts ??
-          new AssistantHistoryFacts({
-            scope: () => `${options.channel.conversation.currentSessionId()}:${options.channel.conversation.storageGeneration}`,
-          }))
-        : undefined;
     if (projection) {
       this.contextWorkspace = new ContextWorkspace(options.channel.conversation, projection, {
         config: options.config.session.magicContext!,
@@ -289,27 +243,20 @@ export class ChannelRuntime {
           channel: this.context,
           selfId: this.selfId,
           customInnerThought: options.config.customInnerThought,
-          delegated: options.polisher !== undefined || (this.modern && options.composer !== undefined),
-          polisherMode: options.polisher?.mode,
-          replyOwnership: this.modern ? (options.polisher || options.composer ? "delegated" : "authored") : undefined,
           roleProfile: options.roleProfile,
           logger: this.logger,
         }),
       tools,
       providerTools: options.providerTools,
       plugins: [
-        ...(this.modern
-          ? [
-              createReplyJournalHistoryPlugin(),
-              {
-                name: "core.reply-lifecycle",
-                onTurnFinish: async (_result: import("@yesimbot/agent-runtime").TurnResult, context: { turnId: string }) => {
-                  await this.modernReplies?.finishTurn(context.turnId);
-                  await Promise.allSettled([...this.replyProofWrites]);
-                },
-              },
-            ]
-          : []),
+        createReplyJournalHistoryPlugin(),
+        {
+          name: "core.reply-lifecycle",
+          onTurnFinish: async (_result: import("@yesimbot/agent-runtime").TurnResult, context: { turnId: string }) => {
+            await this.modernReplies?.finishTurn(context.turnId);
+            await Promise.allSettled([...this.replyProofWrites]);
+          },
+        },
         // Capture compact anchors from canonical entries before the history projection replaces
         // compact records with request-only system messages.
         ...(this.contextWorkspace
@@ -329,7 +276,7 @@ export class ChannelRuntime {
         // Read-only legacy compact/continuity compatibility; this never schedules compaction.
         this.compactRecallPlugin(channelKey),
         createSummaryHistoryPlugin(inlineFragmentCount(options.config), projection, this.contextWorkspace ? undefined : options.channel.conversation),
-        historyFacts?.plugin(projection) ?? createInternalHistoryProjectionPlugin(options.historyProjection ?? "default", projection),
+        createInternalHistoryProjectionPlugin(options.historyProjection ?? "default", projection),
         createModelInputPlugin(
           options.historyProjection ?? "default",
           this.contextWorkspace !== undefined,
@@ -346,41 +293,19 @@ export class ChannelRuntime {
     });
   }
 
-  /**
-   * One modern tool set per runtime: A installs the ordered `parts` sender; the official B lane
-   * installs `prepare_reply` plus a ready-only sender. No model-visible legacy draft/sticker bypass
-   * exists in either lane.
-   */
+  /** One authored tool set per runtime: the main model submits the complete ordered `parts` phase. */
   private createModernReplyTools(options: ChannelRuntimeOptions): AgentTool[] {
     const conversation = options.channel.conversation;
     const turnScoped = (turnId: string) =>
       !this.stopped && !this.silentTurns.has(turnId) && this.agent.getActiveTurnId() === turnId && (options.replyStillCurrent?.() ?? true);
-    const descriptor = options.visionModel
-      ? createImagePreviewCapability({ policy: { mode: "vision", visionModel: options.visionModel }, projection: this.imageProjection })
-      : undefined;
     const set = createReplyTools({
       bot: options.bot,
       channelId: this.context.channelId,
       resources: options.channel.resources,
       pacing: options.config.pacing,
       innerThought: options.config.customInnerThought,
-      delegated: options.polisher !== undefined || options.composer !== undefined,
-      previewAvailable: options.readImagePolicy.mode !== "unavailable",
       stillAllowed: () => !this.stopped && (options.replyStillCurrent?.() ?? true),
-      ...(descriptor
-        ? {
-            describeFrames: (view: import("../agents/reply.js").ReplyStickerView, signal?: AbortSignal) =>
-              descriptor.describe({
-                frames: view.frames ?? [],
-                question: "描述实际提供的表情画面、可见文字与动作，区分事实和推测；采样之外无法确认。",
-                signal,
-              }),
-          }
-        : {}),
-      ...(options.composer ? { composer: options.composer } : {}),
       ...(options.sticker ? { sticker: options.sticker } : {}),
-      resolveProfile: async () => (options.resolveRoleProfile ? await options.resolveRoleProfile() : { persona: "" }),
-      turnContext: (messages) => buildPolisherTurnContext(messages, { replyLayout: true }),
       journal: {
         begin: (input) => {
           const sessionId = conversation.currentSessionId();
@@ -404,7 +329,7 @@ export class ChannelRuntime {
       onFailed: (notice) => this.announceSendFailed(notice),
       onWarn: (reason, detail) => this.logger.warn(reason, detail),
     });
-    // The silent-turn boundary is rechecked at preparation, admission and every transport.
+    // The silent-turn boundary is rechecked at admission and before every transport.
     set.setTurnAllowed(turnScoped);
     this.modernReplies = set;
     return set.tools;

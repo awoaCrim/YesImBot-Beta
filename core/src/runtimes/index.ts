@@ -3,7 +3,6 @@ import type { Bot, Context, Logger, Session } from "koishi";
 
 import { createImagePreviewCapability } from "../agents/image-preview.js";
 import { Agents, type ReplyStickerProvider } from "../agents/index.js";
-import { createSendMessagePolisher, PolisherRegistry } from "../agents/polisher.js";
 import type { ReadImagePolicy } from "../agents/tools.js";
 import type { Channel, Channels } from "../channels/index.js";
 import { type ChannelContext, type ChannelKey, deriveChannelKey } from "../channels/index.js";
@@ -11,7 +10,6 @@ import type { Config } from "../config.js";
 import { MessageBatchRegistry } from "../message-batches/index.js";
 import { AuxiliaryModelError, type ChatModelRef, ModelService } from "../models/index.js";
 import { ChannelRuntime } from "./channel.js";
-import { resolvePolisherPromptProfile } from "./prompt.js";
 
 export class Runtimes {
   private readonly logger: Logger;
@@ -19,13 +17,11 @@ export class Runtimes {
   private readonly agentRevisions = new Map<string, number>();
   private readonly messageRevisions = new Map<string, number>();
   private readonly modelRevisions = new Map<string, number | undefined>();
-  private readonly polisherRevisions = new Map<string, number>();
   private readonly tails = new Map<string, Promise<void>>();
   private stopped = false;
   private stopTask: Promise<void> | undefined;
   private readonly messageRevisionDisposer: () => void;
   private readonly modelRevisionDisposer: () => void;
-  private readonly polisherRevisionDisposer: () => void;
 
   public constructor(
     private readonly ctx: Context,
@@ -34,7 +30,6 @@ export class Runtimes {
     private readonly config: Config,
     private readonly agents: Agents,
     private readonly messageBatches: MessageBatchRegistry = new MessageBatchRegistry(),
-    private readonly polishers: PolisherRegistry = new PolisherRegistry(),
   ) {
     this.logger = ctx.logger("yesimbot.runtimes");
     this.logger.level = config.logLevel ?? 2;
@@ -43,9 +38,6 @@ export class Runtimes {
     });
     this.modelRevisionDisposer = ctx.on("yesimbot/model-registry-changed", (revision) => {
       void this.invalidateModelRuntimes(revision);
-    });
-    this.polisherRevisionDisposer = this.polishers.onRevision((revision) => {
-      void this.invalidatePolisherRuntimes(revision);
     });
   }
 
@@ -62,17 +54,8 @@ export class Runtimes {
       const currentMessageRevision = this.messageRevisions.get(key);
       const modelRevision = this.model.revision;
       const currentModelRevision = this.modelRevisions.get(key);
-      const polisherRevision = this.polishers.revision;
-      const currentPolisherRevision = this.polisherRevisions.get(key);
       const sameBot = current?.isBoundTo(bot) ?? false;
-      if (
-        current &&
-        sameBot &&
-        currentRevision === agentRevision &&
-        currentMessageRevision === messageRevision &&
-        currentModelRevision === modelRevision &&
-        currentPolisherRevision === polisherRevision
-      ) {
+      if (current && sameBot && currentRevision === agentRevision && currentMessageRevision === messageRevision && currentModelRevision === modelRevision) {
         value = current;
         return;
       }
@@ -82,7 +65,6 @@ export class Runtimes {
           ...(currentRevision === agentRevision ? [] : ["agent_revision"]),
           ...(currentMessageRevision === messageRevision ? [] : ["message_revision"]),
           ...(currentModelRevision === modelRevision ? [] : ["model_revision"]),
-          ...(currentPolisherRevision === polisherRevision ? [] : ["polisher_revision"]),
         ];
         this.logger.warn("runtimes.get.recreate", {
           key,
@@ -95,8 +77,6 @@ export class Runtimes {
           newMessageRevision: messageRevision,
           oldModelRevision: currentModelRevision,
           newModelRevision: modelRevision,
-          oldPolisherRevision: currentPolisherRevision,
-          newPolisherRevision: polisherRevision,
         });
         await current.stop();
       }
@@ -123,26 +103,13 @@ export class Runtimes {
       const vision = this.resolveVision(channel.context);
       const imageProjection = new EphemeralImageProjectionStore();
       const readImagePolicy = resolveReadImagePolicy(chat, vision, this.config.imageInput);
-      const polisher = this.polishers.resolve();
-      const composer = this.polishers.resolveComposer(channel.context);
-      const modernDelivery = !polisher || polisher.replyLayout !== undefined;
       const registriesCurrent = () =>
         !this.stopped &&
         this.agents.revision === agentRevision &&
         this.messageBatches.revision === messageRevision &&
         this.model.revision === modelRevision &&
-        this.polishers.revision === polisherRevision &&
         this.config.chatModel === chatModelId;
-      const polish =
-        polisher === undefined
-          ? undefined
-          : createSendMessagePolisher({
-              registry: this.polishers,
-              resolveProfile: async () => resolvePolisherPromptProfile(this.config.basePath, await this.polishers.resolveProfile(channel.context), this.logger),
-              context: channel.context,
-              capability: polisher,
-            });
-      const roleProfile = polisher === undefined ? await this.agents.resolveRoleProfile(channel.context) : undefined;
+      const roleProfile = await this.agents.resolveRoleProfile(channel.context);
       if (!registriesCurrent()) {
         retry = true;
         return;
@@ -158,27 +125,22 @@ export class Runtimes {
         .setup(channel.context, bot, {
           imageProjection,
           imagePreview: createImagePreviewCapability({ policy: readImagePolicy, projection: imageProjection }),
-          polisherActive: polisher !== undefined,
-          rolePromptsManaged: polisher === undefined,
-          ...(modernDelivery
-            ? {
-                replyDelivery: {
-                  version: 1 as const,
-                  ownership: polisher ? ("delegated" as const) : ("authored" as const),
-                  registerSticker: (provider: ReplyStickerProvider) => {
-                    if (frozen || stickerProvider) throw new Error("Sticker delivery setup is frozen or already registered");
-                    stickerProvider = provider;
-                    providerGeneration++;
-                    return () => {
-                      if (stickerProvider === provider) {
-                        stickerProvider = undefined;
-                        providerGeneration++;
-                      }
-                    };
-                  },
-                },
-              }
-            : {}),
+          rolePromptsManaged: true,
+          replyDelivery: {
+            version: 1 as const,
+            ownership: "authored" as const,
+            registerSticker: (provider: ReplyStickerProvider) => {
+              if (frozen || stickerProvider) throw new Error("Sticker delivery setup is frozen or already registered");
+              stickerProvider = provider;
+              providerGeneration++;
+              return () => {
+                if (stickerProvider === provider) {
+                  stickerProvider = undefined;
+                  providerGeneration++;
+                }
+              };
+            },
+          },
         })
         .catch((cause) => {
           frozen = true;
@@ -219,18 +181,8 @@ export class Runtimes {
         config: this.config,
         plugins,
         roleProfile,
-        polisher,
-        polish,
-        modernDelivery,
         replyStillCurrent: stillCurrent,
-        ...(composer ? { composer } : {}),
         ...(stickerProvider ? { sticker: stickerProvider } : {}),
-        ...(polisher
-          ? {
-              resolveRoleProfile: async () =>
-                resolvePolisherPromptProfile(this.config.basePath, await this.polishers.resolveProfile(channel.context), this.logger),
-            }
-          : {}),
         messageBatch: this.messageBatches.select(channel.context),
         archiveMaxBytes: this.config.session.archive.maxKB * 1024,
         ...(this.channels.compactFragments ? { compactFragments: this.channels.compactFragments } : {}),
@@ -260,18 +212,10 @@ export class Runtimes {
         retry = true;
         return;
       }
-      const latestPolisherRevision = this.polishers.revision;
-      if (latestPolisherRevision !== polisherRevision) {
-        this.logger.warn("runtimes.get.polisher_revision_changed", { key, selectedRevision: polisherRevision, latestRevision: latestPolisherRevision });
-        await runtime.stop();
-        retry = true;
-        return;
-      }
       this.runtimes.set(key, runtime);
       this.agentRevisions.set(key, agentRevision);
       this.messageRevisions.set(key, messageRevision);
       this.modelRevisions.set(key, modelRevision);
-      this.polisherRevisions.set(key, polisherRevision);
       this.logger.debug("runtimes.get.created", { key, selfId: bot.selfId, agentRevision, messageRevision, modelRevision, runtimeCount: this.runtimeCount() });
       value = runtime;
     });
@@ -291,7 +235,6 @@ export class Runtimes {
       this.agentRevisions.delete(key);
       this.messageRevisions.delete(key);
       this.modelRevisions.delete(key);
-      this.polisherRevisions.delete(key);
       await this.channels.reset(ctx);
     });
   }
@@ -302,13 +245,11 @@ export class Runtimes {
     this.logger.debug("runtimes.stop", { runtimeCount: this.runtimes.size });
     this.messageRevisionDisposer();
     this.modelRevisionDisposer();
-    this.polisherRevisionDisposer();
     this.stopTask = Promise.allSettled([...this.runtimes.values()].map((runtime) => runtime.stop())).then(() => {
       this.runtimes.clear();
       this.agentRevisions.clear();
       this.messageRevisions.clear();
       this.modelRevisions.clear();
-      this.polisherRevisions.clear();
       this.tails.clear();
     });
     return this.stopTask;
@@ -338,7 +279,6 @@ export class Runtimes {
       this.agentRevisions.delete(key);
       this.messageRevisions.delete(key);
       this.modelRevisions.delete(key);
-      this.polisherRevisions.delete(key);
       const channel = await this.channels.resolve(ctx);
       const magic = this.config.session.magicContext?.enabled === true;
       const chat = noSummary || magic ? undefined : this.model.resolveChatModel(this.config.chatModel, channel.context);
@@ -438,7 +378,6 @@ export class Runtimes {
           this.agentRevisions.delete(key);
           this.messageRevisions.delete(key);
           this.modelRevisions.delete(key);
-          this.polisherRevisions.delete(key);
         }),
       ),
     );
@@ -460,29 +399,6 @@ export class Runtimes {
           this.agentRevisions.delete(key);
           this.messageRevisions.delete(key);
           this.modelRevisions.delete(key);
-          this.polisherRevisions.delete(key);
-        }),
-      ),
-    );
-  }
-
-  private async invalidatePolisherRuntimes(revision: number): Promise<void> {
-    if (this.stopped) return;
-    await Promise.all(
-      [...this.runtimes.keys()].map((key) =>
-        this.serialize(key, async () => {
-          const currentRevision = this.polisherRevisions.get(key);
-          if (currentRevision === undefined || currentRevision >= revision) return;
-          const runtime = this.runtimes.get(key);
-          if (runtime) {
-            this.logger.warn("runtimes.invalidate_polisher", { key, currentRevision, newRevision: revision });
-            await runtime.stop();
-          }
-          this.runtimes.delete(key);
-          this.agentRevisions.delete(key);
-          this.messageRevisions.delete(key);
-          this.modelRevisions.delete(key);
-          this.polisherRevisions.delete(key);
         }),
       ),
     );

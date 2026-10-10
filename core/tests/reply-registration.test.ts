@@ -24,7 +24,6 @@ vi.mock("@yesimbot/agent-runtime", async (original) => {
 import { createAgent } from "@yesimbot/agent-runtime";
 
 import { Agents, type ChannelPluginSetupContext, type ReplyDeliverySetupContext, type ReplyStickerProvider } from "../src/agents/index.js";
-import { PolisherRegistry, type MessagePolisherCapability } from "../src/agents/polisher.js";
 import { Channels } from "../src/channels/index.js";
 import { MessageBatchRegistry } from "../src/message-batches/index.js";
 import { Runtimes } from "../src/runtimes/index.js";
@@ -38,14 +37,12 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function fixture(capability?: MessagePolisherCapability) {
+async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "yesimbot-reply-registration-"));
   roots.push(root);
   const ctx = new Context();
   const channels = new Channels(ctx, { basePath: root });
   const agents = new Agents(ctx);
-  const polishers = new PolisherRegistry();
-  const unregister = capability ? polishers.use(capability) : undefined;
   const owner = new Runtimes(
     ctx,
     channels,
@@ -56,12 +53,11 @@ async function fixture(capability?: MessagePolisherCapability) {
     defaultConfig({ basePath: root, logLevel: 0 }),
     agents,
     new MessageBatchRegistry(),
-    polishers,
   );
   owners.push(owner);
   const channel = await channels.resolve({ type: "guild", platform: "test", channelId: "room", guildId: "room" });
   const bot = { platform: "test", selfId: "bot", sendMessage: vi.fn(async () => ["platform-id"]) };
-  return { owner, agents, channel, bot, unregister, get: () => owner.get(channel, bot as never) };
+  return { owner, agents, channel, bot, get: () => owner.get(channel, bot as never) };
 }
 
 function provider(): ReplyStickerProvider {
@@ -85,18 +81,9 @@ function requireSeam(context?: ChannelPluginSetupContext): ReplyDeliverySetupCon
   return context.replyDelivery;
 }
 
-const polish = async () => ["legacy expression"];
-const compose = async () => ({ kind: "layout" as const, parts: [{ kind: "text" as const, text: "expression" }] });
-
 describe("actual Runtimes reply registration boundary", () => {
-  it.each([
-    { name: "A", capability: undefined, ownership: "authored", preparation: false },
-    { name: "B", capability: { name: "official", polish, replyLayout: { version: 1, compose } }, ownership: "delegated", preparation: true },
-    { name: "unsupported B", capability: { name: "future", polish, replyLayout: { version: 99, compose } }, ownership: "delegated", preparation: true },
-    { name: "legacy rewrite", capability: { name: "third-party", mode: "rewrite" as const, polish }, ownership: undefined, preparation: false },
-    { name: "legacy compose", capability: { name: "third-party", mode: "compose" as const, polish }, ownership: undefined, preparation: false },
-  ])("selects $name before plugin setup without inferring mixed support", async ({ capability, ownership, preparation }) => {
-    const f = await fixture(capability);
+  it("selects one authored parts sender and no polishing preparation tool", async () => {
+    const f = await fixture();
     let setupContext: ChannelPluginSetupContext | undefined;
     f.agents.use({
       setup: (_channel, _bot, context) => {
@@ -105,10 +92,9 @@ describe("actual Runtimes reply registration boundary", () => {
       },
     });
     await f.get();
-    expect(setupContext?.replyDelivery?.ownership).toBe(ownership);
-    expect(setupContext?.polisherActive).toBe(capability !== undefined);
-    expect(selectedAgent().tools?.some((tool) => tool.name === "prepare_reply")).toBe(preparation);
+    expect(setupContext?.replyDelivery?.ownership).toBe("authored");
     expect(selectedAgent().tools?.filter((tool) => tool.name === "send_message")).toHaveLength(1);
+    expect(selectedAgent().tools?.some((tool) => tool.name === "prepare_reply")).toBe(false);
   });
 
   it("freezes registration after setup and disposal invalidates an already-created sender", async () => {
@@ -190,5 +176,23 @@ describe("actual Runtimes reply registration boundary", () => {
       await send.execute({ parts: [{ kind: "text", text: "new generation" }] }, { turnId: "turn", toolCallId: "send", messages: [] } as never),
     ).toMatchObject({ ok: true });
     expect(f.bot.sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it("retries runtime creation when a role registration changes during plugin setup", async () => {
+    const f = await fixture();
+    let calls = 0;
+    let dispose!: () => void;
+    f.agents.use({
+      setup: () => {
+        calls += 1;
+        if (calls === 1) dispose = f.agents.use({ setup: () => ({ name: "late-registration" }) });
+        return { name: "racing-fixture" };
+      },
+    });
+    const runtime = await f.get();
+    expect(runtime).toBeDefined();
+    expect(calls).toBeGreaterThan(1);
+    dispose();
+    expect((await f.get()).isBoundTo(f.bot as never)).toBe(true);
   });
 });

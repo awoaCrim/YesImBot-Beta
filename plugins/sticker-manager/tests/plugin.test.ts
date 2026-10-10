@@ -178,22 +178,21 @@ describe("StickerManagerPlugin", () => {
     );
   });
 
-  it.each(["authored", "delegated"] as const)("modern %s hides standalone delivery and registers one disposable capability", async (ownership) => {
+  it("modern authored hides standalone delivery and registers one disposable capability", async () => {
     const harness = createHarness({ enableSteal: false, tagMode: true });
     const unregister = vi.fn();
     const registerSticker = vi.fn((_provider: ReplyStickerProvider) => unregister);
     const runtime = {
       imageProjection: new EphemeralImageProjectionStore(),
-      polisherActive: ownership === "delegated",
-      replyDelivery: { version: 1, ownership, registerSticker },
-    } as ChannelPluginSetupContext;
+      replyDelivery: { version: 1 as const, ownership: "authored" as const, registerSticker },
+    };
     const plugin = await harness.start({ selfId: "bot" }, scope, runtime);
     expect(registerSticker).toHaveBeenCalledOnce();
     await expectToolNames(plugin, ["sticker_preview", "sticker_categories", "sticker_search", "sticker_tags"]);
     const prompt = await pluginPrompt(plugin);
     expect(prompt).not.toContain("sticker_send");
     expect(prompt).not.toContain("continue 设为 true");
-    expect(prompt).toContain(ownership === "authored" ? "完整 parts" : "prepare_reply");
+    expect(prompt).toContain("完整 parts");
     const tools = typeof plugin?.tools === "function" ? await plugin.tools({} as never) : [];
     expect(tools?.find((tool) => tool.name === "sticker_preview")?.description).not.toContain("sticker_send");
     const provider = registerSticker.mock.calls[0]![0];
@@ -215,7 +214,6 @@ describe("StickerManagerPlugin", () => {
     const registerSticker = vi.fn((_provider: ReplyStickerProvider) => vi.fn());
     const runtime: ChannelPluginSetupContext = {
       imageProjection: new EphemeralImageProjectionStore(),
-      polisherActive: false,
       replyDelivery: { version: 1, ownership: "authored", registerSticker },
     };
     const preflight = vi.fn(async (_input: Parameters<StickerDeliveryService["preflight"]>[0]) => ({ error: "test_preflight" }));
@@ -234,17 +232,13 @@ describe("StickerManagerPlugin", () => {
     unregister?.();
   });
 
-  it("modern guards reject legacy sticker resources in A parts and B exact payloads before output", async () => {
+  it("modern guards reject legacy sticker resources in authored parts before output", async () => {
     const harness = createHarness();
     const plugin = await harness.start({ selfId: "bot" }, scope, {
       imageProjection: new EphemeralImageProjectionStore(),
-      polisherActive: true,
-      replyDelivery: { version: 1, ownership: "delegated", registerSticker: () => () => {} },
+      replyDelivery: { version: 1, ownership: "authored", registerSticker: () => () => {} },
     });
-    const blocked = [
-      { toolName: "send_message", args: { parts: [{ kind: "text", text: '<img src="artifact://sticker/old.png"/>' }] } },
-      { toolName: "prepare_reply", args: { facts: [], intent: "react", verbatim: ['<sticker id="s"/>'] } },
-    ];
+    const blocked = [{ toolName: "send_message", args: { parts: [{ kind: "text", text: '<img src="artifact://sticker/old.png"/>' }] } }];
     for (const call of blocked) expect(await plugin?.beforeToolCall?.(call as never, {} as never)).toMatchObject({ type: "block" });
     expect(
       await plugin?.beforeToolCall?.({ toolName: "send_message", args: { parts: [{ kind: "sticker", sticker_id: "viewed-id" }] } } as never, {} as never),
@@ -256,7 +250,6 @@ describe("StickerManagerPlugin", () => {
     const registerSticker = vi.fn();
     const plugin = await harness.start({ selfId: "bot" }, scope, {
       imageProjection: new EphemeralImageProjectionStore(),
-      polisherActive: false,
       replyDelivery: { version: 2, ownership: "authored", registerSticker },
     } as unknown as ChannelPluginSetupContext);
     expect(registerSticker).not.toHaveBeenCalled();
@@ -508,7 +501,6 @@ describe("StickerManagerPlugin", () => {
     const projection = new EphemeralImageProjectionStore();
     const agentPlugin = await harness.start({ selfId: "bot", sendMessage }, scope, {
       imageProjection: projection,
-      polisherActive: false,
       imagePreview: { mode: "vision", preview: () => ({ mode: "unavailable", error: "image_input_unavailable" }), describe: async () => "红色画面" },
     });
     if (!registeredPlugin || !agentPlugin) throw new Error("sticker plugin was not initialized");

@@ -77,14 +77,7 @@ export class ContextBlockStore {
   private sessionId: string | undefined;
   private epoch = 0;
 
-  public constructor(
-    private readonly snapshot: () => Promise<ContextSourceSnapshot>,
-    private readonly projectRecords?: (
-      records: readonly CompressionRecord[],
-      entries: readonly AgentEntry[],
-      signal?: AbortSignal,
-    ) => Promise<readonly CompressionRecord[]>,
-  ) {}
+  public constructor(private readonly snapshot: () => Promise<ContextSourceSnapshot>) {}
 
   public invalidate(): void {
     this.epoch += 1;
@@ -189,15 +182,13 @@ export class ContextBlockStore {
     const canonical = entries.filter((entry) => rangeIds.has(entry.id));
     if (new Set(canonical.map((entry) => entry.id)).size !== canonical.length) throw new ContextSourceError("AmbiguousRawSource");
     const originals = safeSourceRecords(entries, rangeIds);
-    const records = this.projectRecords ? await this.projectRecords(originals, entries, signal) : originals;
+    const records = originals;
     this.checkEpoch(sourceEpoch);
     if (signal?.aborted) throw new ContextSourceError("CancelledContextRead");
     // A send receipt can lie outside the range. Bind cursors to the verified readable
     // projection too, so changing that evidence cannot reuse old text offsets.
     const proofs = collectAssistantSourceProofs(entries);
-    const fingerprint = hash(
-      JSON.stringify([rangeFingerprint(canonical), originals, [...rangeIds].map((id) => [id, proofs.get(id)]), ...(this.projectRecords ? [records] : [])]),
-    );
+    const fingerprint = hash(JSON.stringify([rangeFingerprint(canonical), originals, [...rangeIds].map((id) => [id, proofs.get(id)])]));
     let recordIndex = 0;
     let offset = 0;
     if (input.cursor) {

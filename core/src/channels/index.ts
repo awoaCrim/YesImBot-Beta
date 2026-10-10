@@ -4,7 +4,6 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { Context, Logger } from "koishi";
 
-import type { HistoryFactsModel } from "../conversations/assistant-facts.js";
 import { CompactFragmentStore, type CompactFragmentWriter } from "../conversations/fragment-store.js";
 import { Conversation, type ConversationCompactConfig, type ConversationReadOptions } from "../conversations/index.js";
 import type { MessageRecord } from "../messages/index.js";
@@ -22,7 +21,6 @@ export interface ChannelsOptions {
   readonly readTimeoutMs?: number;
   readonly compactConfig?: ConversationCompactConfig;
   readonly magicContext?: boolean;
-  readonly resolveHistoryFactsModel?: (context: ChannelContext) => HistoryFactsModel;
 }
 
 /** Fragment persistence wiring handed to each channel's conversation. */
@@ -45,13 +43,11 @@ export class Channel {
     compactConfig: ConversationCompactConfig = { minMessages: 15, maxFailures: 3 },
     fragments: ChannelFragmentOptions = {},
     magicContext = false,
-    resolveHistoryFactsModel?: () => HistoryFactsModel,
   ) {
     this.resources = new ChannelResources(root, imageInput, readTimeoutMs);
     this.conversation = new Conversation(root, compactConfig, {
       channelKey: deriveChannelKey(context),
       magicContext,
-      resolveHistoryFactsModel,
       ...(fragments.store ? { fragments: fragments.store } : {}),
       ...(fragments.onError ? { onFragmentError: fragments.onError } : {}),
     });
@@ -71,7 +67,6 @@ export class Channels implements Resources {
   private readonly readTimeoutMs: number;
   private readonly compactConfig: ConversationCompactConfig;
   private readonly magicContext: boolean;
-  private readonly resolveHistoryFactsModel: ChannelsOptions["resolveHistoryFactsModel"];
   private readonly fragmentStore: CompactFragmentStore | undefined;
   private readonly logger: Logger;
   private readonly started: Promise<void>;
@@ -82,7 +77,6 @@ export class Channels implements Resources {
     this.readTimeoutMs = options.readTimeoutMs ?? 10_000;
     this.compactConfig = options.compactConfig ?? { minMessages: 15, maxFailures: 3 };
     this.magicContext = options.magicContext ?? false;
-    this.resolveHistoryFactsModel = options.resolveHistoryFactsModel;
     // The database is a required service in production, but tests and minimal contexts may omit
     // it. Without it there is no overflow index; JSONL history alone stays fully functional.
     this.fragmentStore = (ctx as { database?: unknown }).database ? new CompactFragmentStore(ctx) : undefined;
@@ -164,16 +158,7 @@ export class Channels implements Resources {
       onError: (operation, cause) =>
         this.logger.warn("channels.compact_fragment_failed", { key, operation, errorName: cause instanceof Error ? cause.name : typeof cause }),
     };
-    const channel = new Channel(
-      ctx,
-      root,
-      this.imageInput,
-      this.readTimeoutMs,
-      this.compactConfig,
-      fragments,
-      this.magicContext,
-      this.resolveHistoryFactsModel ? () => this.resolveHistoryFactsModel!(ctx) : undefined,
-    );
+    const channel = new Channel(ctx, root, this.imageInput, this.readTimeoutMs, this.compactConfig, fragments, this.magicContext);
     for (const reader of this.readers.values()) {
       this.readerDisposers.get(reader)!.set(channel, channel.resources.use(reader));
     }

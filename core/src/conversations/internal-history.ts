@@ -23,7 +23,7 @@ export const INTERNAL_HISTORY_PROJECTION_PLUGIN: AgentPlugin = createInternalHis
 
 /** The send_message tool is the only Core path that delivers model-authored text to a platform. */
 const HISTORICAL_OUTPUT_TOOL_NAME = "send_message";
-/** Image artifacts are ephemeral side effects; replaying their tool trace can resurrect an old image task. */
+/** Image side effects and retired reply preparation are historical internal data, never replayable dialogue. */
 const HISTORICAL_EPHEMERAL_TOOL_NAMES = new Set(["edit_image", "generate_image", "prepare_reply"]);
 /** Legacy durable records may still carry the delivered-message envelope this projection used to emit. */
 const LEGACY_DELIVERED_OPEN = "[DELIVERED_MESSAGE]";

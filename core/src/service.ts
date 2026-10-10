@@ -3,7 +3,6 @@ import { resolve } from "node:path";
 import { type Context, Service } from "koishi";
 
 import { Agents } from "./agents/index.js";
-import { PolisherRegistry } from "./agents/polisher.js";
 import { Channels } from "./channels/index.js";
 import type { ChannelContext } from "./channels/index.js";
 import { registerSessionCommands } from "./commands/index.js";
@@ -28,7 +27,6 @@ export default class YesImBotService extends Service<Config> {
   public readonly messenger: Pick<Messenger, "use" | "post">;
   public readonly message: Pick<MessageBatchRegistry, "use">;
   public readonly agent: Pick<Agents, "use" | "will">;
-  public readonly polisher: Pick<PolisherRegistry, "use" | "profile">;
   public readonly resource: Resources;
   public readonly conversation: { read: (context: ChannelContext, options: ConversationReadOptions) => Promise<MessageRecord[]> };
 
@@ -57,22 +55,16 @@ export default class YesImBotService extends Service<Config> {
       readTimeoutMs: config.resourceReadTimeout * 1000,
       compactConfig: config.session.compact,
       magicContext: config.session.magicContext?.enabled,
-      resolveHistoryFactsModel: (context) => {
-        const auxiliary = this.model.resolveAuxiliaryModel("utility", context);
-        return { model: auxiliary.model, key: `${auxiliary.fullId}:${this.model.revision}` };
-      },
     });
     const agentsLogger = ctx.logger("yesimbot.agents");
     agentsLogger.level = config.logLevel ?? 2;
     const agents = new Agents(ctx);
-    const polishers = new PolisherRegistry({ logger: ctx.logger("yesimbot.polisher") });
     this.messageOwner = new MessageBatchRegistry();
-    this.runtimes = new Runtimes(ctx, this.channels, this.model, config, agents, this.messageOwner, polishers);
+    this.runtimes = new Runtimes(ctx, this.channels, this.model, config, agents, this.messageOwner);
     this.messengerOwner = new Messenger(ctx, config, this.channels, this.runtimes);
     this.messenger = this.messengerOwner;
     this.message = this.messageOwner;
     this.agent = agents;
-    this.polisher = polishers;
     this.resource = this.channels;
     this.commandDisposer = registerSessionCommands(ctx, this.runtimes, { authority: 4 });
     this.conversation = { read: (context, options) => this.channels.readConversation(context, options) };

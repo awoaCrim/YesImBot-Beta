@@ -24,16 +24,10 @@ describe("conversation compaction prompt", () => {
     expect(request.system).toContain("禁止第一人称");
     expect(request.system).not.toContain("这个角色本人说过的话");
 
+    // Legacy assistantAsFacts config still only quotes the delivered record; it must not trigger
+    // any auxiliary extraction or replace the text with a derived view.
     const withAssistantFacts = filterEntriesForCompression(conversationForStrictMode(), { mode: "compartment", assistantAsFacts: true });
-    expect(withAssistantFacts).toContain("[assistant action]: 助手有历史输出记录");
-    expect(withAssistantFacts).not.toContain("已发送确认");
-    const extracted = filterEntriesForCompression(conversationForStrictMode(), {
-      mode: "compartment",
-      assistantAsFacts: true,
-      assistantFacts: new Map([["strict-assistant", ["助手确认项目记录。"]]]),
-    });
-    expect(extracted).toContain("[assistant action]: 助手确认项目记录。");
-    expect(extracted).not.toContain("已发送确认");
+    expect(withAssistantFacts).toContain("[assistant action]: assistant 曾输出原文：“已发送确认”");
   });
 
   it("summarizes conversation memory without injecting the persona prompt or a previous summary", async () => {

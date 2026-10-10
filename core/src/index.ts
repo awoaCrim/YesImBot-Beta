@@ -12,9 +12,6 @@ export type {
   ChannelPlugin,
   ChannelPluginSetupContext,
   ReplyDeliverySetupContext,
-  ReplyLayoutComposeRequest,
-  ReplyLayoutComposer,
-  ReplyLayoutDraft,
   ReplyPart,
   ReplyStickerFrame,
   ReplyStickerView,
@@ -29,13 +26,6 @@ export type {
   ImageDescribeRequest,
   MainAgentRoleProfile,
   MainAgentRoleProvider,
-  MessagePolisherCapability,
-  PolisherMode,
-  PolisherPromptProfile,
-  PolisherRequest,
-  PolisherTurnContext,
-  PolisherTurnEntry,
-  RolePromptProfileProvider,
   WillBatchDecision,
   WillDebug,
   WillEngine,
@@ -44,15 +34,7 @@ export type {
   WillState,
 } from "./agents/index.js";
 
-export {
-  createSendMessagePolisher,
-  extractProtectedTokens,
-  PolisherRegistry,
-  validatePolishedMessages,
-  validateComposedMessages,
-  MAX_COMPOSE_MESSAGES,
-  MAX_COMPOSE_BYTES,
-} from "./agents/index.js";
+export { extractProtectedTokens } from "./agents/index.js";
 
 export { withAbortSignal } from "./abort.js";
 

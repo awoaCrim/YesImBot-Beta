@@ -46,7 +46,7 @@ function scriptedModel(steps: readonly (Call | Call[])[]) {
   });
 }
 
-async function run(steps: readonly (Call | Call[])[], mode: "native" | "vision" | "unavailable" = "native", polish = false) {
+async function run(steps: readonly (Call | Call[])[], mode: "native" | "vision" | "unavailable" = "native") {
   const deps = createDeps({}, mode);
   const sendMessage = vi.fn(async (_channel: string, _elements: unknown) => ["message-id"]);
   const bot = { platform: "test", sendMessage } as unknown as Bot;
@@ -58,11 +58,8 @@ async function run(steps: readonly (Call | Call[])[], mode: "native" | "vision" 
     resources: {} as never,
     pacing: { charactersPerSecond: 1000, maxTotalDelayMs: 60_000 },
     innerThought: false,
-    ...(polish ? { factsRequired: true, polish: async ({ messages }) => [...messages] } : {}),
   });
-  const withFacts = (call: Call): Call =>
-    polish && call.toolName === "send_message" ? { ...call, input: { ...call.input, facts: ["当前消息需要确认和补充"] } } : call;
-  const model = scriptedModel(steps.map((step) => (Array.isArray(step) ? step.map(withFacts) : withFacts(step))));
+  const model = scriptedModel(steps);
   const agent = createAgent({ model, tools: [textTool, deps.preview, ...deps.tools, createFinishTool()], requireTerminalTool: true });
   const events: string[] = [];
   try {
@@ -110,7 +107,7 @@ describe("Core and Sticker viewed delivery", () => {
     expect(JSON.stringify(result.entries)).not.toContain('"type":"image-data"');
   });
 
-  it("uses delegated vision evidence without native image output", async () => {
+  it("uses shared vision evidence without native image output", async () => {
     const result = await run([preview, sticker()], "vision");
     expect(result.kinds).toEqual([["img"]]);
     expect(result.deps.capability.describe).toHaveBeenCalledOnce();
@@ -142,8 +139,8 @@ describe("Core and Sticker viewed delivery", () => {
     expect(JSON.stringify(result.entries)).toContain("sticker_send_limit_reached");
   });
 
-  it.each([false, true])("delivers semantic array boundaries with polisher=%s without continuation", async (polish) => {
-    const result = await run([text(false, ["收到", "另一个补充"])], "native", polish);
+  it("delivers semantic array boundaries without continuation", async () => {
+    const result = await run([text(false, ["收到", "另一个补充"])], "native");
     expect(result.kinds).toEqual([["text"], ["text"]]);
     expect(JSON.stringify(result.sendMessage.mock.calls[0])).toContain("收到");
     expect(JSON.stringify(result.sendMessage.mock.calls[1])).toContain("另一个补充");
