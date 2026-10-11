@@ -245,7 +245,7 @@ export function registerStickerCommands(deps: StickerCommandDeps): () => void {
           if (response !== "确认删除") return "操作已取消";
         }
         const result = await store.deleteCategory(scopeKey, category);
-        return `已删除分类 "${category}"，移除 ${result.removed} 条记录和 ${result.files} 个文件`;
+        return `已删除分类 "${category}"，移除 ${result.removed} 条记录和 ${result.files} 个文件${result.warning ? "；部分文件清理失败，可由管理员运行 cleanup" : ""}`;
       }),
   );
 

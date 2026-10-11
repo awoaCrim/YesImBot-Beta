@@ -73,7 +73,7 @@ export function createReplyTools(options: ReplyToolsOptions): ReplyToolSet {
 
 export function authoredDescription(innerThought: boolean, stickerAvailable: boolean): string {
   return `用 parts 提交本次完整的有序回复；普通文本输出不会发送。每个 {kind:"text",text:"..."} 是一个有意义的交流单元。短而完整的回应可以一条，独立回应、转折、补充可以分条。不按字数、句号或空行机械拆分；完整代码、命令与精确引用不拆散。
-${stickerAvailable ? '表情包可选，使用 {kind:"sticker",sticker_id:"..."}；必须在本轮更早的已完成步骤用 sticker_preview 看过同一 id 的实际画面。可以纯文字、纯表情、表情在文字前/后或两段文字之间。没有固定数量或搭配；看过并不意味着要发送。' : "当前没有表情发送能力，只提交文字。"}
+${stickerAvailable ? '表情包可选，使用 {kind:"sticker",sticker_id:"..."}；使用当前可见库的精确 id；sticker_preview 可选，用于查看实际画面，不限制发送目标。可以纯文字、纯表情、表情在文字前/后或两段文字之间。没有固定数量或搭配；看过并不意味着要发送。' : "当前没有表情发送能力，只提交文字。"}
 parts 顺序就是发送顺序；同次调用会发完全部单元，不用为了分条设置 continue。channel 留空发当前频道，OneBot 群使用裸群号；混排表情不支持跨频道。mode=element（默认）解析 <at>/<quote>/<img>/<file>，资源用真实 URI，<text>...</text> 是逐字块；普通尖括号需转义。mode=raw 原样发送纯文本。continue 默认 false 结束本轮；之后还要做工具工作时必须预先设 true。
 ${innerThought ? "inner_thought 是私有行为判断，不是角色台词，不会发送。" : ""}
 返回 replyReceipt 和真实平台 ID。发送遇错立即停止，已发送前缀不会重发；不要通过另一个工具或后续调用重发同一份回复。`;

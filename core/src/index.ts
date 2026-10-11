@@ -60,6 +60,8 @@ export type * from "./models/index.js";
 
 export { createThinkingLevelMapSchema, getSupportedThinkingLevels, resolveThinkingLevel, THINKING_LEVELS } from "./models/index.js";
 
-export { ResourceReadError } from "./resources/index.js";
+export { hasCompletedImageRead } from "./agents/image-read-evidence.js";
+
+export { ResourceReadError, RESOURCE_MAX_BYTES } from "./resources/index.js";
 
 export type * from "./resources/index.js";

@@ -129,14 +129,13 @@ describe("actual SDK unified reply orchestration", () => {
     { name: "text sticker", parts: [text("before"), sticker], kinds: ["text", "img"] },
     { name: "text sticker text", parts: [text("before"), sticker, text("after")], kinds: ["text", "img", "text"] },
   ])("A delivers $name from one accepted phase without expression", async ({ parts, kinds }) => {
-    const sticker = parts.some((part) => part.kind === "sticker");
-    const f = await run(sticker ? [preview, send(parts)] : [send(parts)]);
+    const f = await run([send(parts)]);
     expect(f.events).toContain("turn.done");
     expect(f.events).not.toContain("turn.failed");
     expect(f.sendMessage.mock.calls.map((call) => call[1].map((element) => (element as { type: string }).type).join(""))).toEqual(kinds);
     expect(f.records).toHaveLength(parts.length);
     // Only the scripted main-model steps run: no second expression/auxiliary inference exists.
-    expect(f.model.doStreamCalls).toHaveLength(sticker ? 2 : 1);
+    expect(f.model.doStreamCalls).toHaveLength(1);
     expect(JSON.stringify(f.entries)).not.toContain('"type":"image-data"');
   });
   it("preview may be omitted from delivery, silence uses finish", async () => {
@@ -150,10 +149,10 @@ describe("actual SDK unified reply orchestration", () => {
     expect(f.records.map((record) => record.text)).toEqual(["acknowledgement", "result"]);
     expect(f.events).toContain("turn.done");
   });
-  it("same-step viewing cannot authorize A transport", async () => {
-    const f = await run([[preview, send([sticker])], { toolName: "finish", input: {} }]);
-    expect(f.sendMessage).not.toHaveBeenCalled();
-    expect(f.records).toEqual([]);
+  it("same-step viewing is independent of exact-ID transport", async () => {
+    const f = await run([[preview, send([sticker])]]);
+    expect(f.sendMessage).toHaveBeenCalledOnce();
+    expect(f.records).toHaveLength(1);
   });
   it("a later authored phase after a consumed sticker keeps real ordering and IDs", async () => {
     const f = await run([preview, send([sticker], true), { toolName: "sticker_categories", input: {} }, send([text("later text")])]);

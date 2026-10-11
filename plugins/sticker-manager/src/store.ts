@@ -1,4 +1,5 @@
 import type { Context, Field, Types } from "koishi";
+import { RESOURCE_MAX_BYTES, withAbortSignal } from "koishi-plugin-yesimbot";
 
 import { sha256Hex, type StickerFileStore } from "./files.js";
 import {
@@ -31,13 +32,33 @@ const STICKER_FIELDS = {
 } satisfies Field.Extension<StickerRow, Types>;
 const registeredModels = new WeakSet<object>();
 type StoreModel = Pick<Context["model"], "extend" | "get" | "create" | "set" | "remove">;
+
+export interface StickerRecordBinding {
+  readonly sticker: StickerProjection;
+  release(): void;
+}
+
+export interface StickerRemovalResult {
+  readonly removed: number;
+  readonly files: number;
+  readonly warning?: "sticker_file_cleanup_failed";
+}
+
+export interface StickerMutationGuard {
+  readonly signal?: AbortSignal;
+  readonly stillAllowed?: () => boolean;
+}
+
 declare module "koishi" {
   interface Tables {
     [STICKER_TABLE]: StickerRow;
   }
 }
+
 export class StickerStore {
   private mutationTail: Promise<void> = Promise.resolve();
+  private readonly bindingRows = new WeakMap<StickerRecordBinding, { scopeKey: string; contentId: string; rowId: string }>();
+  private readonly liveBindings = new Map<string, Set<StickerRecordBinding>>();
 
   public constructor(
     private readonly model: StoreModel,
@@ -48,12 +69,15 @@ export class StickerStore {
     return this.files.ensure();
   }
 
-  public save(input: SaveStickerInput): Promise<SaveStickerResult> {
+  public save(input: SaveStickerInput, guard?: StickerMutationGuard & { readonly preserveDuplicate?: boolean }): Promise<SaveStickerResult> {
     return this.mutate(async () => {
+      checkMutationGuard(guard);
       const contentId = sha256Hex(input.bytes);
       const now = new Date().toISOString();
       const existing = await this.findRow(input.scopeKey, contentId);
+      checkMutationGuard(guard);
       if (existing) {
+        if (guard?.preserveDuplicate) return { status: "duplicate", sticker: toProjection(existing) };
         const mergedTags = normalizeTags([...(existing.tags ?? []), ...(input.tags ?? [])]);
         if (mergedTags.length > 0 && mergedTags.join("\u0000") !== (existing.tags ?? []).join("\u0000")) {
           await this.model.set(STICKER_TABLE, { id: existing.id }, { tags: mergedTags, updatedAt: now });
@@ -80,6 +104,7 @@ export class StickerStore {
 
       await this.files.write(input.bytes, contentId);
       try {
+        checkMutationGuard(guard);
         await this.model.create(STICKER_TABLE, row);
       } catch (cause) {
         if (!(await this.isReferenced(contentId))) {
@@ -96,6 +121,56 @@ export class StickerStore {
     return this.mutate(async () => {
       const row = await this.findRow(scopeKey, contentId);
       return row ? toProjection(row) : null;
+    });
+  }
+
+  /** Only active delivery leases retain bindings; row deletion permanently retires them. */
+  public bindForDelivery(scopeKey: string, contentId: string, signal?: AbortSignal): Promise<StickerRecordBinding | null> {
+    return this.mutate(async () => {
+      signal?.throwIfAborted();
+      const row = await withAbortSignal(this.findRow(scopeKey, contentId), signal);
+      signal?.throwIfAborted();
+      if (!row) return null;
+      const binding: StickerRecordBinding = Object.freeze({
+        sticker: toProjection(row),
+        release: () => this.releaseBinding(binding),
+      });
+      this.bindingRows.set(binding, { scopeKey, contentId, rowId: row.id });
+      const bindings = this.liveBindings.get(row.id) ?? new Set<StickerRecordBinding>();
+      bindings.add(binding);
+      this.liveBindings.set(row.id, bindings);
+      return binding;
+    });
+  }
+
+  public isBindingCurrent(binding: StickerRecordBinding): boolean {
+    const row = this.bindingRows.get(binding);
+    return !!row && this.liveBindings.get(row.rowId)?.has(binding) === true;
+  }
+
+  /**
+   * Serialize the final scoped-row/byte read with deletion, then start transport synchronously.
+   * The callback returns a handle, never an awaited network promise: transport must not hold the
+   * Store queue (accounting itself uses that queue). A retired binding cannot revive on reinsert.
+   */
+  public startDelivery<T>(
+    binding: StickerRecordBinding,
+    start: (bytes: Uint8Array) => { readonly value: T },
+    signal?: AbortSignal,
+  ): Promise<{ readonly value: T } | null> {
+    return this.mutate(async () => {
+      signal?.throwIfAborted();
+      const owned = this.bindingRows.get(binding);
+      if (!owned || !this.isBindingCurrent(binding)) return null;
+      const row = await withAbortSignal(this.findRow(owned.scopeKey, owned.contentId), signal);
+      if (!row) {
+        this.liveBindings.delete(owned.rowId);
+        return null;
+      }
+      const bytes = await withAbortSignal(this.readBytes(toProjection(row), RESOURCE_MAX_BYTES, signal), signal);
+      signal?.throwIfAborted();
+      if (!this.isBindingCurrent(binding)) return null;
+      return start(bytes);
     });
   }
 
@@ -167,8 +242,9 @@ export class StickerStore {
     });
   }
 
-  public renameCategory(scopeKey: string, oldName: string, newName: string): Promise<number> {
+  public renameCategory(scopeKey: string, oldName: string, newName: string, guard?: StickerMutationGuard): Promise<number> {
     return this.mutate(async () => {
+      checkMutationGuard(guard);
       const target = normalizeCategory(newName);
       if (!target) throw new Error("新分类名不能为空");
       const result = await this.model.set(STICKER_TABLE, { scopeKey, category: oldName }, { category: target, updatedAt: new Date().toISOString() });
@@ -176,8 +252,9 @@ export class StickerStore {
     });
   }
 
-  public mergeCategories(scopeKey: string, source: string, target: string): Promise<number> {
+  public mergeCategories(scopeKey: string, source: string, target: string, guard?: StickerMutationGuard): Promise<number> {
     return this.mutate(async () => {
+      checkMutationGuard(guard);
       const normalizedTarget = normalizeCategory(target);
       if (!normalizedTarget) throw new Error("目标分类名不能为空");
       const result = await this.model.set(STICKER_TABLE, { scopeKey, category: source }, { category: normalizedTarget, updatedAt: new Date().toISOString() });
@@ -185,8 +262,9 @@ export class StickerStore {
     });
   }
 
-  public moveSticker(scopeKey: string, contentId: string, category: string): Promise<number> {
+  public moveSticker(scopeKey: string, contentId: string, category: string, guard?: StickerMutationGuard): Promise<number> {
     return this.mutate(async () => {
+      checkMutationGuard(guard);
       const target = normalizeCategory(category);
       if (!target) throw new Error("分类名不能为空");
       const result = await this.model.set(STICKER_TABLE, { scopeKey, contentId }, { category: target, updatedAt: new Date().toISOString() });
@@ -204,20 +282,12 @@ export class StickerStore {
     });
   }
 
-  public deleteCategory(scopeKey: string, category: string): Promise<{ removed: number; files: number }> {
-    return this.mutate(async () => {
-      const rows = await this.model.get(STICKER_TABLE, { scopeKey, category });
-      const result = await this.model.remove(STICKER_TABLE, { scopeKey, category });
-      const contentIds = [...new Set(rows.map((row) => row.contentId))];
-      let files = 0;
-      for (const contentId of contentIds) {
-        if (!(await this.isReferenced(contentId))) {
-          await this.files.remove(contentId);
-          files += 1;
-        }
-      }
-      return { removed: result.removed ?? 0, files };
-    });
+  public deleteSticker(scopeKey: string, contentId: string, guard?: StickerMutationGuard): Promise<StickerRemovalResult> {
+    return this.mutate(() => this.removeRows({ scopeKey, contentId }, guard));
+  }
+
+  public deleteCategory(scopeKey: string, category: string): Promise<StickerRemovalResult> {
+    return this.mutate(() => this.removeRows({ scopeKey, category }));
   }
 
   public markUsed(scopeKey: string, contentId: string): Promise<StickerProjection> {
@@ -230,8 +300,8 @@ export class StickerStore {
     });
   }
 
-  public async readBytes(projection: StickerProjection): Promise<Uint8Array> {
-    return this.files.read(projection.id);
+  public async readBytes(projection: StickerProjection, maxBytes?: number, signal?: AbortSignal): Promise<Uint8Array> {
+    return this.files.read(projection.id, maxBytes, signal);
   }
 
   public listByScopeKey(scopeKey: string): Promise<StickerProjection[]> {
@@ -250,17 +320,7 @@ export class StickerStore {
   }
 
   public removeScopeRows(scopeKey: string): Promise<number> {
-    return this.mutate(async () => {
-      const rows = await this.rows(scopeKey);
-      const result = await this.model.remove(STICKER_TABLE, { scopeKey });
-      const contentIds = [...new Set(rows.map((row) => row.contentId))];
-      for (const contentId of contentIds) {
-        if (!(await this.isReferenced(contentId))) {
-          await this.files.remove(contentId);
-        }
-      }
-      return result.removed ?? 0;
-    });
+    return this.mutate(async () => (await this.removeRows({ scopeKey })).removed);
   }
 
   public cleanup(): Promise<CleanupResult> {
@@ -289,6 +349,36 @@ export class StickerStore {
     return this.model.get(STICKER_TABLE, { scopeKey });
   }
 
+  private releaseBinding(binding: StickerRecordBinding): void {
+    const row = this.bindingRows.get(binding);
+    if (!row) return;
+    const bindings = this.liveBindings.get(row.rowId);
+    bindings?.delete(binding);
+    if (bindings?.size === 0) this.liveBindings.delete(row.rowId);
+  }
+
+  /** Called only inside mutate; preserve row effects even when later file cleanup fails. */
+  private async removeRows(query: { scopeKey: string; category?: string; contentId?: string }, guard?: StickerMutationGuard): Promise<StickerRemovalResult> {
+    checkMutationGuard(guard);
+    const rows = await this.model.get(STICKER_TABLE, query);
+    checkMutationGuard(guard);
+    const result = await this.model.remove(STICKER_TABLE, query);
+    for (const row of rows) this.liveBindings.delete(row.id);
+    let files = 0;
+    let warning: StickerRemovalResult["warning"];
+    for (const contentId of new Set(rows.map((row) => row.contentId))) {
+      try {
+        if (!(await this.isReferenced(contentId))) {
+          await this.files.remove(contentId);
+          files += 1;
+        }
+      } catch {
+        warning = "sticker_file_cleanup_failed";
+      }
+    }
+    return { removed: result.removed ?? 0, files, ...(warning ? { warning } : {}) };
+  }
+
   private async isReferenced(contentId: string): Promise<boolean> {
     const rows = await this.model.get(STICKER_TABLE, { contentId });
     return rows.length > 0;
@@ -308,4 +398,9 @@ export function registerStickerModel(model: StoreModel): void {
   if (registeredModels.has(model)) return;
   registeredModels.add(model);
   model.extend(STICKER_TABLE, STICKER_FIELDS, { primary: "id" });
+}
+
+function checkMutationGuard(guard?: StickerMutationGuard): void {
+  guard?.signal?.throwIfAborted();
+  if (guard?.stillAllowed?.() === false) throw new Error("StickerCapabilityRetired");
 }

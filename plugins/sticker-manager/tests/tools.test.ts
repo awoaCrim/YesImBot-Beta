@@ -1,3 +1,4 @@
+import { createAssistantMessage, createToolMessage } from "@yesimbot/agent-runtime";
 import { describe, expect, it, vi } from "vitest";
 vi.mock("koishi", async () => import("@koishijs/core"));
 import { GifReader } from "omggif";
@@ -28,10 +29,10 @@ describe("sticker agent tools", () => {
     expect(deps.tool("sticker_search").description).toContain("不代表你已经看过");
   });
 
-  it.each([{}, { category: "meme" }, { sticker_id: stickerId }])("rejects unread or blind sends %j", async (input) => {
+  it.each([{}, { category: "meme" }])("rejects missing exact IDs %j", async (input) => {
     const deps = createDeps();
     await deps.execute(deps.tool("sticker_search"), {});
-    expect(await deps.execute(deps.tool("sticker_send"), input)).toEqual({ ok: false, error: "sticker_preview_required" });
+    expect(await deps.execute(deps.tool("sticker_send"), input)).toEqual({ ok: false, error: "invalid_sticker_id" });
     expect(deps.sender.send).not.toHaveBeenCalled();
     expect(deps.store.random).not.toHaveBeenCalled();
   });
@@ -48,10 +49,10 @@ describe("sticker agent tools", () => {
     deps.projection.clearAll();
   });
 
-  it("rejects a different target and changed bytes", async () => {
+  it("rejects inconsistent target bytes without treating another preview as permission", async () => {
     const deps = createDeps();
     await deps.view();
-    expect(await send(deps, { sticker_id: "b".repeat(64) })).toMatchObject({ error: "sticker_preview_mismatch" });
+    expect(await send(deps, { sticker_id: "b".repeat(64) })).toMatchObject({ error: "sticker_preview_stale" });
     deps.store.readBytes.mockResolvedValueOnce(new Uint8Array([1, 2, 3]));
     expect(await send(deps)).toMatchObject({ error: "sticker_preview_stale" });
     expect(deps.sender.send).not.toHaveBeenCalled();
@@ -89,14 +90,13 @@ describe("sticker agent tools", () => {
     deps.projection.clearAll();
   });
 
-  it("requires a new view in a later turn", async () => {
+  it("allows another exact-ID send in a later turn without a new view", async () => {
     const deps = createDeps();
     await deps.view();
     await send(deps);
     deps.gate.clearTurn("turn-1");
     deps.slot.clearTurn("turn-1");
-    expect(await deps.execute(deps.tool("sticker_send"), { sticker_id: stickerId }, "turn-2")).toMatchObject({ error: "sticker_preview_required" });
-    await deps.view({ sticker_id: stickerId }, "turn-2");
+
     expect(await deps.execute(deps.tool("sticker_send"), { sticker_id: stickerId }, "turn-2")).toMatchObject({ ok: true });
     deps.projection.clearAll();
   });
@@ -137,24 +137,37 @@ describe("sticker agent tools", () => {
     deps.projection.clearAll();
   });
 
-  it("preserves collection classification and duplicate handling", async () => {
+  it("requires main-model category and completed actual viewing without classifier calls", async () => {
     const deps = createDeps({ tagMode: true });
-    deps.store.get.mockResolvedValueOnce(null);
-    expect(await deps.execute(deps.tool("sticker_steal"), { asset_id: "a".repeat(32) })).toMatchObject({ ok: true, status: "created" });
-    expect(deps.store.save).toHaveBeenCalledWith(expect.objectContaining({ tags: ["meme", "搞笑"] }));
-    expect(await deps.execute(deps.tool("sticker_steal"), { asset_id: "a".repeat(32) })).toMatchObject({ status: "duplicate" });
-    expect(deps.store.save).toHaveBeenCalledOnce();
+    const assetId = stickerId.slice(0, 32);
+    expect(await deps.execute(deps.tool("sticker_steal"), { asset_id: assetId })).toMatchObject({ error: "classification_required" });
+    expect(await deps.execute(deps.tool("sticker_steal"), { asset_id: assetId, category: "meme" })).toMatchObject({ error: "image_read_required" });
+    deps.messages.push(
+      createAssistantMessage([{ type: "tool-call", toolName: "read", toolCallId: "read-call", input: { uri: `asset://${assetId}` } }]),
+      createToolMessage([
+        {
+          type: "tool-result",
+          toolName: "read",
+          toolCallId: "read-call",
+          output: { type: "content", value: [{ type: "image-data", data: Buffer.from(pngBytes).toString("base64"), mediaType: "image/png" }] },
+        },
+      ]),
+    );
+    expect(await deps.execute(deps.tool("sticker_steal"), { asset_id: assetId, category: "meme", tags: ["搞笑"] })).toMatchObject({
+      ok: true,
+      status: "created",
+    });
+    expect(deps.store.save).toHaveBeenCalledWith(expect.objectContaining({ tags: ["meme", "搞笑"] }), expect.objectContaining({ preserveDuplicate: true }));
+    expect(deps.classifier.classify).not.toHaveBeenCalled();
   });
 
   it("preserves manual collection and invalid/missing asset behavior", async () => {
     const deps = createDeps();
-    deps.store.get.mockResolvedValueOnce(null);
-    await deps.execute(deps.tool("sticker_steal"), { asset_id: "a".repeat(32), category: "manual" });
-    expect(deps.classifier.classify).not.toHaveBeenCalled();
-    expect(deps.store.save).toHaveBeenCalledWith(expect.objectContaining({ category: "manual" }));
-    expect(await deps.execute(deps.tool("sticker_steal"), { asset_id: "bad" })).toMatchObject({ error: "invalid_asset_id" });
+    expect(await deps.execute(deps.tool("sticker_steal"), { asset_id: "bad", category: "manual" })).toMatchObject({ error: "invalid_asset_id" });
     deps.assets.get.mockRejectedValueOnce(new Error("gone"));
-    expect(await deps.execute(deps.tool("sticker_steal"), { asset_id: "a".repeat(32) })).toMatchObject({ error: "asset_not_found" });
+    expect(await deps.execute(deps.tool("sticker_steal"), { asset_id: "a".repeat(32), category: "manual" })).toMatchObject({ error: "asset_not_found" });
+    expect(deps.classifier.classify).not.toHaveBeenCalled();
+    expect(deps.store.save).not.toHaveBeenCalled();
   });
 
   it("preserves categories and search without incrementing usage", async () => {

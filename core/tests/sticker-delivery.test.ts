@@ -12,7 +12,6 @@ type Call = { toolName: string; input: Record<string, unknown> };
 const preview: Call = { toolName: "sticker_preview", input: { sticker_id: stickerId } };
 const sticker = (continued = false): Call => ({ toolName: "sticker_send", input: { sticker_id: stickerId, continue: continued } });
 const text = (continued = false, messages = ["hello"]): Call => ({ toolName: "send_message", input: { messages, mode: "raw", continue: continued } });
-const finish: Call = { toolName: "finish", input: {} };
 
 function scriptedModel(steps: readonly (Call | Call[])[]) {
   let index = 0;
@@ -84,11 +83,11 @@ async function run(steps: readonly (Call | Call[])[], mode: "native" | "vision" 
 
 describe("Core and Sticker viewed delivery", () => {
   it.each([
-    { name: "sticker only", steps: [preview, sticker()], expected: [["img"]] },
+    { name: "sticker only", steps: [sticker()], expected: [["img"]] },
     { name: "text only", steps: [text()], expected: [["text"]] },
-    { name: "sticker then text", steps: [preview, sticker(true), text()], expected: [["img"], ["text"]] },
-    { name: "text then sticker", steps: [preview, text(true), sticker()], expected: [["text"], ["img"]] },
-    { name: "text sticker text", steps: [preview, text(true), sticker(true), text()], expected: [["text"], ["img"], ["text"]] },
+    { name: "sticker then text", steps: [sticker(true), text()], expected: [["img"], ["text"]] },
+    { name: "text then sticker", steps: [text(true), sticker()], expected: [["text"], ["img"]] },
+    { name: "text sticker text", steps: [text(true), sticker(true), text()], expected: [["text"], ["img"], ["text"]] },
   ])("supports $name without inserting other output", async ({ steps, expected }) => {
     const result = await run(steps);
     expect(result.events).toContain("turn.done");
@@ -114,16 +113,15 @@ describe("Core and Sticker viewed delivery", () => {
     expect(JSON.stringify(result.model.doStreamCalls[1])).toContain("红色与蓝色");
   });
 
-  it("cannot authorize a same-step send even if preview executes first", async () => {
-    const result = await run([[preview, sticker()], finish]);
-    expect(result.kinds).toEqual([]);
-    expect(JSON.stringify(result.entries)).toContain("sticker_preview_required");
+  it("same-step preview does not constrain exact-ID delivery", async () => {
+    const result = await run([[preview, sticker()]]);
+    expect(result.kinds).toEqual([["img"]]);
   });
 
-  it("rejects an unread sticker without delivery", async () => {
-    const result = await run([sticker()]);
-    expect(result.kinds).toEqual([]);
-    expect(result.deps.sender.send).not.toHaveBeenCalled();
+  it("sends an existing precise ID even with no image capability", async () => {
+    const result = await run([sticker()], "unavailable");
+    expect(result.kinds).toEqual([["img"]]);
+    expect(result.deps.sender.send).toHaveBeenCalledOnce();
   });
 
   it("allows text fallback after unavailable preview", async () => {

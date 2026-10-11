@@ -64,6 +64,28 @@ export function createDeps(overrides: Partial<StickerConfig> = {}, mode: "native
     readBytes: vi.fn(async () => pngBytes),
     markUsed: vi.fn(async () => sticker({ usageCount: 1 })),
   };
+  const bindings = new Set<{ sticker: StickerProjection; release(): void }>();
+  const boundStore = Object.assign(store, {
+    bindForDelivery: vi.fn(async (scopeKey: string, id: string, signal?: AbortSignal) => {
+      signal?.throwIfAborted();
+      const record = await store.get(scopeKey, id);
+      if (!record) return null;
+      const binding = {
+        sticker: record,
+        release: () => {
+          bindings.delete(binding);
+        },
+      };
+      bindings.add(binding);
+      return binding;
+    }),
+    isBindingCurrent: (binding: { sticker: StickerProjection; release(): void }) => bindings.has(binding),
+    startDelivery: async <T>(binding: { sticker: StickerProjection; release(): void }, start: (bytes: Uint8Array) => { value: T }, signal?: AbortSignal) => {
+      const bytes = await store.readBytes();
+      signal?.throwIfAborted();
+      return bindings.has(binding) ? start(bytes) : null;
+    },
+  });
   const projection = new EphemeralImageProjectionStore();
   const gate = new StickerPreviewGate();
   const slot = new StickerSendSlot();
@@ -109,5 +131,5 @@ export function createDeps(overrides: Partial<StickerConfig> = {}, mode: "native
     messages.push(createToolMessage([{ type: "tool-result", toolName: "sticker_preview", toolCallId: "preview-call", output: modelOutput }]));
     return output;
   };
-  return { store, classifier, sender, assets, projection, gate, slot, capability, preview, tools, tool, messages, execute, view };
+  return { store: boundStore, classifier, sender, assets, projection, gate, slot, capability, preview, tools, tool, messages, execute, view };
 }

@@ -25,11 +25,12 @@ export const StickerConfigSchema: Schema<StickerConfig> = Schema.object({
     .min(1024 * 1024)
     .default(10 * 1024 * 1024)
     .description("单张导入图片的最大字节数"),
-  tagMode: Schema.boolean().default(false).description("实验性 tag 模式，默认关闭：steal 自动分类并生成多个 tags，提供 sticker_tags 工具并支持多 tag 发送"),
+  tagMode: Schema.boolean().default(false).description("实验性 tag 模式，默认关闭：收藏时允许主模型提供标签，提供 sticker_tags 和预览标签选择"),
   fuzzyTagMatch: Schema.boolean().default(true).description("sticker_send 的 tag 使用模糊匹配，默认开启"),
   tagRandomRange: Schema.number().min(0).default(1).description("tag 发送随机范围：0 只选最高匹配分，每增加 1 可随机放宽到下一档匹配分"),
   sendStaticAsGif: Schema.boolean().default(true).description("发送静态图片表情包时转为单帧 GIF，默认开启；GIF 原样发送"),
   stickerElement: Schema.boolean().default(true).description("启用 Sticker 元素的内部历史投影，默认开启；平台发送必须调用 sticker_send"),
+  enableManage: Schema.boolean().default(false).description("允许模型移动/整理分类及删除精确单张（含管理员导入），默认关闭；全局库的修改会影响共用频道"),
   enableSteal: Schema.boolean()
     .default(true)
     .description("允许 bot 收藏当前消息中的图片（sticker_steal 工具），默认开启；关闭后仍可查询、搜索和发送已有表情包"),

@@ -17,6 +17,8 @@ export interface StickerConfig {
   sendStaticAsGif: boolean;
   stickerElement: boolean;
   enableSteal: boolean;
+  /** Missing on old/raw configurations means false. */
+  enableManage?: boolean;
 }
 
 export interface StickerSource {

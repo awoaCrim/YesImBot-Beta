@@ -1,9 +1,20 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { createAssistantMessage, createMessageEntry, createToolMessage, type AgentEntry } from "@yesimbot/agent-runtime";
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("koishi", async () => import("@koishijs/core"));
 vi.mock("../src/agents/tools.js", async (original) => ({ ...(await original<object>()), pacedDelay: () => 0 }));
 
+import { StickerDeliveryService } from "../../plugins/sticker-manager/src/delivery.js";
+import { StickerFileStore } from "../../plugins/sticker-manager/src/files.js";
+import { StickerPreviewGate, StickerSendSlot } from "../../plugins/sticker-manager/src/preview-evidence.js";
+import { StickerStore } from "../../plugins/sticker-manager/src/store.js";
+import type { StickerRow } from "../../plugins/sticker-manager/src/types.js";
+import { createMemoryModel } from "../../plugins/sticker-manager/tests/helpers.js";
+import { config, pngBytes, scope } from "../../plugins/sticker-manager/tests/preview-fixtures.js";
 import { normalizeReplyParts, preflightReplyPhase, projectDeliveredText, ReplyCoordinator, type ReplyStickerProvider } from "../src/agents/reply.js";
 import { beginReplyJournal, type ReplyJournalWriter } from "../src/conversations/reply-journal.js";
 import {
@@ -134,6 +145,51 @@ describe("modern reply complete ordered phases", () => {
     expect(decodeReplyReceipt(outcome.receipt)).toEqual(outcome.receipt);
     expect([...reduceReplyJournal(f.entries).journals.values()][0]?.units).toHaveLength(parts.length);
     expect(f.onDelivered).toHaveBeenCalledTimes(parts.length);
+  });
+  it.each(["before-preflight", "after-prefix"])("real scoped deletion %s preserves zero-output or actual prefix proof", async (timing) => {
+    const dir = await mkdtemp(join(tmpdir(), "reply-sticker-delete-"));
+    try {
+      const store = new StickerStore(createMemoryModel<StickerRow>() as never, new StickerFileStore(dir, "data"));
+      await store.ensure();
+      const save = (scopeKey: string) => store.save({ scopeKey, bytes: pngBytes, mediaType: "image/png", category: "meme", source: { kind: "import" } });
+      const saved = await save("global");
+      await save("other");
+      const sendWithProof = vi.fn(async () => ["unexpected-sticker"]);
+      const delivery = new StickerDeliveryService({
+        store,
+        scope: { ...scope, channelId: "42" },
+        config,
+        sendSlot: new StickerSendSlot(),
+        previewGate: new StickerPreviewGate(),
+        sender: { send: async () => {}, sendWithProof },
+      });
+      const provider: ReplyStickerProvider = {
+        revision: 1,
+        status: (id) => delivery.status(id),
+        catalog: () => delivery.catalog(),
+        view: (id, messages) => delivery.view(id, messages),
+        preflight: (input) => delivery.preflight(input),
+      };
+      if (timing === "before-preflight") await store.deleteSticker("global", saved.sticker.id);
+      const f = fixture({
+        sticker: provider,
+        send: async () => {
+          await store.deleteSticker("global", saved.sticker.id);
+          return ["real-prefix"];
+        },
+      });
+      const result = await f.send([text("confirmed prefix"), { kind: "sticker", sticker_id: saved.sticker.id }, text("never sent")]);
+      expect(result.output.ok).toBe(false);
+      expect(sendWithProof).not.toHaveBeenCalled();
+      expect(result.receipt.completeUnits.map((unit) => unit.text)).toEqual(timing === "after-prefix" ? ["confirmed prefix"] : []);
+      expect(records(f.entries)).toEqual(timing === "after-prefix" ? ["confirmed prefix"] : []);
+      expect(f.sendMessage).toHaveBeenCalledTimes(timing === "after-prefix" ? 1 : 0);
+      if (timing === "after-prefix") expect(JSON.stringify(f.entries)).toContain("real-prefix");
+      expect(records(f.entries)).not.toContain("never sent");
+      delivery.stop();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
   it("uses explicit boundaries, never blank lines", async () => {
     const f = fixture();

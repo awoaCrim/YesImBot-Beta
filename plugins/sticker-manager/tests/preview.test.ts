@@ -2,6 +2,7 @@ import { createToolMessage } from "@yesimbot/agent-runtime";
 import { GifWriter } from "omggif";
 import { describe, expect, it, vi } from "vitest";
 
+import { sha256Hex } from "../src/files.js";
 import { createDeps, pngBytes, sticker, stickerId } from "./preview-fixtures.js";
 
 const context = (messages: unknown[] = [], signal?: AbortSignal) => ({ toolCallId: "preview-call", turnId: "turn-1", messages, abortSignal: signal }) as never;
@@ -27,8 +28,8 @@ describe("sticker content preview", () => {
     expect(projected).toMatchObject({ type: "content", value: expect.arrayContaining([expect.objectContaining({ type: "image-data" })]) });
     expect(deps.store.markUsed).not.toHaveBeenCalled();
     expect(deps.sender.send).not.toHaveBeenCalled();
-    // Same-step callers have no prior result even if preview execute already completed.
-    expect(await deps.execute(deps.tool("sticker_send"), { sticker_id: stickerId })).toMatchObject({ error: "sticker_preview_required" });
+    // Actual viewing stays completed-step-only, independently of send admission.
+    expect(deps.gate.resolve("turn-1", deps.messages)).toBeUndefined();
     deps.messages.push(createToolMessage([{ type: "tool-result", toolName: "sticker_preview", toolCallId: "preview-call", output: projected }]));
     expect(await deps.execute(deps.tool("sticker_send"), { sticker_id: stickerId })).toMatchObject({ ok: true });
     deps.projection.clearAll();
@@ -41,7 +42,7 @@ describe("sticker content preview", () => {
     const projected = await deps.preview.toModelOutput!({ toolCallId: "preview-call", input: {}, output });
     expect(projected).toEqual({ type: "json", value: { ok: false, error: "sticker_preview_expired" } });
     deps.messages.push(createToolMessage([{ type: "tool-result", toolName: "sticker_preview", toolCallId: "preview-call", output: projected }]));
-    expect(await deps.execute(deps.tool("sticker_send"), { sticker_id: stickerId })).toMatchObject({ error: "sticker_preview_required" });
+    expect(deps.gate.resolve("turn-1", deps.messages)).toBeUndefined();
   });
 
   it("TTL cleanup after materialization does not erase already-visible current-turn content", async () => {
@@ -57,7 +58,7 @@ describe("sticker content preview", () => {
     deps.messages.push(
       createToolMessage([{ type: "tool-result", toolName: "sticker_preview", toolCallId: "preview-call", output: { type: "json", value: output } }]),
     );
-    expect(await deps.execute(deps.tool("sticker_send"), { sticker_id: stickerId })).toMatchObject({ error: "sticker_preview_required" });
+    expect(deps.gate.resolve("turn-1", deps.messages)).toBeUndefined();
     deps.projection.clearAll();
   });
 
@@ -74,7 +75,7 @@ describe("sticker content preview", () => {
     const deps = createDeps({}, "vision");
     vi.mocked(deps.capability.describe).mockResolvedValue(text);
     expect(await deps.view()).toMatchObject({ ok: false });
-    expect(await deps.execute(deps.tool("sticker_send"), { sticker_id: stickerId })).toMatchObject({ error: "sticker_preview_required" });
+    expect(deps.gate.resolve("turn-1", deps.messages)).toBeUndefined();
   });
 
   it("does not read or send when no image capability exists", async () => {
@@ -119,7 +120,8 @@ describe("sticker content preview", () => {
     await deps.view();
     deps.store.random.mockResolvedValueOnce(null);
     expect(await deps.preview.execute({}, context())).toMatchObject({ error: "sticker_not_found" });
-    expect(await deps.execute(deps.tool("sticker_send"), { sticker_id: stickerId })).toMatchObject({ error: "sticker_preview_required" });
+    expect(deps.gate.resolve("turn-1", deps.messages)).toBeUndefined();
+    expect(await deps.execute(deps.tool("sticker_send"), { sticker_id: stickerId })).toMatchObject({ ok: true });
     deps.projection.clearAll();
   });
 
@@ -131,11 +133,12 @@ describe("sticker content preview", () => {
     const gif = buffer.slice(0, writer.end());
     for (const mode of ["native", "vision"] as const) {
       const deps = createDeps({}, mode);
-      deps.store.get.mockResolvedValue(sticker({ mime: "image/gif", size: gif.length }));
+      const id = sha256Hex(gif);
+      deps.store.get.mockResolvedValue(sticker({ id, mime: "image/gif", size: gif.length }));
       deps.store.readBytes.mockResolvedValue(gif);
       expect(await deps.view()).toMatchObject({ ok: true, frameCount: 2, totalFrames: 2, frames: ["frame 1/2, 0ms", "frame 2/2, 100ms"] });
       if (mode === "vision") expect(vi.mocked(deps.capability.describe).mock.calls[0]![0].frames).toHaveLength(2);
-      await deps.execute(deps.tool("sticker_send"), { sticker_id: stickerId });
+      await deps.execute(deps.tool("sticker_send"), { sticker_id: id });
       expect(deps.sender.send).toHaveBeenCalledWith({ bytes: gif, mediaType: "image/gif" });
       deps.projection.clearAll();
     }

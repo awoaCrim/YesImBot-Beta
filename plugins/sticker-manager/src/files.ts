@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 const IMAGE_EXTENSIONS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg"]);
@@ -34,8 +34,27 @@ export class StickerFileStore {
     }
   }
 
-  public async read(contentId: string): Promise<Uint8Array> {
-    return new Uint8Array(await readFile(this.path(contentId)));
+  public async read(contentId: string, maxBytes?: number, signal?: AbortSignal): Promise<Uint8Array> {
+    if (maxBytes === undefined) return new Uint8Array(await readFile(this.path(contentId), { signal }));
+    signal?.throwIfAborted();
+    const file = await open(this.path(contentId), "r");
+    try {
+      if ((await file.stat()).size > maxBytes) throw new RangeError("sticker_too_large");
+      // Bound allocation and reading even if the file grows after stat.
+      const bytes = new Uint8Array(maxBytes + 1);
+      let length = 0;
+      while (length < bytes.length) {
+        signal?.throwIfAborted();
+        const { bytesRead } = await file.read(bytes, length, bytes.length - length, length);
+        if (!bytesRead) break;
+        length += bytesRead;
+      }
+      signal?.throwIfAborted();
+      if (length > maxBytes) throw new RangeError("sticker_too_large");
+      return bytes.slice(0, length);
+    } finally {
+      await file.close();
+    }
   }
 
   public async exists(contentId: string): Promise<boolean> {

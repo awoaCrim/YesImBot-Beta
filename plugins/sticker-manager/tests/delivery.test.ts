@@ -1,9 +1,12 @@
 import { createAssistantMessage } from "@yesimbot/agent-runtime";
+import { PNG } from "pngjs";
 import { describe, expect, it, vi } from "vitest";
 vi.mock("koishi", async () => import("@koishijs/core"));
 import { StickerDeliveryService } from "../src/delivery.js";
+import { sha256Hex } from "../src/files.js";
+import * as frames from "../src/frames.js";
 import type { StickerStore } from "../src/store.js";
-import { config, createDeps, pngBytes, scope, stickerId } from "./preview-fixtures.js";
+import { config, createDeps, pngBytes, scope, sticker, stickerId } from "./preview-fixtures.js";
 function fixture() {
   const deps = createDeps();
   const sendWithProof = vi.fn(async (): Promise<readonly string[]> => ["actual-id"]);
@@ -44,19 +47,46 @@ describe("shared sticker delivery lease", () => {
     expect(f.service.status("turn-1")).toBe("consumed");
     expect(await f.preflight()).toMatchObject({ error: "sticker_send_limit_reached" });
   });
-  it("modern proof requires one earlier real call and completed result, not metadata/echo alone", async () => {
+  it("admits a precise ID without any preview, including unfinished preview history", async () => {
     const f = fixture();
-    await f.deps.view();
-    expect(await f.preflight()).toMatchObject({ error: "sticker_preview_required" });
-    await f.view(); // Reset duplicated test receipts before a real modern pair.
-    f.deps.messages.splice(0, 1);
-    expect(await f.preflight()).toHaveProperty("lease");
-  });
-  it("same-step preview evidence is not usable before its result", async () => {
-    const f = fixture();
+    const first = await f.preflight();
+    expect(first).toHaveProperty("lease");
+    if ("lease" in first) first.lease.release();
     await f.view();
     f.deps.messages.pop();
-    expect(await f.preflight()).toMatchObject({ error: "sticker_preview_required" });
+    expect(await f.preflight()).toHaveProperty("lease");
+    expect(f.sendWithProof).not.toHaveBeenCalled();
+  });
+  it("preview A does not restrict sending a different valid exact B", async () => {
+    const f = fixture();
+    await f.view();
+    const png = new PNG({ width: 1, height: 1 });
+    png.data.set([0, 255, 0, 255]);
+    const bytes = new Uint8Array(PNG.sync.write(png));
+    const id = sha256Hex(bytes);
+    f.deps.store.get.mockResolvedValue(sticker({ id, size: bytes.length }));
+    f.deps.store.readBytes.mockResolvedValue(bytes);
+    const result = await f.service.preflight({ stickerId: id, turnId: "turn-1", messages: f.deps.messages });
+    if (!("lease" in result)) throw new Error(result.error);
+    expect(result.lease.stickerId).toBe(id);
+    expect(await result.lease.send()).toMatchObject({ status: "confirmed", contentHash: id });
+  });
+  it("new, failed or replaced preview generations do not revoke send admission", async () => {
+    const f = fixture();
+    const result = await f.preflight();
+    if (!("lease" in result)) throw new Error("missing lease");
+    f.deps.gate.begin("turn-1");
+    expect(await result.lease.send()).toMatchObject({ status: "confirmed" });
+  });
+  it("turn finish/stop release bindings and reject late old-turn admission", async () => {
+    const f = fixture();
+    const result = await f.preflight();
+    if (!("lease" in result)) throw new Error("missing lease");
+    f.service.finishTurn("turn-1");
+    expect(await result.lease.send()).toMatchObject({ status: "failed" });
+    expect(await f.preflight()).toMatchObject({ error: "StickerCapabilityRetired" });
+    f.service.stop();
+    expect(await f.service.preflight({ stickerId, turnId: "turn-2" })).toMatchObject({ error: "StickerCapabilityRetired" });
     expect(f.sendWithProof).not.toHaveBeenCalled();
   });
   it("changed bytes fail before the phase's first output and release reservation", async () => {
@@ -66,6 +96,17 @@ describe("shared sticker delivery lease", () => {
     expect(await f.preflight()).toMatchObject({ error: "sticker_preview_stale" });
     expect(f.service.status("turn-1")).toBe("eligible");
     expect(f.sendWithProof).not.toHaveBeenCalled();
+  });
+  it("bounds the prepared transport bytes as well as the original image", async () => {
+    const f = fixture();
+    const prepare = vi.spyOn(frames, "prepareStaticGif").mockReturnValueOnce({ bytes: new Uint8Array(5 * 1024 * 1024 + 1), mediaType: "image/gif" });
+    try {
+      expect(await f.preflight()).toMatchObject({ error: "sticker_prepare_failed" });
+      expect(f.service.status("turn-1")).toBe("eligible");
+      expect(f.sendWithProof).not.toHaveBeenCalled();
+    } finally {
+      prepare.mockRestore();
+    }
   });
   it("rechecks bytes and generation immediately before the sticker boundary", async () => {
     const f = fixture();

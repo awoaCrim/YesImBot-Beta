@@ -115,6 +115,14 @@ export default class StickerManagerPlugin {
     const previewGate = new StickerPreviewGate();
     const scopeKey = scopeKeyFor(scope, this.config);
     const sender = new BotStickerSender(bot, scope);
+    const revision = this.capabilityRevision;
+    let retired = false;
+    let activeTurn: { id: string } | undefined;
+    let closedTurn: string | undefined;
+    const captureTurn = (turnId: string) => {
+      const captured = activeTurn;
+      return () => !retired && this.capabilityRevision === revision && !!captured && captured.id === turnId && activeTurn === captured;
+    };
     const delivery = new StickerDeliveryService({
       store: this.store,
       sender,
@@ -122,6 +130,7 @@ export default class StickerManagerPlugin {
       config: this.config,
       sendSlot,
       previewGate,
+      captureTurn,
       onUsageWarning: (stickerId, cause) => this.logger.warn("sticker_usage_update_failed", { stickerId, cause }),
     });
     const disposeDelivery = this.registerDelivery(scope, bot, runtime ?? { imageProjection: new EphemeralImageProjectionStore() }, delivery);
@@ -140,6 +149,7 @@ export default class StickerManagerPlugin {
           previewCapability: runtime?.imagePreview,
           gate: previewGate,
           deliveryMode,
+          captureTurn,
         }),
         ...createStickerTools({
           store: this.store,
@@ -151,29 +161,40 @@ export default class StickerManagerPlugin {
           sendSlot,
           previewGate,
           delivery,
+          captureTurn,
         }).filter((tool) => !modern || tool.name !== "sticker_send"),
       ],
       beforeToolCall: (call) => {
         // A legacy sticker artifact URI or a bare <sticker/> element in send_message would deliver
-        // unread bytes through the text-resource path, bypassing both the preview gate and the quota.
+        // unread bytes through the text-resource path, bypassing exact-record admission and the quota.
         if (call.toolName !== "send_message") return;
         const reason = stickerSendMessageBlockReason(call.args);
         return reason ? { type: "block", reason } : undefined;
       },
       onTurnFinish: (_result, context) => {
-        sendSlot.clearTurn(context.turnId);
-        previewGate.clearTurn(context.turnId);
+        if (activeTurn?.id === context.turnId) {
+          activeTurn = undefined;
+          closedTurn = context.turnId;
+        }
+        delivery.finishTurn(context.turnId);
         if (catalogTurnId === context.turnId) {
           catalogTurnId = undefined;
           catalogPromise = undefined;
         }
       },
       stop: () => {
+        retired = true;
+        activeTurn = undefined;
         disposeDelivery?.();
-        sendSlot.clear();
-        previewGate.clear();
+        delivery.stop();
       },
       prepareStep: async (messages, context) => {
+        if (retired || this.capabilityRevision !== revision || closedTurn === context.turnId) return messages;
+        if (activeTurn?.id !== context.turnId) {
+          if (activeTurn) delivery.finishTurn(activeTurn.id);
+          activeTurn = { id: context.turnId };
+        }
+        const current = captureTurn(context.turnId);
         if (catalogTurnId !== context.turnId || !catalogPromise) {
           catalogTurnId = context.turnId;
           catalogPromise = this.store
@@ -185,7 +206,7 @@ export default class StickerManagerPlugin {
             });
         }
         const catalog = await catalogPromise;
-        if (!catalog || messages.some((message) => message.role === "user" && message.content === catalog)) return messages;
+        if (!current() || !catalog || messages.some((message) => message.role === "user" && message.content === catalog)) return messages;
         // Runtime rebuilds messages for each step. Keep this turn's snapshot in every request,
         // without persisting it or freezing mutable library data in the stable system prompt.
         return [...messages, { role: "user", content: catalog }];
@@ -230,21 +251,33 @@ function formatStickerPrompt(config: StickerConfig, mode: "legacy" | "authored" 
   if (mode !== "legacy")
     return [
       "表情包可选，与文字没有固定搭配，也不要求每轮发送。查看不意味着发送；不合适时省略。",
-      "必须在本轮更早的已完成步骤用 sticker_preview 看到实际画面。分类和搜索只是数据，不是画面或发送许可。",
-      "使用 send_message 的完整 parts 一起决定文字分条和表情位置，sticker 单元只填已查看的精确 sticker_id；可以单独、在文字前/后或两段文字之间。",
-      "同一轮最多一次确认或不确定的表情发送；不能用 <sticker/> 或历史 artifact://sticker/ 链接绕过查看与额度。",
-      ...(config.enableSteal ? ["sticker_steal 可收藏当前消息中的图片。"] : []),
+      "sticker_preview 可选，用于查看实际画面；分类和搜索只是元数据。未预览或图像能力不可用，也可发送已有精确 ID。",
+      "使用 send_message 的完整 parts 一起决定文字分条和表情位置，sticker 单元只填当前可见库的精确 sticker_id；可以单独、在文字前/后或两段文字之间。",
+      "同一轮最多一次确认或不确定的表情发送；不能用 <sticker/> 或历史 artifact://sticker/ 链接绕过专用发送与额度。",
+      ...(config.enableSteal
+        ? ["sticker_steal 可收藏当前聊天图片：先完成同一 Asset 的实际 read/describe_image，再提交必填具体分类；缺少可验证历史结果时先重读，不会辅助自动分类。"]
+        : []),
+      ...(config.enableManage === true
+        ? [
+            "sticker_manage 可整理分类和删除精确单张（含导入）；整类/批量删除交给管理员确认，不要循环单张删除模拟批量操作。当前查询/修改结果比回合开始快照更新。",
+          ]
+        : []),
       ...(config.tagMode ? ["sticker_tags 可查询实验性标签。"] : []),
     ].join("\n");
   return [
     "表情包是可选的自然回应之一，和文字地位相同：开心、得意、吐槽、害羞或简短情绪反应时可以用，也可以只发文字或什么都不发。",
     "顺序由你决定：可以只发表情包、只发文字、先表情后文字、先文字后表情，或在两段文字之间发表情；没有固定搭配，不要求每轮都发表情包。",
-    "发送前必须先用 sticker_preview 查看这张表情包的实际画面；分类、标签和搜索结果只是元数据，不代表你看过内容。查看失败时本轮不要发送表情包。",
-    "sticker_send 必须传入 sticker_preview 返回的同一个 sticker_id；同一轮最多实际发送一张。",
+    "sticker_preview 是可选的实际画面查看工具；分类、标签和搜索结果只是元数据。未预览或查看失败不妨碍发送已有精确 ID。",
+    "sticker_send 必须传入当前可见库的精确 sticker_id，不会随机选择；同一轮最多实际发送一张。",
     "sticker_send 默认结束本轮；若之后还要发送文字，把 continue 设为 true，再继续调用 send_message。",
     "发送表情包必须调用 sticker_send；不要直接输出 <sticker/>，它只用于内部历史投影，不会发送到平台。",
-    "不要编造资源 URI；表情包不能借历史 artifact://sticker/ 链接经 send_message 绕过查看与发送限制。",
-    ...(config.enableSteal ? ["sticker_steal 可收藏当前消息中的图片。"] : []),
+    "不要编造资源 URI；表情包不能借历史 artifact://sticker/ 链接经 send_message 绕过专用发送与额度限制。",
+    ...(config.enableSteal
+      ? ["sticker_steal 可收藏当前聊天图片：先完成同一 Asset 的实际 read/describe_image，再提交必填具体分类；缺少可验证历史结果时先重读，不会辅助自动分类。"]
+      : []),
+    ...(config.enableManage === true
+      ? ["sticker_manage 可整理分类和删除精确单张（含导入）；整类/批量删除交给管理员确认，不要循环单张删除模拟批量操作。当前查询/修改结果比回合开始快照更新。"]
+      : []),
     ...(config.tagMode ? ["sticker_tags 可查询实验性标签，sticker_preview 支持按标签选定目标。"] : []),
   ].join("\n");
 }
