@@ -2,7 +2,16 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createAssistantMessage, createEntry, createMessageEntry, createToolMessage, type AgentEntry } from "@yesimbot/agent-runtime";
+import {
+  AgentRequestProjection,
+  createAssistantMessage,
+  createEntry,
+  createMessageEntry,
+  createSystemMessage,
+  createToolMessage,
+  createUserMessage,
+  type AgentEntry,
+} from "@yesimbot/agent-runtime";
 import { h, Universal } from "koishi";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -168,6 +177,32 @@ describe("canonical mixed reply history source", () => {
     expect(JSON.stringify(entries)).toBe(before);
     const open = stripInternalAssistantInputs(entries.slice(1, 3), mode);
     expect(open.flatMap((entry) => (entry.type === "message" && isDeliveredTranscript(entry.data) ? [entry.data.data.partial] : []))).toEqual([true]);
+  });
+  it("keeps Gemini proof-derived answers at their source position with the whole canonical provenance", () => {
+    const source = phase();
+    const first = createMessageEntry(createUserMessage("earlier question", { id: "question", timestamp: 1 }), { id: "question", timestamp: 1 });
+    const next = createMessageEntry(createUserMessage("later question", { id: "next", timestamp: 500 }), { id: "next", timestamp: 500 });
+    const system = createMessageEntry(createSystemMessage("historical summary", { id: "summary", timestamp: 600 }), { id: "summary", timestamp: 600 });
+    const entries = [first, ...source, next, system];
+    const before = JSON.stringify(entries);
+    const projection = new AgentRequestProjection();
+    for (const entry of entries) {
+      if (entry.type === "message")
+        projection.register(entry.data, {
+          kind: entry.data.role === "system" ? "mandatory" : "history",
+          sourceEntryIds: [entry.id],
+          timestamp: entry.timestamp,
+        });
+    }
+    const projected = stripInternalAssistantInputs(entries, "gemini-native", projection);
+    expect(projected[0]).toBe(system);
+    expect(projected[1]).toBe(first);
+    expect(projected.at(-1)).toBe(next);
+    const transcripts = projected.flatMap((entry) => (entry.type === "message" && isDeliveredTranscript(entry.data) ? [entry.data] : []));
+    expect(transcripts.map((message) => message.data.messages)).toEqual([[firstBody], [secondBody]]);
+    for (const transcript of transcripts) expect(projection.origin(transcript)?.sourceEntryIds).toEqual(source.map((entry) => entry.id));
+    expect(JSON.stringify(projected)).not.toMatch(/PRIVATE|SIGNED|replyReceipt|reply-delivery-proof/);
+    expect(JSON.stringify(entries)).toBe(before);
   });
   it.each([false, true])("shares full canonical proof across expansion and frozen regions without extraction (facts=%s)", async (factual) => {
     const f = await fixture(factual);

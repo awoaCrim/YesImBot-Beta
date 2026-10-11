@@ -323,7 +323,7 @@ describe("ChannelRuntime scheduling", () => {
     expect(resolveImage).toHaveBeenCalledTimes(2);
   });
 
-  it("drops delivered transcripts and merges adjacent user turns only in Gemini mode", async () => {
+  it("converts Gemini transcripts per source and still merges adjacent user turns", async () => {
     const { value, root } = await runtime(undefined, {}, undefined, undefined, undefined, undefined, undefined, "gemini-native");
     try {
       const plugin = vi
@@ -334,7 +334,19 @@ describe("ChannelRuntime scheduling", () => {
         { messages: ["已经发出的内容"], deliveredCount: 1, partial: false },
         { id: "transcript-gemini", timestamp: 123 },
       );
-      await expect(plugin?.toModelMessages?.(transcript, { history: [transcript], current: [] } as never)).resolves.toEqual([]);
+      const second = createDeliveredTranscriptMessage(
+        { messages: ["另一条已发出的内容"], deliveredCount: 1, partial: true },
+        { id: "transcript-gemini-2", timestamp: 456 },
+      );
+      const context = { history: [transcript, second], current: [] } as never;
+      const firstProjection = await plugin?.toModelMessages?.(transcript, context);
+      const secondProjection = await plugin?.toModelMessages?.(second, context);
+      expect(firstProjection).toEqual([{ role: "assistant", content: expect.stringContaining("已经发出的内容") }]);
+      expect(secondProjection).toEqual([{ role: "assistant", content: expect.stringContaining("另一条已发出的内容") }]);
+      expect(JSON.stringify(firstProjection)).not.toContain("另一条已发出的内容");
+      expect(JSON.stringify(secondProjection)).not.toContain("已经发出的内容");
+      expect(JSON.stringify(firstProjection)).toContain("already-delivered");
+      expect(JSON.stringify(secondProjection)).toContain("already-delivered");
 
       const prepared = await plugin?.prepareStep?.(
         [

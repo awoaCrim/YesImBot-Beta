@@ -67,6 +67,9 @@ export function stripInternalAssistantInputs(
   );
   const projected: AgentEntry[] = [];
   const transcripts: AgentEntry[] = [];
+  // Gemini keeps proven answers with their source dialogue and rejects unverified stored
+  // transcripts below. Default mode retains its existing leading transcript corpus.
+  const transcriptTarget = mode === "gemini-native" ? projected : transcripts;
   for (const entry of entries) {
     if (entry.type !== "message") {
       projected.push(entry);
@@ -91,7 +94,7 @@ export function stripInternalAssistantInputs(
               transcript.data,
               entries.flatMap((source) => (source.type === "message" && (modern.groups.get(entry.id) ?? [entry.id]).includes(source.id) ? [source.data] : [])),
             );
-          transcripts.push(transcript);
+          transcriptTarget.push(transcript);
         }
       }
       continue;
@@ -102,8 +105,8 @@ export function stripInternalAssistantInputs(
       continue;
     }
     if (mode === "gemini-native" && isDeliveredTranscript(entry.data)) {
-      // Gemini mode reconstructs safe delivered output from paired send_message history only. A
-      // legacy/custom transcript has no call/result identity and must not become a duplicate turn.
+      // Only canonical journal proof or uniquely paired actual-body receipts may issue new
+      // Gemini transcripts. A stored custom transcript has no verified source identity.
       continue;
     }
 
@@ -115,7 +118,7 @@ export function stripInternalAssistantInputs(
         geminiSendCalls,
       );
       for (const replacement of replacements) if (replacement.type === "message") projection?.inherit(replacement.data, [entry.data]);
-      appendProjectedEntries(projected, transcripts, replacements);
+      appendProjectedEntries(projected, transcriptTarget, replacements);
       continue;
     }
 
@@ -130,9 +133,9 @@ export function stripInternalAssistantInputs(
 
     projected.push(entry);
   }
-  // Providers such as Gemini reject any system message that appears after non-system content. The
-  // compaction summary is a system entry, and delivered transcripts are assistant history, so the
-  // stable order is: every system entry, then transcripts, then the remaining dialogue in order.
+  // Providers such as Gemini reject system messages after non-system content. Hoist system
+  // entries only: Gemini dialogue keeps source-positioned answers, while default mode preserves
+  // its existing leading transcript corpus.
   const systemEntries: AgentEntry[] = [];
   const dialogue: AgentEntry[] = [];
   for (const entry of projected) {

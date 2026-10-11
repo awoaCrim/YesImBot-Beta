@@ -1201,9 +1201,9 @@ export function createModelInputPlugin(mode: HistoryProjectionMode = "default", 
     enforce: "pre",
     toModelMessages: async (message, context) => {
       if (isDeliveredTranscript(message)) {
-        if (mode === "gemini-native") return [];
-        // Magic must select bounded canonical source units before any cross-source merge.
-        const transcripts = deferMerge ? [message] : context.history.filter(isDeliveredTranscript);
+        // Gemini preserves source-positioned answers; Magic selects canonical units before any
+        // cross-source merge. Only the non-Magic default mode coalesces the leading corpus.
+        const transcripts = deferMerge || mode === "gemini-native" ? [message] : context.history.filter(isDeliveredTranscript);
         if (transcripts[0]?.id !== message.id) return [];
         const output = formatDeliveredTranscriptHistory(transcripts);
         context.projection?.inherit(output, transcripts);
