@@ -42,24 +42,25 @@ export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     session: Schema.object({
       compact: Schema.object({
-        responseIdleMinutes: finiteNumber(0).default(0).description("已弃用：不再使用响应空闲压缩；保留用于兼容旧配置"),
+        responseIdleMinutes: finiteNumber(0).default(0).description("已弃用：不再使用响应空闲压缩；保留用于兼容旧配置").hidden(),
         checkIntervalMinutes: finiteNumber(1, 2_147_483_647 / 60_000)
           .default(30)
-          .description("已弃用：仅兼容旧配置解析；自动压缩不再做周期检查"),
-        turnThreshold: finiteInteger(1).default(50).description("已弃用：仅兼容旧配置解析；自动压缩不再按用户轮数触发"),
-        minMessages: finiteNumber(1).default(15).description("手动/兼容压缩所需的最少消息数"),
-        maxFailures: finiteNumber(1).default(3).description("自动压缩连续失败上限"),
-        inlineFragments: finiteInteger(1).default(3).description("请求上下文中常驻的最近压缩片段数量；更旧的片段写入持久存储并按需召回"),
+          .description("已弃用：仅兼容旧配置解析；自动压缩不再做周期检查")
+          .hidden(),
+        turnThreshold: finiteInteger(1).default(50).description("已弃用：仅兼容旧配置解析；自动压缩不再按用户轮数触发").hidden(),
+        minMessages: finiteNumber(1).default(15).description("手动/兼容压缩所需的最少消息数；不控制 Magic Context 的触发"),
+        maxFailures: finiteNumber(1).default(3).description("兼容压缩连续失败上限；不控制 Magic Context 的后台整理重试"),
+        inlineFragments: finiteInteger(1).default(3).description("请求中常驻的最近旧压缩片段数；更旧的片段按需召回；不是 Magic Context 的整理阈值"),
         mode: Schema.union(["summary", "compartment"])
           .default("summary")
-          .description("压缩模式；summary 保持兼容，compartment 按时间块增量压缩并支持 ctx_expand"),
-        chunkMessages: finiteInteger(1).default(20).description("compartment 模式每个时间块最多包含的消息数"),
-        chunkChars: finiteInteger(1).default(12_000).description("compartment 模式每个时间块的最大输入字符数"),
+          .description("兼容历史压缩格式；启用 Magic Context 必须选择 compartment；summary 仅用于兼容压缩"),
+        chunkMessages: finiteInteger(1).default(20).description("兼容 compartment 压缩每块最多包含的消息数；不控制 Magic Context 的分块"),
+        chunkChars: finiteInteger(1).default(12_000).description("兼容 compartment 压缩每块的最大输入字符数；不控制 Magic Context 的分块"),
         assistantAsFacts: Schema.boolean()
           .default(false)
-          .description("compartment 模式是否把历史 assistant 输出转成客观动作/事实供压缩；默认不注入 assistant 原话"),
-        model: Schema.dynamic("registry.chatModels").description("压缩模型；留空则使用默认对话模型"),
-      }).description("自动压缩"),
+          .description("兼容 compartment 压缩是否包含归属明确的 assistant 历史原话；不控制 Magic Context 的历史来源"),
+        model: Schema.dynamic("registry.chatModels").description("旧历史整理模型字段；保留用于兼容；新模型入口位于 Magic Context 下").hidden(),
+      }).description("兼容历史压缩"),
       archive: Schema.object({
         maxKB: Schema.number()
           .min(0)
@@ -67,15 +68,20 @@ export const Config: Schema<Config> = Schema.intersect([
           .description("单个会话文件归档上限（KB）；0 = 禁用"),
       }).description("自动归档"),
       magicContext: Schema.object({
-        enabled: Schema.boolean().default(false).description("启用异步局部历史摘要；主模型实际输入达到 100000 时整理，目标约 80000；仅支持 compartment 模式"),
+        enabled: Schema.boolean()
+          .default(false)
+          .description("启用异步局部历史摘要；主模型实际输入达到 100000 时后台整理，软目标约 80000；接近安全容量时可提前整理；仅支持 compartment 模式"),
+        model: Schema.dynamic("registry.chatModels").description(
+          "历史整理模型；Magic Context 与兼容压缩共用；留空沿用旧压缩模型设置，两者均未设置时使用默认对话模型",
+        ),
         contextWindow: finiteInteger(1).description("明确的上下文窗口；与模型 limit 同时存在时取较小值"),
         outputReserveTokens: finiteInteger(1).default(8192).description("实际请求输出上限与输出预留"),
-        historyBudgetPercentage: finiteNumber(Number.MIN_VALUE, 100).default(25).description("兼容旧配置；Magic 不再按此比例裁剪原文"),
-        recentMessages: finiteInteger(1, 200).default(20).description("兼容旧配置；Magic 按 token 动态保护近期完整协议单元"),
-        maxLoadedBlocks: finiteInteger(1, 4).default(4).description("兼容旧配置；展开正文直接返回工具结果"),
-        pageTokenBudget: finiteInteger(128, 4096).default(4096).description("兼容旧配置；展开按安全剩余容量有界分页"),
-        retainTurns: finiteInteger(0, 2).default(2).description("兼容旧配置；不再使用按轮数到期的历史页租约"),
-        mediaReserveTokens: finiteInteger(1).description("兼容旧配置；媒体 payload 不计入本地文本预算"),
+        historyBudgetPercentage: finiteNumber(Number.MIN_VALUE, 100).default(25).description("兼容旧配置；Magic 不再按此比例裁剪原文").hidden(),
+        recentMessages: finiteInteger(1, 200).default(20).description("兼容旧配置；Magic 按 token 动态保护近期完整协议单元").hidden(),
+        maxLoadedBlocks: finiteInteger(1, 4).default(4).description("兼容旧配置；展开正文直接返回工具结果").hidden(),
+        pageTokenBudget: finiteInteger(128, 4096).default(4096).description("兼容旧配置；展开按安全剩余容量有界分页").hidden(),
+        retainTurns: finiteInteger(0, 2).default(2).description("兼容旧配置；不再使用按轮数到期的历史页租约").hidden(),
+        mediaReserveTokens: finiteInteger(1).description("兼容旧配置；媒体 payload 不计入本地文本预算").hidden(),
       }).description("Magic Context（默认关闭）"),
     }).description("会话管理"),
   }),
@@ -112,6 +118,8 @@ export interface SessionArchiveConfig {
 
 export interface MagicContextConfig {
   enabled: boolean;
+  /** Shared history-summary model; the legacy compact.model remains a fallback. */
+  model?: string;
   contextWindow?: number;
   outputReserveTokens: number;
   historyBudgetPercentage: number;

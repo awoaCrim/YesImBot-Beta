@@ -172,3 +172,26 @@ Declare model image capability in the model override in `models.json`. When
 `imageInput: true`, the runtime projects only images explicitly read by the
 model through `read`. Set `imageInput: false` to disable model image input.
 This setting does not impose a download policy on Translators.
+
+### History management
+
+Choose the **history summary model** under **Magic Context** in the Koishi
+configuration UI (`session.magicContext.model`). Magic and compatible legacy
+compression share this selection. When unset, Core uses the old
+`session.compact.model` value, then the main chat model if neither is configured.
+An unavailable explicitly selected model fails rather than silently switching.
+Existing YAML values remain supported; loading configuration does not migrate them.
+
+Magic is disabled by default and requires `session.compact.mode: compartment`.
+When enabled, matching main-model input usage of at least 100,000 tokens starts
+background history summarization toward a soft target of about 80,000 tokens.
+Near the safe input capacity, or when the next request is estimated to exceed it,
+capacity protection can start earlier. Safe requests continue without waiting.
+With Magic disabled, the legacy controller triggers above 150,000 input tokens
+and waits for an idle runtime before compacting; the two controllers do not run
+together.
+
+Deprecated timer, turn-count, and old Magic budget/lease controls are hidden but
+still parsed for compatibility. The **compatible history compression** group
+retains working legacy settings, including the history format and resident old
+fragments; these are not Magic's scheduling thresholds.

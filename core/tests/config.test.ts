@@ -109,4 +109,71 @@ describe("Config schema", () => {
   ])("rejects invalid %s", (_label, field, value) => {
     expect(() => Config({ chatModel: "test:model", session: { compact: { [field]: value } } } as never)).toThrow();
   });
+
+  it("hides deprecated settings and exposes one history model selector under Magic Context", () => {
+    type SchemaNode = {
+      meta?: { description?: string; hidden?: boolean };
+      dict?: Record<string, string | number>;
+    };
+    const json = Config.toJSON() as { refs: Record<string, SchemaNode> };
+    const session = Object.values(json.refs).find((ref) => ref.meta?.description === "会话管理");
+    const compact = json.refs[String(session?.dict?.compact)];
+    const magic = json.refs[String(session?.dict?.magicContext)];
+
+    for (const field of ["responseIdleMinutes", "checkIntervalMinutes", "turnThreshold", "model"]) {
+      expect(json.refs[String(compact?.dict?.[field])]).toMatchObject({ meta: { hidden: true } });
+    }
+    for (const field of ["historyBudgetPercentage", "recentMessages", "maxLoadedBlocks", "pageTokenBudget", "retainTurns", "mediaReserveTokens"]) {
+      expect(json.refs[String(magic?.dict?.[field])]).toMatchObject({ meta: { hidden: true } });
+    }
+    for (const field of ["minMessages", "maxFailures", "inlineFragments", "mode", "chunkMessages", "chunkChars", "assistantAsFacts"]) {
+      expect(compact?.dict).toHaveProperty(field);
+      expect(json.refs[String(compact?.dict?.[field])]?.meta?.hidden).not.toBe(true);
+    }
+    for (const field of ["enabled", "model", "contextWindow", "outputReserveTokens"]) {
+      expect(magic?.dict).toHaveProperty(field);
+      expect(json.refs[String(magic?.dict?.[field])]?.meta?.hidden).not.toBe(true);
+    }
+    expect(compact?.meta?.description).toBe("兼容历史压缩");
+    expect(json.refs[String(magic?.dict?.model)]?.meta?.description).toContain("历史整理模型");
+  });
+
+  it("preserves hidden legacy values alongside the new history model without enabling Magic or rewriting the old model", () => {
+    const compact = { responseIdleMinutes: 120, checkIntervalMinutes: 60, turnThreshold: 80, model: "test:legacy" };
+    const compatibility = {
+      historyBudgetPercentage: 30,
+      recentMessages: 40,
+      maxLoadedBlocks: 2,
+      pageTokenBudget: 512,
+      retainTurns: 1,
+      mediaReserveTokens: 256,
+    };
+    const resolved = Config({
+      chatModel: "test:main",
+      session: { compact, magicContext: { ...compatibility, model: "test:history" } },
+    } as never) as { session: { compact: typeof compact; magicContext: typeof compatibility & { enabled: boolean; model: string } } };
+
+    expect(resolved.session.compact).toMatchObject(compact);
+    expect(resolved.session.magicContext).toMatchObject({ ...compatibility, enabled: false, model: "test:history" });
+  });
+
+  it("keeps history model selection optional and preserves old-only configuration", () => {
+    const defaults = Config({ chatModel: "test:main" } as never) as { session: { compact: { model?: string }; magicContext: { model?: string } } };
+    const legacy = Config({ chatModel: "test:main", session: { compact: { model: "test:legacy" } } } as never) as typeof defaults;
+    expect(defaults.session.magicContext.model).toBeUndefined();
+    expect(defaults.session.compact.model).toBeUndefined();
+    expect(legacy.session.magicContext.model).toBeUndefined();
+    expect(legacy.session.compact.model).toBe("test:legacy");
+  });
+
+  it.each([
+    ["historyBudgetPercentage", 0],
+    ["recentMessages", 0],
+    ["maxLoadedBlocks", 5],
+    ["pageTokenBudget", 127],
+    ["retainTurns", 3],
+    ["mediaReserveTokens", 0],
+  ])("still validates hidden Magic compatibility field %s", (field, value) => {
+    expect(() => Config({ chatModel: "test:main", session: { magicContext: { [field]: value } } } as never)).toThrow();
+  });
 });

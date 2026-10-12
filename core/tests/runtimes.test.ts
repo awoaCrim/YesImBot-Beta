@@ -1700,13 +1700,22 @@ describe("Runtimes identity", () => {
     { enabled: true, level: "low", separate: true, expected: "low" },
     { enabled: true, level: undefined, separate: true, expected: "low" },
     { enabled: false, level: "high", separate: true, expected: undefined },
-  ] as const)("scopes historian thinking without replacing main/legacy settings: %j", async ({ enabled, level, separate, expected }) => {
+    { enabled: true, level: "high", separate: true, historyModel: "test:history", expected: "low" },
+    { enabled: true, level: "high", separate: false, historyModel: "test:history", expected: "low" },
+    { enabled: false, level: "high", separate: true, historyModel: "test:history", expected: undefined },
+    { enabled: true, level: "minimal", separate: true, historyModel: "test:history", expected: "minimal" },
+    { enabled: true, level: "high", separate: true, historyModel: "", expected: "low" },
+  ] as const)("scopes historian thinking without replacing main/legacy settings: %j", async (input) => {
+    const { enabled, level, separate, expected } = input;
+    const historyModel = "historyModel" in input ? input.historyModel : undefined;
+    const selectedId = historyModel || (separate ? "test:compact" : "test:main");
     const root = await mkdtemp(join(tmpdir(), "yesimbot-scoped-historian-"));
     const ctx = new Context();
     const channels = new Channels(ctx, { basePath: root });
     const main = { provider: "test", modelId: "main" };
     const legacy = { provider: "test", modelId: "compact" };
-    const scoped = { provider: "test", modelId: separate ? "compact" : "main" };
+    const history = { provider: "test", modelId: "history" };
+    const scoped = { provider: "test", modelId: selectedId.split(":")[1] };
     const model = {
       revision: 1,
       contextLimit: () => undefined,
@@ -1714,7 +1723,7 @@ describe("Runtimes identity", () => {
         fullId: id,
         providerId: "test",
         modelId: id.split(":")[1],
-        model: options ? scoped : id === "test:main" ? main : legacy,
+        model: options ? scoped : id === "test:main" ? main : id === "test:history" ? history : legacy,
         entry: { id: id.split(":")[1], reasoning: true, thinkingLevel: options?.thinkingLevel ?? level },
       })),
     };
@@ -1730,7 +1739,7 @@ describe("Runtimes identity", () => {
         session: {
           ...config.session,
           compact: { ...config.session.compact, mode: "compartment", model: separate ? "test:compact" : undefined },
-          magicContext: { enabled, contextWindow: 147200 },
+          magicContext: { enabled, model: historyModel, contextWindow: 147200 },
         },
       },
       new Agents(ctx),
@@ -1740,9 +1749,51 @@ describe("Runtimes identity", () => {
       await runtimes.get(channel, { selfId: "bot", sendMessage: vi.fn() } as never);
       const overrideCalls = model.resolveChatModel.mock.calls.filter((call) => call[2] !== undefined);
       expect(overrideCalls).toHaveLength(enabled ? 1 : 0);
-      if (enabled) expect(overrideCalls[0]).toEqual([separate ? "test:compact" : "test:main", channel.context, { thinkingLevel: expected }]);
+      if (enabled) expect(overrideCalls[0]).toEqual([selectedId, channel.context, { thinkingLevel: expected }]);
+      const ordinaryIds = model.resolveChatModel.mock.calls.filter((call) => call[2] === undefined).map((call) => call[0]);
+      expect(ordinaryIds).toEqual(selectedId === "test:main" ? ["test:main"] : ["test:main", selectedId]);
       expect(vi.mocked(createAgent).mock.calls.at(-1)![0].model).toBe(main);
       expect(model.resolveChatModel.mock.calls[0]?.[2]).toBeUndefined();
+    } finally {
+      await runtimes.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, true])("does not fall back to a legacy or main model when the selected history model is unavailable (Magic=%s)", async (enabled) => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-history-selection-"));
+    const ctx = new Context();
+    const channels = new Channels(ctx, { basePath: root });
+    const unavailable = new Error("Selected history model is unavailable");
+    const model = {
+      revision: 1,
+      contextLimit: () => undefined,
+      resolveChatModel: vi.fn((id: string) => {
+        if (id === "test:missing") throw unavailable;
+        return { fullId: id, providerId: "test", modelId: "main", model: {}, entry: { id: "main" } };
+      }),
+    };
+    const runtimes = new Runtimes(
+      ctx,
+      channels,
+      model as never,
+      {
+        ...config,
+        basePath: root,
+        chatModel: "test:main",
+        logLevel: 0,
+        session: {
+          ...config.session,
+          compact: { ...config.session.compact, mode: "compartment", model: "test:legacy" },
+          magicContext: { enabled, model: "test:missing", contextWindow: 147200 },
+        },
+      },
+      new Agents(ctx),
+    );
+    try {
+      const channel = await channels.resolve({ type: "guild", platform: "test", channelId: "room", guildId: "room" });
+      await expect(runtimes.get(channel, { selfId: "bot", sendMessage: vi.fn() } as never)).rejects.toBe(unavailable);
+      expect(model.resolveChatModel.mock.calls.map((call) => call[0])).toEqual(["test:main", "test:missing"]);
     } finally {
       await runtimes.stop();
       await rm(root, { recursive: true, force: true });

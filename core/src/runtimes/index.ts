@@ -326,7 +326,8 @@ export class Runtimes {
   }
 
   private resolveCompactModel(fallback: ChatModelRef, context: ChannelContext): ChatModelRef {
-    return this.config.session.compact.model ? this.model.resolveChatModel(this.config.session.compact.model, context) : fallback;
+    const modelId = this.config.session.magicContext?.model || this.config.session.compact.model;
+    return modelId ? this.model.resolveChatModel(modelId, context) : fallback;
   }
 
   private resolveVision(context: ChannelContext) {
