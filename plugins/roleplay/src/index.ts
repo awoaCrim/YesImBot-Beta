@@ -8,13 +8,14 @@ import type { ChannelContext, ChannelPluginSetupContext, MainAgentRoleProfile, M
 import { loadCharacterCard } from "./card.js";
 import type { CBSContext } from "./cbs.js";
 import { selectGreeting } from "./greeting.js";
-import { assembleRoleProfile } from "./prompt.js";
+import { assembleRoleplayPrompts, type RoleplayPromptMaterial } from "./prompt.js";
 import { createRoleplayPlugin } from "./roleplay.js";
 
 export interface RoleplayPluginConfig {
   characterCard: string;
   useRandomGreeting?: boolean;
   enableGreeting?: boolean;
+  exampleDialoguesAsHistory?: boolean;
 }
 
 export default class RoleplayPlugin {
@@ -25,6 +26,7 @@ export default class RoleplayPlugin {
     characterCard: Schema.path({ filters: ["file"] }).description("PNG 角色卡文件路径"),
     useRandomGreeting: Schema.boolean().default(false).description("随机选择角色卡开场白"),
     enableGreeting: Schema.boolean().default(true).description("新建空会话时注入角色卡开场白"),
+    exampleDialoguesAsHistory: Schema.boolean().default(false).description("将示例对话作为角色的过去对话提供给模型，可能引入虚构经历"),
   });
 
   public readonly ctx: Context;
@@ -38,7 +40,7 @@ export default class RoleplayPlugin {
   private greeting?: string;
   private disposeAgentPlugin: (() => void) | undefined;
   private readonly promptContexts = new Map<string, CBSContext>();
-  private readonly promptProfiles = new Map<string, MainAgentRoleProfile>();
+  private readonly promptProfiles = new Map<string, RoleplayPromptMaterial>();
 
   public constructor(ctx: Context, config: RoleplayPluginConfig) {
     this.ctx = ctx;
@@ -65,16 +67,7 @@ export default class RoleplayPlugin {
 
   /** Card resolution for the main Agent; Core places it once in its continuous role section. */
   public resolve(scope: ChannelContext): MainAgentRoleProfile | undefined {
-    const card = this.card;
-    if (!card) return undefined;
-    const key = roleplayContextKey(scope);
-    const cached = this.promptProfiles.get(key);
-    if (cached) return cached;
-
-    // Preserve per-channel random/roll choices across setup retries and runtime replacements.
-    const profile = assembleRoleProfile(card, this.promptContext(scope));
-    this.promptProfiles.set(key, profile);
-    return profile;
+    return this.card ? this.promptMaterial(scope).roleProfile : undefined;
   }
 
   public setup(scope: ChannelContext, _bot: Bot, runtime?: ChannelPluginSetupContext): AgentPlugin {
@@ -85,6 +78,7 @@ export default class RoleplayPlugin {
       userName: scope.type === "direct" ? scope.channelId : "User",
       context: this.promptContext(scope),
       managedPrompts: runtime?.rolePromptsManaged === true,
+      material: this.promptMaterial(scope),
     });
   }
 
@@ -94,6 +88,18 @@ export default class RoleplayPlugin {
     this.disposeAgentPlugin = undefined;
     this.promptContexts.clear();
     this.promptProfiles.clear();
+  }
+
+  private promptMaterial(scope: ChannelContext): RoleplayPromptMaterial {
+    const card = this.card;
+    if (!card) throw new Error("Roleplay plugin has not been started");
+    const key = roleplayContextKey(scope);
+    const cached = this.promptProfiles.get(key);
+    if (cached) return cached;
+    // Freeze role instructions and optional history together; setup never rerolls resolved fields.
+    const material = assembleRoleplayPrompts(card, this.promptContext(scope), this.config.exampleDialoguesAsHistory === true);
+    this.promptProfiles.set(key, material);
+    return material;
   }
 
   private promptContext(scope: ChannelContext): CBSContext {

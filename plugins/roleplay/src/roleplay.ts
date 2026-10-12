@@ -3,7 +3,7 @@ import { createAssistantMessage, createMessageEntry, type AgentPlugin } from "@y
 
 import type { CBSContext } from "./cbs.js";
 import { renderCBS } from "./cbs.js";
-import { assembleRoleProfile } from "./prompt.js";
+import { assembleRoleplayPrompts, type RoleplayPromptMaterial } from "./prompt.js";
 
 export interface RoleplayAgentPluginOptions {
   readonly card: CharacterCardV3;
@@ -14,6 +14,9 @@ export interface RoleplayAgentPluginOptions {
   readonly context?: CBSContext;
   /** Core already placed this card in its unified role section; greeting initialization still runs. */
   readonly managedPrompts?: boolean;
+  readonly exampleDialoguesAsHistory?: boolean;
+  /** Reuse the channel render already supplied to Core; never rerender random/roll fields. */
+  readonly material?: RoleplayPromptMaterial;
 }
 
 export function createRoleplayPlugin(options: RoleplayAgentPluginOptions): AgentPlugin {
@@ -24,8 +27,13 @@ export function createRoleplayPlugin(options: RoleplayAgentPluginOptions): Agent
     userName: options.userName,
   };
   const delegate = options.managedPrompts === true;
-  // Managed material was already rendered before setup. Do not consume random/roll placeholders again.
-  const profile = delegate ? {} : assembleRoleProfile(options.card, context);
+  // Old managed callers need no card render; resolved channel material carries optional history.
+  const material: RoleplayPromptMaterial =
+    options.material ??
+    (delegate && options.exampleDialoguesAsHistory !== true
+      ? { roleProfile: {}, dialogueHistory: [] }
+      : assembleRoleplayPrompts(options.card, context, options.exampleDialoguesAsHistory === true));
+  const profile = material.roleProfile;
   const cardSection = [profile.characterDefinition, profile.roleInstructions].filter(Boolean).join("\n\n");
   const greeting = renderCBS(options.greeting, context).text;
   const plugin: AgentPlugin = {
@@ -41,6 +49,19 @@ export function createRoleplayPlugin(options: RoleplayAgentPluginOptions): Agent
   // one complete frozen leading system block. Core-placed material does not add another card prefix.
   if (!delegate) {
     plugin.appendSystemPrompt = () => cardSection || undefined;
+  }
+
+  if (material.dialogueHistory.length > 0) {
+    const history = material.dialogueHistory;
+    const historyObjects = new Set<object>(history);
+    plugin.prepareStep = (messages, context) => {
+      // Rebuilt steps need the same batch. Remove only our own objects, never identical real speech.
+      const retained = messages.filter((message) => !historyObjects.has(message));
+      for (const message of history) context.projection?.register(message, { kind: "mandatory", sourceEntryIds: [] });
+      const firstDialogue = retained.findIndex((message) => message.role !== "system");
+      const insertion = firstDialogue < 0 ? retained.length : firstDialogue;
+      return [...retained.slice(0, insertion), ...history, ...retained.slice(insertion)];
+    };
   }
 
   return plugin;
