@@ -112,8 +112,26 @@ The MCP client plugin MUST support resolving `Authorization: Bearer <token>` for
 - **THEN** every log entry MUST contain field names or configured-state only
 - **AND** no log entry, thrown error, or tool result may contain a token value
 
-### Requirement: Complete MCP catalogs stay registered behind a hard confirmation gate
-The MCP client plugin MUST register every tool returned by `listTools()` for a connected server and MUST NOT drop tools through a static allowlist. Before calling upstream `client.callTool()`, it MUST classify each tool from its upstream name and description, allow explicitly read-only tools through, and require confirmation for every tool that either has a side-effect signal or cannot be proven read-only.
+### Requirement: Configured MCP catalogs do not use a global scope allowlist
+The MCP client plugin MUST expose configured server catalogs to group and direct runtimes without a plugin-global `allowedScopes` gate. Legacy `allowedScopes` configuration MUST NOT filter this catalog. This does not change access control owned by Core or other plugins.
+
+#### Scenario: Group and direct runtimes receive configured tools
+- **WHEN** an enabled server publishes its catalog
+- **THEN** group and direct runtimes MUST receive its tools regardless of a legacy global scope allowlist
+- **AND** execution MUST follow that server's confirmation setting
+
+### Requirement: Complete MCP catalogs use server-level confirmation
+The MCP client plugin MUST register every tool returned by `listTools()` for a connected server and MUST NOT drop tools through a static allowlist. Each stdio/http/sse server MUST support optional `requireConfirmation`, defaulting to true. When enabled, before calling upstream `client.callTool()`, the plugin MUST classify each tool from its upstream name and description, allow explicitly read-only tools through, and require confirmation for every tool that either has a side-effect signal or cannot be proven read-only. The confirmation requirements below apply to servers with confirmation enabled.
+
+#### Scenario: An operator explicitly disables confirmation for one server
+- **WHEN** a server configures `requireConfirmation: false`
+- **THEN** its side-effect and unknown tools MUST call upstream without issuing a confirmation code
+- **AND** confirmation enabled on another server MUST remain unchanged
+- **AND** the artifact wrapper and upstream tool descriptions MUST remain unchanged
+
+#### Scenario: Confirmation is omitted or enabled
+- **WHEN** a server omits `requireConfirmation` or sets it to true
+- **THEN** the following default confirmation behavior MUST remain active
 
 #### Scenario: A catalog contains side-effect tools
 - **WHEN** a connected server exposes order, payment, cancellation, or other state-changing tools
@@ -197,5 +215,6 @@ Blocked and allowed tool results MUST keep the MCP content-array shape so the ex
 #### Scenario: Runtime guidance is published
 - **WHEN** a Runtime receives MCP tools
 - **THEN** the artifact guidance MUST appear once
-- **AND** the confirmation guidance MUST be added as part of that same single injection
+- **AND** the confirmation guidance MUST be added as part of that same single injection when at least one published tool requires confirmation
+- **AND** a catalog containing only unguarded/read-only tools MUST NOT add confirmation guidance
 - **AND** each remote tool description MUST retain its server-provided text

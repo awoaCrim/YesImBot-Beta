@@ -23,9 +23,9 @@ import urllib.request
 import uuid
 import zipfile
 
-from release_runner import (MAX_BYTES, MAX_FILES, PACKAGE_FIELDS, RUNTIME_PROBE, WORKSPACE,
-                            canonical, command, digest, read_json, require, validate_archive,
-                            validate_manifest)
+from release_runner import (APPROVAL_FILE, MAX_BYTES, MAX_FILES, PACKAGE_FIELDS, RUNTIME_PROBE, WORKSPACE,
+                            canonical, command, digest, read_approval, read_json, require, validate_archive,
+                            validate_approved_output_changes, validate_manifest)
 
 REPOSITORY = "awoaCrim/YesImBot-Beta"
 ASSETS = {"payload.tar.gz", "manifest.json", "runner.py"}
@@ -42,7 +42,8 @@ check(state.is_absolute() and state.resolve() == state and run.parent == state/'
 for business in [pathlib.Path(p['sourceRoot']), pathlib.Path(p['dataRoot'])]:
     check(business.is_absolute() and business.resolve() == business, 'unsafe business root')
     check(not state.is_relative_to(business) and not business.is_relative_to(state), 'state overlaps business root')
-check(set(expected) == {'manifest.json','runner.py','profile.json'} and sum(v['size'] for v in expected.values()) < 5*1024*1024, 'invalid controls')
+required = {'manifest.json','runner.py','profile.json'}
+check(required <= set(expected) <= required | {'approved-output-changes.json'} and sum(v['size'] for v in expected.values()) < 5*1024*1024, 'invalid controls')
 for root in [state, state/'runs']:
     root.mkdir(mode=0o700, exist_ok=True)
     check(root.resolve() == root and root.stat().st_uid == 0 and stat.S_IMODE(root.stat().st_mode) == 0o700, 'unsafe state permissions')
@@ -303,10 +304,14 @@ def ssh_call(alias, args, data=None):
     return json.loads(result.stdout)
 
 
-def controls(bundle, profile, alias):
+def controls(bundle, profile, alias, approved_output_changes=None):
     run = Path(profile["stateRoot"]) / "runs" / uuid.uuid4().hex
     files = {name: (Path(bundle) / name).read_bytes() for name in ("manifest.json", "runner.py")}
     files["profile.json"] = canonical(profile)
+    if approved_output_changes is not None:
+        data = read_approval(approved_output_changes)
+        validate_approved_output_changes(json.loads(data), json.loads(files["manifest.json"])["workspaces"])
+        files[APPROVAL_FILE] = data
     require(sum(len(v) for v in files.values()) < 5 * 1024 * 1024, "controls budget exceeded")
     expected = {name: {"size": len(value), "sha256": hashlib.sha256(value).hexdigest()} for name, value in files.items()}
     stream = io.BytesIO()
@@ -327,7 +332,8 @@ def delta_archive(bundle, entries):
     return stream.getvalue()
 
 
-def target_action(action, repository, tag, alias, profile_path, dry_run=False):
+def target_action(action, repository, tag, alias, profile_path, dry_run=False, approved_output_changes=None):
+    require(action == "deploy" or approved_output_changes is None, "approved output changes are deploy-only")
     profile = read_json(profile_path)
     bundle = Path(".release-cache") / tag
     if action in {"status", "recover", "rollback"} and bundle.exists():
@@ -337,7 +343,7 @@ def target_action(action, repository, tag, alias, profile_path, dry_run=False):
         require(re.fullmatch(r"beta-\d{8}-[0-9a-f]{12}", tag) and tag.endswith(m["sourceSha"][:12]), "cached recovery tag mismatch")
     else:
         download(repository, tag, bundle)
-    run = controls(bundle, profile, alias)
+    run = controls(bundle, profile, alias) if approved_output_changes is None else controls(bundle, profile, alias, approved_output_changes)
     args = ["python3", run + "/runner.py", "--run-dir", run]
     if action != "deploy":
         return ssh_call(alias, args + [action])
@@ -370,6 +376,7 @@ def main():
         p.add_argument("--profile", default=".release-local/ssh1.json")
         if name == "deploy":
             p.add_argument("--dry-run", action="store_true")
+            p.add_argument("--approved-output-changes", metavar="JSON_FILE", help="explicit path/hash approval bound to the active release state")
     for p in sub.choices.values():
         p.add_argument("--repository", default=REPOSITORY)
     a = parser.parse_args()
@@ -381,7 +388,8 @@ def main():
     elif a.action == "publish":
         value = publish(a.repository, a.run_id, a.output)
     else:
-        value = target_action("verify" if a.action == "verify-target" else a.action, a.repository, a.tag, a.target, a.profile, getattr(a, "dry_run", False))
+        value = target_action("verify" if a.action == "verify-target" else a.action, a.repository, a.tag, a.target, a.profile,
+                              getattr(a, "dry_run", False), getattr(a, "approved_output_changes", None))
     print(json.dumps(value, ensure_ascii=False))
 
 

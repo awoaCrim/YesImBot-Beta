@@ -116,7 +116,6 @@ describe("mcp-client tool registry", () => {
     mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
 
     const plugin = new McpClientPlugin(ctx as never, {
-      allowedScopes: [{ platform: "test", channelId: "room" }],
       mcpServers: { docs: { type: "http", url: "https://example.test/mcp" } },
     });
 
@@ -141,7 +140,6 @@ describe("mcp-client tool registry", () => {
     mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
 
     const plugin = new McpClientPlugin(ctx as never, {
-      allowedScopes: [{ platform: "test", channelId: "room" }],
       mcpServers: { luckin: { type: "http", url: "https://example.test/mcp" } },
     });
     await plugin.start();
@@ -166,22 +164,53 @@ describe("mcp-client tool registry", () => {
     expect(client.callTool).not.toHaveBeenCalled();
   });
 
-  it("hides the catalog from scopes outside the allowlist", async () => {
+  it("exposes the configured catalog to group and direct runtimes without a global allowlist", async () => {
     const { client } = createClient([["search"]]);
     const { ctx, plugins } = createContext();
     mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
 
     const plugin = new McpClientPlugin(ctx as never, {
-      allowedScopes: [{ platform: "test", channelId: "*", userId: "100" }],
       mcpServers: { docs: { type: "http", url: "https://example.test/mcp" } },
     });
     await plugin.start();
 
-    const denied = await plugins[0]!.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" } as never, {} as never);
-    expect(await resolveToolNames(denied!)).toEqual([]);
+    const group = await plugins[0]!.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" } as never, {} as never);
+    expect(await resolveToolNames(group!)).toEqual(["docs-search"]);
 
-    const allowed = await plugins[0]!.setup({ type: "direct", platform: "test", channelId: "private:100", userId: "100", selfId: "bot" } as never, {} as never);
-    expect(await resolveToolNames(allowed!)).toEqual(["docs-search"]);
+    const direct = await plugins[0]!.setup({ type: "direct", platform: "test", channelId: "private:100", userId: "100", selfId: "bot" } as never, {} as never);
+    expect(await resolveToolNames(direct!)).toEqual(["docs-search"]);
+  });
+
+  it("does not apply a legacy global allowedScopes field to MCP catalog visibility", async () => {
+    const { client } = createClient([["search"]]);
+    const { ctx, plugins } = createContext();
+    mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
+    const legacyConfig = {
+      allowedScopes: [],
+      mcpServers: { docs: { type: "http" as const, url: "https://example.test/mcp" } },
+    };
+    const plugin = new McpClientPlugin(ctx as never, legacyConfig);
+    await plugin.start();
+    const runtime = await plugins[0]!.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" } as never, {} as never);
+    expect(await resolveToolNames(runtime!)).toEqual(["docs-search"]);
+  });
+
+  it("updates server-level confirmation for newly published catalog snapshots", async () => {
+    const { client, emitToolListChanged } = createClient([["createOrder"], ["createOrder"]]);
+    client.callTool.mockResolvedValue({ content: [{ text: "upstream", type: "text" }] });
+    const { ctx, plugins } = createContext();
+    mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
+    const config = { mcpServers: { orders: { type: "http" as const, url: "https://example.test/mcp", requireConfirmation: false } } };
+    const plugin = new McpClientPlugin(ctx as never, config);
+    await plugin.start();
+    const scope = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as never;
+    const first = (await resolveTools(await plugins[0]!.setup(scope, {} as never)))[0]!;
+    expect(outputText(await first.execute({}, { messages: [] } as never))).toBe("upstream");
+    config.mcpServers.orders.requireConfirmation = true;
+    await emitToolListChanged();
+    const refreshed = (await resolveTools(await plugins[1]!.setup(scope, {} as never)))[0]!;
+    expect(outputText(await refreshed.execute({}, { messages: [] } as never))).toContain("confirmation_required");
+    expect(client.callTool).toHaveBeenCalledOnce();
   });
 
   it("disambiguates exposed names after sanitization", async () => {
@@ -190,7 +219,6 @@ describe("mcp-client tool registry", () => {
     mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
 
     const plugin = new McpClientPlugin(ctx as never, {
-      allowedScopes: [{ platform: "test", channelId: "room" }],
       mcpServers: { docs: { type: "http", url: "https://example.test/mcp" } },
     });
     await plugin.start();

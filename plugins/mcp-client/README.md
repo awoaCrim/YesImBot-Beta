@@ -2,24 +2,13 @@
 
 Expose tools from configured MCP servers to Athena channel runtimes.
 
-## Scope Allowlist
+## Tool Access and Confirmation Configuration
 
-MCP tools use an explicit allowlist. By default, the OneBot direct-message user `1049700117` is authorized; an empty `allowedScopes` list denies all MCP tool definitions, including read-only tools. Confirmation is an additional execution safeguard, not a replacement for this allowlist.
+The MCP plugin no longer applies a global `allowedScopes` allowlist; that field in old configurations has no effect. Enabled servers expose their tools to channel runtimes admitted by Core. Core's `allowedChannels` and other plugins' access controls are unchanged. Review which channels can invoke external services before upgrading.
 
-```yaml
-allowedScopes:
-  # Direct messages: authorize a QQ user across its private channel IDs.
-  - platform: onebot
-    channelId: "*"
-    userId: "10001"
-    selfId: "*"
-  # Group/channel runtime: authorize one exact channel.
-  - platform: onebot
-    channelId: "123456789"
-    selfId: "3535802886"
-```
+Every `mcpServers` entry (`stdio`, `http`, or `sse`) supports optional `requireConfirmation`. Omitted or `true` keeps the existing risk classifier and one-time confirmation for side-effect or unknown-risk tools; explicitly read-only tools execute directly. Setting `false` bypasses confirmation for all tools on that server, including orders, payments and deletions. Disable it only when you explicitly accept those external effects; other servers keep their own setting.
 
-A concrete `userId` matches direct messages only. Omit `userId` for a group/channel rule. Unlisted scopes receive no MCP tool definitions or MCP system guidance.
+The switch does not change server authentication, Token file handling, media artifacts or catalog refresh. Configuration changes use the normal plugin/runtime reload lifecycle.
 
 ## Tool Registry
 
@@ -72,7 +61,7 @@ Servers that keep using explicit `headers` without `bearerTokenFile` behave exac
 
 ## Side-Effect Confirmation
 
-For an authorized scope, every tool returned by `listTools()` is registered; the catalog is never reduced by a static tool-name allowlist. Each tool is classified from its upstream name and description.
+Every tool returned by an enabled server's `listTools()` is registered; the catalog is never reduced by a static tool-name allowlist. When that server's `requireConfirmation` is omitted or `true`, each tool is classified from its upstream name and description.
 
 - explicit read-only action vocabulary (`list`, `search`, `query`, `get`, `detail`, `查询`, `列表`, ...) is forwarded immediately;
 - side-effect vocabulary (`create`, `cancel`, `pay`, `submit`, `delete`, `下单`, `支付`, `取消`, ...) requires confirmation;

@@ -81,7 +81,6 @@ async function buildPlugin(serverName = "tools", toolNames: string[] = ["listSna
   const client = createClient(toolNames);
   mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn(async () => undefined) } });
   const plugin = new McpClientPlugin(ctx as never, {
-    allowedScopes: [{ platform: "test", channelId: "room" }],
     mcpServers: { [serverName]: { type: "http", url: "https://example.test/mcp" } },
   });
   await plugin.start();

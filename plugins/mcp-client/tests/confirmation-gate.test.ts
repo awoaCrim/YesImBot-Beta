@@ -52,6 +52,7 @@ import {
   pendingKey,
 } from "../src/confirmation";
 import McpClientPlugin from "../src/index";
+import type { McpServer } from "../src/types";
 
 const SCOPE_A = { type: "guild", platform: "qq", channelId: "room-a", guildId: "room-a" } as never;
 const SCOPE_B = { type: "guild", platform: "qq", channelId: "room-b", guildId: "room-b" } as never;
@@ -107,13 +108,12 @@ function createClient(tools = DEFAULT_TOOLS) {
   };
 }
 
-async function buildPlugin(tools = DEFAULT_TOOLS) {
+async function buildPlugin(tools = DEFAULT_TOOLS, server: McpServer = { type: "http", url: "https://example.test/mcp" }) {
   const { ctx, artifactWriter, scopedLogger } = createContext();
   const client = createClient(tools);
   mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn(async () => undefined) } });
   const plugin = new McpClientPlugin(ctx as never, {
-    allowedScopes: [{ platform: "qq", channelId: "*" }],
-    mcpServers: { luckin: { type: "http", url: "https://example.test/mcp" } },
+    mcpServers: { luckin: server },
   });
   await plugin.start();
   return { plugin, client, artifactWriter, scopedLogger };
@@ -349,6 +349,65 @@ describe("deriveChannelScopeKey", () => {
 });
 
 describe("mcp-client confirmation gate", () => {
+  const transports: McpServer[] = [
+    { type: "stdio", command: "unused-test-command" },
+    { type: "http", url: "https://example.test/mcp" },
+    { type: "sse", url: "https://example.test/mcp" },
+  ];
+
+  it.each(transports)("keeps confirmation on by default for $type servers", async (server) => {
+    const { plugin, client } = await buildPlugin(DEFAULT_TOOLS, server);
+    const { tool } = await channelTools(plugin, SCOPE_A);
+    expect(outputText(await tool("luckin-createOrder").execute({}, { messages: [] } as never))).toContain("confirmation_required");
+    expect(client.callTool).not.toHaveBeenCalled();
+  });
+
+  it.each(transports)("keeps explicit confirmation enabled for $type servers", async (server) => {
+    const { plugin, client } = await buildPlugin(DEFAULT_TOOLS, { ...server, requireConfirmation: true });
+    const { tool, agentPlugin } = await channelTools(plugin, SCOPE_A);
+    expect(outputText(await tool("luckin-frobnicate").execute({}, { messages: [] } as never))).toContain("confirmation_required");
+    expect(client.callTool).not.toHaveBeenCalled();
+    if (typeof agentPlugin.appendSystemPrompt !== "function") throw new Error("appendSystemPrompt unavailable");
+    expect(String(await agentPlugin.appendSystemPrompt({} as never))).toContain("confirmation_required");
+  });
+
+  it.each(transports)("forwards side effects and unknown tools when $type confirmation is explicitly disabled", async (server) => {
+    const { plugin, client } = await buildPlugin(DEFAULT_TOOLS, { ...server, requireConfirmation: false });
+    const { tool, agentPlugin } = await channelTools(plugin, SCOPE_A);
+    const argumentsValue = { item: "coffee" };
+    expect(outputText(await tool("luckin-createOrder").execute(argumentsValue, { messages: [] } as never))).toBe("upstream-ok");
+    expect(outputText(await tool("luckin-frobnicate").execute({}, { messages: [] } as never))).toBe("upstream-ok");
+    expect(client.callTool).toHaveBeenCalledTimes(2);
+    expect(client.callTool).toHaveBeenNthCalledWith(1, { arguments: argumentsValue, name: "createOrder" });
+    if (typeof agentPlugin.appendSystemPrompt !== "function") throw new Error("appendSystemPrompt unavailable");
+    const prompt = String(await agentPlugin.appendSystemPrompt({} as never));
+    expect(prompt).toContain("artifact://");
+    expect(prompt).not.toContain("confirmation_required");
+  });
+
+  it("isolates the confirmation setting between mixed servers", async () => {
+    const { ctx } = createContext();
+    const guarded = createClient();
+    const unguarded = createClient();
+    mocks.connectMcpServer
+      .mockResolvedValueOnce({ client: guarded, transport: { close: vi.fn(async () => undefined) } })
+      .mockResolvedValueOnce({ client: unguarded, transport: { close: vi.fn(async () => undefined) } });
+    const plugin = new McpClientPlugin(ctx as never, {
+      mcpServers: {
+        guarded: { type: "http", url: "https://example.test/guarded" },
+        unguarded: { type: "sse", url: "https://example.test/unguarded", requireConfirmation: false },
+      },
+    });
+    await plugin.start();
+    const { tool, agentPlugin } = await channelTools(plugin, SCOPE_A);
+    expect(outputText(await tool("guarded-createOrder").execute({}, { messages: [] } as never))).toContain("confirmation_required");
+    expect(outputText(await tool("unguarded-createOrder").execute({}, { messages: [] } as never))).toBe("upstream-ok");
+    expect(guarded.callTool).not.toHaveBeenCalled();
+    expect(unguarded.callTool).toHaveBeenCalledOnce();
+    if (typeof agentPlugin.appendSystemPrompt !== "function") throw new Error("appendSystemPrompt unavailable");
+    expect(String(await agentPlugin.appendSystemPrompt({} as never))).toContain("confirmation_required");
+  });
+
   it("returns confirmation_required without calling upstream for a side-effect tool", async () => {
     const { plugin, client } = await buildPlugin();
     const { tool } = await channelTools(plugin, SCOPE_A);

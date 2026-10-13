@@ -27,6 +27,8 @@ import uuid
 SCHEMA = 1
 MAX_FILES = 10000
 MAX_BYTES = 512 * 1024 * 1024
+APPROVAL_FILE = "approved-output-changes.json"
+MAX_APPROVAL_BYTES = 1024 * 1024
 SHA = re.compile(r"[0-9a-f]{64}")
 WORKSPACE = re.compile(r"(?:core|(?:packages|plugins|providers|platforms)/[a-zA-Z0-9_-]+)")
 PACKAGE_FIELDS = ("name", "version", "type", "main", "exports", "dependencies",
@@ -281,9 +283,62 @@ def severe_startup_count(text):
     return sum(bool(context.search(line.lstrip())) and bool(pattern.search(line)) for line in text.splitlines())
 
 
-def changed_plan(files, current, previous=None):
+def read_approval(path, optional=False):
+    """Read one bounded regular control file, never a symlink or special node."""
+    path = Path(path).absolute()
+    require(path.resolve() == path, "linked approved output changes path")
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        require(optional, "missing approved output changes file")
+        return None
+    require(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= MAX_APPROVAL_BYTES, "invalid approved output changes file/size")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    with os.fdopen(os.open(path, flags), "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        require(stat.S_ISREG(opened.st_mode) and (opened.st_dev, opened.st_ino) == (info.st_dev, info.st_ino),
+                "approved output changes file changed while opening")
+        data = stream.read(MAX_APPROVAL_BYTES + 1)
+    require(len(data) == info.st_size and len(data) <= MAX_APPROVAL_BYTES, "approved output changes size changed/exceeded")
+    return data
+
+
+def validate_approved_output_changes(value, workspaces):
+    require(isinstance(value, dict) and set(value) == {"schema", "sourceSha", "changes"} and
+            type(value["schema"]) is int and value["schema"] == SCHEMA, "unsupported approved output changes")
+    require(isinstance(value["sourceSha"], str) and re.fullmatch(r"[0-9a-f]{40}", value["sourceSha"]), "invalid approval source SHA")
+    changes = value["changes"]
+    require(isinstance(changes, list) and 0 < len(changes) <= MAX_FILES, "invalid approved output change count")
+    require(workspaces is not None, "approval requires registered workspace outputs")
+    seen = set()
+    for change in changes:
+        require(isinstance(change, dict) and set(change) == {"path", "previousSha256", "currentSha256"}, "invalid approved output change")
+        path = output_path(change["path"], workspaces)
+        require(path not in seen, "duplicate approved output path")
+        seen.add(path)
+        for key in ("previousSha256", "currentSha256"):
+            sha = change[key]
+            require(sha is None or isinstance(sha, str) and SHA.fullmatch(sha), "invalid approved output SHA")
+        require(change["previousSha256"] != change["currentSha256"], "approved output change must have different hashes")
+    return value
+
+
+def changed_plan(files, current, previous=None, approved_output_changes=None, workspaces=None):
     new = {f["path"]: f for f in files}
-    if previous is None:
+    if approved_output_changes is not None:
+        approval = validate_approved_output_changes(approved_output_changes, workspaces)
+        require(previous is not None, "approved output changes require an existing release state")
+        require(approval["sourceSha"] == previous.get("sourceSha"), "approval source SHA differs from active release state")
+        old = previous["files"]
+        drift = {}
+        for path in set(old) | set(current):
+            before = old.get(path, {}).get("sha256")
+            after = current.get(path, {}).get("sha256")
+            if before != after:
+                drift[path] = {"previousSha256": before, "currentSha256": after}
+        approved = {c["path"]: {"previousSha256": c["previousSha256"], "currentSha256": c["currentSha256"]} for c in approval["changes"]}
+        require(approved == drift, "approved output changes do not exactly match current drift")
+    elif previous is None:
         require(set(current) <= set(new), "unknown output ownership; explicit upgrade required")
     else:
         old = previous["files"]
@@ -291,6 +346,7 @@ def changed_plan(files, current, previous=None):
         require(all(current[p]["sha256"] == old[p]["sha256"] for p in old), "foreign output change")
     writes = [f for p, f in new.items() if p not in current or current[p]["sha256"] != f["sha256"]]
     deletes = sorted(set(current) - set(new))
+    require(approved_output_changes is None or writes or deletes, "approved output adoption requires real writes/deletes; no-op has no backup")
     return {"write": writes, "delete": deletes}
 
 
@@ -425,10 +481,18 @@ class Deployment:
         before = self.snapshot()
         require(before["koishi"]["status"] == "running" and before["napcat"]["status"] == "running", "service not running")
         files = self.inventory()
-        plan = changed_plan(self.manifest["files"], files, previous)
+        # Reread on every preview/locked deploy; neither parsed approval nor its
+        # bytes may be cached across inventories. Even formatting edits stale it.
+        approval_data = read_approval(self.run / APPROVAL_FILE, optional=True)
+        approval = json.loads(approval_data) if approval_data is not None else None
+        require(approval_data is None or approval is not None, "unsupported approved output changes")
+        plan = changed_plan(self.manifest["files"], files, previous, approval, self.manifest["workspaces"])
         self.healthy()
         self.guards(before, True)
         value = {"before": before, "files": files, "runtimeSha256": fingerprint, "previous": previous}
+        if approval_data is not None:
+            value["approvedOutputChanges"] = approval
+            value["approvedOutputChangesSha256"] = hashlib.sha256(approval_data).hexdigest()
         return value, plan, hashlib.sha256(canonical(value)).hexdigest()
 
     def save_ledger(self, phase):
@@ -666,6 +730,8 @@ def remote_main():
     m = read_json(run / "manifest.json")
     owner = Deployment(run, profile, m)
     owner.guard_host()
+    require(args.action in {"inventory", "deploy"} or not (run / APPROVAL_FILE).exists() and not (run / APPROVAL_FILE).is_symlink(),
+            "approved output changes are deploy-only controls")
     require(digest(run / "runner.py") == m["runner"]["sha256"], "remote runner hash mismatch")
     with target_lock(owner.state, owner.source):
         if args.action in {"recover", "rollback"}:

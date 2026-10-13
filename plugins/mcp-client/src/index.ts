@@ -2,7 +2,6 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { jsonSchema, type AgentPlugin, type AgentTool, type AgentToolExecuteContext } from "@yesimbot/agent-runtime";
 import { Context, Logger, Schema, type Bot } from "koishi";
-import { DEFAULT_MANAGEMENT_TOOL_SCOPES, isToolAccessAllowed } from "koishi-plugin-yesimbot";
 import type { ArtifactStore, ChannelContext } from "koishi-plugin-yesimbot";
 
 import {
@@ -52,20 +51,13 @@ export default class McpClientPlugin {
   public static usage = "MCP 客户端插件，用于连接 MCP 服务器并注册工具";
   public static inject = ["yesimbot"];
   public static Config: Schema<McpClientConfig> = Schema.object({
-    allowedScopes: Schema.array(
-      Schema.object({
-        platform: Schema.string().required().description("平台名称；* 匹配任意平台"),
-        channelId: Schema.string().required().description("频道 ID；私聊按 QQ 号授权时填写 *"),
-        userId: Schema.string().description("私聊 QQ 号；群聊/频道规则留空"),
-        selfId: Schema.string().description("可选的机器人账号 ID；留空匹配全部机器人"),
-      }),
-    )
-      .role("table")
-      .default(DEFAULT_MANAGEMENT_TOOL_SCOPES.map((scope) => ({ ...scope, selfId: "" })))
-      .description("MCP 工具白名单；默认授权 QQ 1049700117 的 OneBot 私聊，设置为空数组可拒绝全部工具。私聊按 QQ 号，群聊/频道按 channelId 授权"),
     mcpServers: Schema.dict(
       Schema.intersect([
-        Schema.object({ enable: Schema.boolean().default(true).description("是否启用"), type: Schema.union(["stdio", "http", "sse"]) }),
+        Schema.object({
+          enable: Schema.boolean().default(true).description("是否启用"),
+          requireConfirmation: Schema.boolean().default(true).description("是否要求确认有外部副作用或风险未知的工具；关闭后直接执行"),
+          type: Schema.union(["stdio", "http", "sse"]),
+        }),
         Schema.union([
           Schema.object({
             type: Schema.const("stdio").required(),
@@ -122,10 +114,6 @@ export default class McpClientPlugin {
   }
 
   public async setup(scope: ChannelContext, _bot: Bot): Promise<AgentPlugin> {
-    if (!isToolAccessAllowed(scope, this.config.allowedScopes)) {
-      return { name: "mcp-client", tools: [] };
-    }
-
     const resources = await this.ctx.yesimbot.resource.get(scope);
     const scopeKey = deriveChannelScopeKey(scope);
     const confirmations = new ConfirmationStore(() => Date.now());
@@ -193,7 +181,7 @@ export default class McpClientPlugin {
         entries[tool.name] = {
           serverName: name,
           upstreamToolName: tool.name,
-          requiresConfirmation: classifyToolRisk(tool.name, tool.description) === "side-effect",
+          requiresConfirmation: this.config.mcpServers[name]?.requireConfirmation !== false && classifyToolRisk(tool.name, tool.description) === "side-effect",
           tool: {
             name: exposedName,
             description: tool.description,

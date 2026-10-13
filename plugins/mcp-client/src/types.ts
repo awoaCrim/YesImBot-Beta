@@ -1,7 +1,6 @@
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { ToolAccessRule } from "koishi-plugin-yesimbot";
 
 export type McpServer = McpStdioServer | McpHttpServer | McpSseServer;
 
@@ -13,6 +12,8 @@ export interface McpStdioServer {
   args?: string[];
   env?: Record<string, string> | string;
   enable?: boolean;
+  /** Defaults to true; false bypasses confirmation for this server's tools. */
+  requireConfirmation?: boolean;
 }
 
 export interface McpHttpServer {
@@ -22,6 +23,8 @@ export interface McpHttpServer {
   /** Owner-only file holding a Bearer token. Mutually exclusive with an explicit `Authorization` header. */
   bearerTokenFile?: string;
   enable?: boolean;
+  /** Defaults to true; false bypasses confirmation for this server's tools. */
+  requireConfirmation?: boolean;
 }
 
 export interface McpSseServer {
@@ -31,10 +34,10 @@ export interface McpSseServer {
   /** Owner-only file holding a Bearer token. Mutually exclusive with an explicit `Authorization` header. */
   bearerTokenFile?: string;
   enable?: boolean;
+  /** Defaults to true; false bypasses confirmation for this server's tools. */
+  requireConfirmation?: boolean;
 }
 
 export interface McpClientConfig {
   mcpServers: Record<string, McpServer>;
-  /** Sensitive MCP tools are exposed only to explicitly authorized scopes. */
-  allowedScopes?: ToolAccessRule[];
 }

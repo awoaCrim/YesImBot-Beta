@@ -169,6 +169,34 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "foreign"):
             runner.changed_plan(manifest()["files"], old, previous)
 
+    def test_approval_control_reader_rejects_empty_oversized_and_missing_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory).resolve() / "approval.json"
+            self.assertIsNone(runner.read_approval(path, optional=True))
+            with self.assertRaises(RuntimeError):
+                runner.read_approval(path)
+            for data in (b"", b"x" * 5):
+                path.write_bytes(data)
+                with patch.object(runner, "MAX_APPROVAL_BYTES", 4), self.assertRaises(RuntimeError):
+                    runner.read_approval(path)
+            path.write_bytes(b"{}")
+            self.assertEqual(runner.read_approval(path), b"{}")
+
+    @unittest.skipUnless(os.name == "posix", "symlink creation requires host support")
+    def test_approval_control_reader_rejects_symlink_and_special_node(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            target = root / "real.json"
+            target.write_bytes(b"{}")
+            linked = root / "linked.json"
+            linked.symlink_to(target)
+            with self.assertRaises(RuntimeError):
+                runner.read_approval(linked)
+            fifo = root / "fifo"
+            os.mkfifo(fifo)
+            with self.assertRaises(RuntimeError):
+                runner.read_approval(fifo)
+
     def test_prefix_digest_rejects_shrink_and_changed_prefix_but_allows_append(self):
         with tempfile.TemporaryDirectory() as directory:
             p = Path(directory) / "session"
@@ -225,6 +253,43 @@ class GitHubTests(unittest.TestCase):
         for alias in ("-oProxyCommand=evil", "ssh1;echo", "user@host"):
             with self.assertRaises(RuntimeError):
                 cli.ssh_call(alias, ["true"])
+
+    def test_optional_approval_control_is_uploaded_with_exact_bytes_and_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            bundle = root / "bundle"
+            bundle.mkdir()
+            (bundle / "manifest.json").write_bytes(runner.canonical(manifest()))
+            (bundle / "runner.py").write_bytes(b"synthetic test runner")
+            approval = {"schema": 1, "sourceSha": "e" * 40, "changes": [
+                {"path": "core/dist/index.cjs", "previousSha256": "1" * 64, "currentSha256": "2" * 64}
+            ]}
+            path = root / "approval.json"
+            path.write_text(json.dumps(approval, indent=2))
+            with patch.object(cli, "ssh_call", return_value={"status": "controls_ready"}) as call:
+                cli.controls(bundle, {"stateRoot": "/owned/state"}, "ssh1", path)
+            self.assertEqual(call.call_count, 1)
+            args = call.call_args.args
+            expected = json.loads(args[1][-1])
+            self.assertEqual(set(expected), {"manifest.json", "runner.py", "profile.json", "approved-output-changes.json"})
+            self.assertEqual(expected["approved-output-changes.json"]["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+            with tarfile.open(fileobj=io.BytesIO(args[2]), mode="r:") as archive:
+                self.assertEqual(set(archive.getnames()), set(expected))
+                self.assertEqual(archive.extractfile("approved-output-changes.json").read(), path.read_bytes())
+            with patch.object(cli, "ssh_call", return_value={"status": "controls_ready"}) as call:
+                cli.controls(bundle, {"stateRoot": "/owned/state"}, "ssh1")
+            self.assertEqual(set(json.loads(call.call_args.args[1][-1])), {"manifest.json", "runner.py", "profile.json"})
+
+    def test_cli_and_api_reject_approval_for_non_deploy_actions(self):
+        script = Path(__file__).resolve().parents[1] / "release.py"
+        for action in ("status", "recover", "rollback", "verify-target"):
+            with self.subTest(action=action):
+                result = subprocess.run([sys.executable, str(script), action, "beta-20261013-aaaaaaaaaaaa", "--approved-output-changes", "unused.json"], capture_output=True)
+                self.assertEqual(result.returncode, 2)
+                with self.assertRaisesRegex(RuntimeError, "deploy-only"), patch.object(cli, "download") as download, patch.object(cli, "controls") as controls:
+                    cli.target_action("verify" if action == "verify-target" else action, cli.REPOSITORY, "unused", "ssh1", "missing-profile.json", approved_output_changes="unused.json")
+                download.assert_not_called()
+                controls.assert_not_called()
 
     def test_cli_help_exits_successfully(self):
         scripts = Path(__file__).resolve().parents[1]
@@ -313,6 +378,23 @@ class FakeDeployment(runner.Deployment):
         return patch.object(runner, "inspect", side_effect=lambda name: copy.deepcopy(self.world[name])), patch.object(runner, "command", side_effect=self.execute)
 
 
+def adoption_fixture(root):
+    owner = FakeDeployment(root, old=b"hotpatch", extras={"core/dist/index.cjs.bak": b"managed old"})
+    actual = owner.inventory()
+    managed = copy.deepcopy(actual)
+    managed.pop("core/dist/index.cjs.bak")
+    managed["core/dist/index.cjs"].update(entry("core/dist/index.cjs", b"managed old"))
+    previous = {"files": managed, "sourceSha": "e" * 40, "workspacePaths": ["core"], "lastActivatedRun": "older-backup"}
+    approval = {"schema": 1, "sourceSha": previous["sourceSha"], "changes": [
+        {"path": path, "previousSha256": managed.get(path, {}).get("sha256"), "currentSha256": actual.get(path, {}).get("sha256")}
+        for path in sorted(set(managed) | set(actual))
+        if managed.get(path, {}).get("sha256") != actual.get(path, {}).get("sha256")
+    ]}
+    runner.atomic_json(owner.state / "release-state.json", previous)
+    runner.atomic_json(owner.run / "approved-output-changes.json", approval)
+    return owner, actual, previous, approval
+
+
 class LifecycleTests(unittest.TestCase):
     def setUp(self):
         self.signals = patch.object(runner.signal, "signal")
@@ -323,6 +405,156 @@ class LifecycleTests(unittest.TestCase):
         value, plan, marker = owner.preflight()
         members = [(f["path"], b"new", None) for f in plan["write"]]
         return owner.deploy(marker, io.BytesIO(archive_bytes(members)))
+
+    def test_approved_adoption_backs_up_actual_hotpatch_and_extra_then_rolls_back_exactly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner, actual, previous, _ = adoption_fixture(Path(directory).resolve())
+            inspect_patch, command_patch = owner.patches()
+            with inspect_patch, command_patch, patch.object(runner.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+                result = self.run_owner(owner)
+                self.assertEqual(result["status"], "activated")
+                self.assertEqual((owner.run / "app-before/core/dist/index.cjs").read_bytes(), b"hotpatch")
+                self.assertEqual((owner.run / "app-before/core/dist/index.cjs.bak").read_bytes(), b"managed old")
+                self.assertEqual(runner.read_json(owner.run / "ledger.json")["oldFiles"], actual)
+                self.assertFalse((owner.source / "core/dist/index.cjs.bak").exists())
+                self.assertEqual((owner.source / "core/dist/index.cjs").read_bytes(), b"new")
+                self.assertEqual(owner.previous()["sourceSha"], "a" * 40)
+                self.assertEqual(owner.rollback(explicit=True)["status"], "rolled_back")
+                self.assertEqual(owner.inventory(), actual)
+                self.assertEqual(owner.previous(), previous)
+                self.assertEqual(owner.config.read_bytes(), b"private config")
+                self.assertEqual((owner.data / "channels/session.jsonl").read_bytes(), b"private old session\n")
+
+    def test_adoption_failure_restores_hotpatch_extra_and_old_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner, actual, previous, _ = adoption_fixture(Path(directory).resolve())
+            owner.fail = "import"
+            inspect_patch, command_patch = owner.patches()
+            with inspect_patch, command_patch:
+                with self.assertRaisesRegex(RuntimeError, "import"):
+                    self.run_owner(owner)
+            self.assertEqual(owner.inventory(), actual)
+            self.assertEqual(owner.previous(), previous)
+            self.assertEqual(owner.world["koishi"]["status"], "running")
+            self.assertFalse((owner.state / "pending.json").exists())
+
+    def test_adoption_rejects_unapproved_drift_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner, actual, previous, _ = adoption_fixture(Path(directory).resolve())
+            (owner.run / "approved-output-changes.json").unlink()
+            inspect_patch, command_patch = owner.patches()
+            with inspect_patch, command_patch, self.assertRaisesRegex(RuntimeError, "foreign"):
+                owner.preflight()
+            self.assertEqual(owner.calls, [])
+            self.assertEqual(owner.inventory(), actual)
+            self.assertEqual(owner.previous(), previous)
+
+    def test_adoption_requires_exact_source_paths_and_both_hashes(self):
+        mutations = [
+            lambda a: a.update(schema=2),
+            lambda a: a.update(sourceSha="f" * 40),
+            lambda a: a.update(changes=[]),
+            lambda a: a["changes"].append(copy.deepcopy(a["changes"][0])),
+            lambda a: a["changes"].pop(),
+            lambda a: a["changes"][0].update(path="core/src/index.ts"),
+            lambda a: a["changes"][0].update(path="../escape"),
+            lambda a: a["changes"][0].update(previousSha256="f" * 64),
+            lambda a: a["changes"][0].update(currentSha256="f" * 64),
+            lambda a: a["changes"][0].update(currentSha256="bad"),
+            lambda a: a["changes"][0].update(previousSha256=None, currentSha256=None),
+            lambda a: a["changes"].append({"path": "core/dist/not-changed.js", "previousSha256": None, "currentSha256": "f" * 64}),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as directory:
+                owner, actual, previous, approval = adoption_fixture(Path(directory).resolve())
+                mutate(approval)
+                runner.atomic_json(owner.run / "approved-output-changes.json", approval)
+                inspect_patch, command_patch = owner.patches()
+                with inspect_patch, command_patch, self.assertRaises(RuntimeError):
+                    owner.preflight()
+                self.assertEqual(owner.calls, [])
+                self.assertEqual(owner.inventory(), actual)
+                self.assertEqual(owner.previous(), previous)
+
+    def test_adoption_refuses_any_additional_output_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner, _, previous, _ = adoption_fixture(Path(directory).resolve())
+            (owner.source / "core/dist/unreviewed.js").write_bytes(b"unreviewed")
+            inspect_patch, command_patch = owner.patches()
+            with inspect_patch, command_patch, self.assertRaises(RuntimeError):
+                owner.preflight()
+            self.assertEqual(owner.calls, [])
+            self.assertEqual(owner.previous(), previous)
+            self.assertEqual((owner.source / "core/dist/unreviewed.js").read_bytes(), b"unreviewed")
+
+    def test_adoption_reloads_approval_before_deploy_and_does_not_stop_on_stale_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner, actual, previous, approval = adoption_fixture(Path(directory).resolve())
+            inspect_patch, command_patch = owner.patches()
+            with inspect_patch, command_patch:
+                _, _, marker = owner.preflight()
+                approval["changes"][0]["currentSha256"] = "f" * 64
+                runner.atomic_json(owner.run / "approved-output-changes.json", approval)
+                with self.assertRaises(RuntimeError):
+                    owner.deploy(marker, io.BytesIO())
+            self.assertEqual(owner.calls, [])
+            self.assertEqual(owner.inventory(), actual)
+            self.assertEqual(owner.previous(), previous)
+
+    def test_even_format_only_approval_change_invalidates_inventory_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner, actual, previous, approval = adoption_fixture(Path(directory).resolve())
+            inspect_patch, command_patch = owner.patches()
+            with inspect_patch, command_patch:
+                _, _, marker = owner.preflight()
+                (owner.run / "approved-output-changes.json").write_text(json.dumps(approval, indent=2))
+                with self.assertRaisesRegex(RuntimeError, "inventory changed"):
+                    owner.deploy(marker, io.BytesIO())
+            self.assertEqual(owner.calls, [])
+            self.assertEqual(owner.inventory(), actual)
+            self.assertEqual(owner.previous(), previous)
+
+    def test_adoption_requires_a_managed_previous_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner, _, _, _ = adoption_fixture(Path(directory).resolve())
+            (owner.state / "release-state.json").unlink()
+            inspect_patch, command_patch = owner.patches()
+            with inspect_patch, command_patch, self.assertRaises(RuntimeError):
+                owner.preflight()
+            self.assertEqual(owner.calls, [])
+            self.assertFalse((owner.state / "release-state.json").exists())
+
+    def test_adoption_of_already_equal_payload_never_updates_ledger_without_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner, actual, previous, approval = adoption_fixture(Path(directory).resolve())
+            (owner.source / "core/dist/index.cjs.bak").unlink()
+            actual.pop("core/dist/index.cjs.bak")
+            approval["changes"] = [approval["changes"][0]]
+            runner.atomic_json(owner.run / "approved-output-changes.json", approval)
+            owner.manifest["files"] = [entry("core/dist/index.cjs", b"hotpatch")]
+            inspect_patch, command_patch = owner.patches()
+            with inspect_patch, command_patch, self.assertRaises(RuntimeError):
+                self.run_owner(owner)
+            self.assertEqual(owner.calls, [])
+            self.assertEqual(owner.inventory(), actual)
+            self.assertEqual(owner.previous(), previous)
+
+    def test_adoption_handles_explicitly_approved_missing_managed_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner, _, previous, approval = adoption_fixture(Path(directory).resolve())
+            missing = "core/dist/deleted.js"
+            previous["files"][missing] = {**previous["files"]["core/dist/index.cjs"], **entry(missing, b"deleted externally")}
+            approval["changes"].append({"path": missing, "previousSha256": previous["files"][missing]["sha256"], "currentSha256": None})
+            runner.atomic_json(owner.state / "release-state.json", previous)
+            runner.atomic_json(owner.run / "approved-output-changes.json", approval)
+            inspect_patch, command_patch = owner.patches()
+            with inspect_patch, command_patch, patch.object(runner.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+                result = self.run_owner(owner)
+                self.assertEqual(result["status"], "activated")
+                self.assertFalse((owner.run / "app-before" / missing).exists())
+                owner.rollback(explicit=True)
+                self.assertFalse((owner.source / missing).exists())
+                self.assertEqual(owner.previous(), previous)
 
     def test_success_then_explicit_application_only_rollback(self):
         with tempfile.TemporaryDirectory() as directory:
