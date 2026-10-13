@@ -63,15 +63,34 @@ function dialogue(request: WireRequest): WireTurn[] {
   return (request.contents ?? request.messages ?? []).filter((turn) => turn.role !== "system" && turn.role !== "developer");
 }
 
+function systemBlocks(request: WireRequest): string[] {
+  return request.systemInstruction?.parts.map((part) => part.text ?? "") ?? request.messages?.filter((turn) => turn.role === "system").map(body) ?? [];
+}
+
 function systemText(request: WireRequest): string {
-  return (
-    request.systemInstruction?.parts.map((part) => part.text ?? "").join("\n") ??
-    request.messages
-      ?.filter((turn) => turn.role === "system")
-      .map(body)
-      .join("\n") ??
-    ""
-  );
+  return systemBlocks(request).join("\n");
+}
+
+function expectCorePromptBlocks(request: WireRequest, provider: Provider): void {
+  // This runtime fixture keeps defaultConfig.customInnerThought enabled.
+  const headings = ["# 运行契约", "# 角色", "# 互动策略", "# 能力与证据边界", "# 内心判断", "# 完整回复编排"];
+  const blocks = systemBlocks(request);
+  const all = systemText(request);
+  const offsets = headings.map((heading) => all.indexOf(heading));
+  expect(offsets.every((offset) => offset >= 0)).toBe(true);
+  expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
+  for (const heading of headings) expect(occurrences(all, heading)).toBe(1);
+  for (const marker of ["SYNTHETIC_CHARACTER_DEFINITION", "SYNTHETIC_CARD_RULE", "SYNTHETIC_POST_RULE"]) {
+    expect(occurrences(all, marker)).toBe(1);
+    expect(all.indexOf(marker)).toBeGreaterThan(all.indexOf("# 角色"));
+    expect(all.indexOf(marker)).toBeLessThan(all.indexOf("# 互动策略"));
+  }
+  if (provider === "openai") {
+    expect(blocks.slice(0, headings.length).map((block) => block.split("\n")[0])).toEqual(headings);
+  } else {
+    // Google may aggregate system messages into systemInstruction; content/order must survive.
+    expect(request.systemInstruction?.parts.length).toBeGreaterThan(0);
+  }
 }
 
 function text(request: WireRequest): string {
@@ -242,6 +261,7 @@ async function fixture(provider: Provider, magic: boolean, enabled: boolean, scr
     );
     if (result.kind === "run") await result.done;
     await runtime.wait();
+    for (const request of requests) expectCorePromptBlocks(request, provider);
   };
   return { runtime, channel, bot, roleplay, requests, fetch, handle, onTurnFinish };
 }

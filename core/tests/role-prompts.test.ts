@@ -46,17 +46,24 @@ describe("unified main-Agent role ownership", () => {
     await writeFile(join(basePath, "AGENTS.md"), "AGENTS_SENTINEL");
     const blocks = await buildCoreSystemPrompt({ basePath, channel: scope, selfId: "bot", roleProfile: profile });
     const all = blocks.map((block) => String(block.content)).join("\n");
-    const order = ["# 运行契约", "# 角色", "# 互动策略", "# 能力与证据边界", "AGENTS_SENTINEL", "<runtime_context>"];
+    const roleBlock = blocks.find((block) => String(block.content).startsWith("# 角色\n"));
+    const roleText = String(roleBlock?.content);
+    expect(roleBlock).toBeDefined();
+    expect(blocks.filter((block) => String(block.content).startsWith("# 角色\n"))).toHaveLength(1);
+    const order = ["# 运行契约", "# 角色", "# 互动策略", "# 能力与证据边界", "# 完整回复编排", "AGENTS_SENTINEL", "<runtime_context>"];
     // runtime_context is mentioned as reference in interaction; the actual data block is last.
     const offsets = order.slice(0, -1).map((value) => all.indexOf(value));
     expect(offsets.every((offset) => offset >= 0)).toBe(true);
     expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
     expect(String(blocks.at(-1)?.content)).toMatch(/^<runtime_context>/);
-    if (identity) expect(all).toContain("<persona>\n" + identity + "\n</persona>");
+    if (identity) expect(roleText).toContain("<persona>\n" + identity + "\n</persona>");
     else expect(all).not.toContain("Athena");
     expect(all.split("CARD_DEFINITION_SENTINEL")).toHaveLength(hasCard ? 2 : 1);
     if (hasCard) {
-      expect(all.indexOf("CARD_DEFINITION_SENTINEL")).toBeLessThan(all.indexOf("CARD_INSTRUCTION_SENTINEL"));
+      for (const marker of ["CARD_DEFINITION_SENTINEL", "CARD_INSTRUCTION_SENTINEL", "EXAMPLE_SENTINEL"]) {
+        expect(blocks.filter((block) => String(block.content).includes(marker))).toEqual([roleBlock]);
+      }
+      expect(roleText.indexOf("CARD_DEFINITION_SENTINEL")).toBeLessThan(roleText.indexOf("CARD_INSTRUCTION_SENTINEL"));
       expect(all.indexOf("EXAMPLE_SENTINEL")).toBeLessThan(all.indexOf("# 互动策略"));
       if (identity) expect(all).toContain("补充角色材料：服从主身份与行为文档");
     }
