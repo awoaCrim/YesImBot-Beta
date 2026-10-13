@@ -118,6 +118,29 @@ export class Runtimes {
       const will = await this.agents.setupWill(willContext, session);
       // The channel-local holder collects exactly one typed sticker provider before the runtime is
       // frozen. Capability generation changes invalidate prepared phases.
+      const channelOutputTools = new Set<string>();
+      const channelOutputRegistrations = new Map<string, number>();
+      const registerChannelOutputTools = (toolNames: readonly string[]) => {
+        const registered = [...new Set(toolNames.filter((toolName) => toolName.trim().length > 0))];
+        for (const toolName of registered) {
+          channelOutputRegistrations.set(toolName, (channelOutputRegistrations.get(toolName) ?? 0) + 1);
+          channelOutputTools.add(toolName);
+        }
+        let disposed = false;
+        return () => {
+          if (disposed) return;
+          disposed = true;
+          for (const toolName of registered) {
+            const count = channelOutputRegistrations.get(toolName) ?? 0;
+            if (count <= 1) {
+              channelOutputRegistrations.delete(toolName);
+              channelOutputTools.delete(toolName);
+            } else {
+              channelOutputRegistrations.set(toolName, count - 1);
+            }
+          }
+        };
+      };
       let providerGeneration = 0;
       let frozen = false;
       let stickerProvider: ReplyStickerProvider | undefined;
@@ -140,6 +163,10 @@ export class Runtimes {
                 }
               };
             },
+          },
+          channelOutput: {
+            version: 1 as const,
+            registerTools: registerChannelOutputTools,
           },
         })
         .catch((cause) => {
@@ -183,6 +210,7 @@ export class Runtimes {
         roleProfile,
         replyStillCurrent: stillCurrent,
         ...(stickerProvider ? { sticker: stickerProvider } : {}),
+        channelOutputTools,
         messageBatch: this.messageBatches.select(channel.context),
         archiveMaxBytes: this.config.session.archive.maxKB * 1024,
         ...(this.channels.compactFragments ? { compactFragments: this.channels.compactFragments } : {}),

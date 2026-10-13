@@ -34,6 +34,13 @@ export interface ChannelPluginSetupContext {
    * never imports plugin storage or types; absence keeps standalone plugin behavior intact.
    */
   readonly replyDelivery?: ReplyDeliverySetupContext;
+  /** Optional Core-owned boundary for tools that directly send content to the current channel. */
+  readonly channelOutput?: ChannelOutputSetupContext;
+}
+
+export interface ChannelOutputSetupContext {
+  readonly version: 1;
+  readonly registerTools: (toolNames: readonly string[]) => Disposer;
 }
 
 export interface ReplyDeliverySetupContext {

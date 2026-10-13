@@ -11,6 +11,7 @@ export default YesImBotService;
 export type {
   ChannelPlugin,
   ChannelPluginSetupContext,
+  ChannelOutputSetupContext,
   ReplyDeliverySetupContext,
   ReplyPart,
   ReplyStickerFrame,

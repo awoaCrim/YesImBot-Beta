@@ -3,7 +3,7 @@ import type { ReadableStream } from "node:stream/web";
 import { jsonSchema, type AgentPlugin, type AgentTool } from "@yesimbot/agent-runtime";
 import { Context, Logger, Schema, type Bot } from "koishi";
 import { DEFAULT_MANAGEMENT_TOOL_SCOPES, isToolAccessAllowed } from "koishi-plugin-yesimbot";
-import type { ChannelResources, ChannelContext, ToolAccessRule } from "koishi-plugin-yesimbot";
+import type { ChannelPluginSetupContext, ChannelResources, ChannelContext, ToolAccessRule } from "koishi-plugin-yesimbot";
 
 import { projectAnimatedImages } from "./animated-image.js";
 import { createForwardReader, type ForwardImageRequest, type ForwardResult, type ForwardToolInput } from "./forward.js";
@@ -99,15 +99,17 @@ export default class OnebotUtilsPlugin {
     this.dispose = this.ctx.yesimbot.agent.use(this);
   }
 
-  public async setup(scope: ChannelContext, bot: Bot): Promise<AgentPlugin | null> {
+  public async setup(scope: ChannelContext, bot: Bot, runtime?: ChannelPluginSetupContext): Promise<AgentPlugin | null> {
     if (scope.platform !== "onebot") return null;
     const allowed = isToolAccessAllowed(scope, this.config.allowedScopes);
     const resources = allowed ? await this.ctx.yesimbot.resource.get(scope) : undefined;
+    const disposeChannelOutput = runtime?.channelOutput?.version === 1 ? runtime.channelOutput.registerTools([TOOLS.SEND_FORWARD_MESSAGE]) : undefined;
     return {
       name: "onebot-utils",
       tools: allowed ? createOneBotTools(this.ctx, bot, this.config, scope, resources!) : [],
       onAppend: (entries) => projectAnimatedImages(entries, { attachImageSummary: this.config.attachImageSummary }),
       transformEntries: (entries) => projectAnimatedImages(entries, { attachImageSummary: this.config.attachImageSummary }),
+      stop: () => disposeChannelOutput?.(),
     } satisfies AgentPlugin;
   }
 

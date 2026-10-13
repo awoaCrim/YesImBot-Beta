@@ -188,13 +188,17 @@ describe("StickerManagerPlugin", () => {
   it("modern authored hides standalone delivery and registers one disposable capability", async () => {
     const harness = createHarness({ enableSteal: false, tagMode: true });
     const unregister = vi.fn();
+    const unregisterChannelOutput = vi.fn();
     const registerSticker = vi.fn((_provider: ReplyStickerProvider) => unregister);
+    const registerTools = vi.fn((_names: readonly string[]) => unregisterChannelOutput);
     const runtime = {
       imageProjection: new EphemeralImageProjectionStore(),
       replyDelivery: { version: 1 as const, ownership: "authored" as const, registerSticker },
+      channelOutput: { version: 1 as const, registerTools },
     };
     const plugin = await harness.start({ selfId: "bot" }, scope, runtime);
     expect(registerSticker).toHaveBeenCalledOnce();
+    expect(registerTools).toHaveBeenCalledWith(["sticker_send"]);
     await expectToolNames(plugin, ["sticker_preview", "sticker_categories", "sticker_search", "sticker_tags"]);
     const prompt = await pluginPrompt(plugin);
     expect(prompt).not.toContain("sticker_send");
@@ -208,6 +212,7 @@ describe("StickerManagerPlugin", () => {
     await plugin?.stop?.();
     await plugin?.stop?.();
     expect(unregister).toHaveBeenCalledOnce();
+    expect(unregisterChannelOutput).toHaveBeenCalledOnce();
     expect(provider.revision).toBeGreaterThan(revision);
     expect(provider.status("turn")).toBe("unavailable");
     await expect(provider.preflight({ stickerId: "s", turnId: "turn", messages: [] })).resolves.toEqual({ error: "StickerCapabilityRetired" });

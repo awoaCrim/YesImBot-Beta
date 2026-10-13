@@ -185,6 +185,7 @@ async function runtime(
   will: Record<string, unknown> = { decide: state.decide, observe: state.observe },
   compactFragments?: ChannelRuntimeOptions["compactFragments"],
   historyProjection?: ChannelRuntimeOptions["historyProjection"],
+  channelOutputTools?: ChannelRuntimeOptions["channelOutputTools"],
 ) {
   const root = await mkdtemp(join(tmpdir(), "yesimbot-runtime-"));
   const channel = new Channel(context, root);
@@ -201,6 +202,7 @@ async function runtime(
     messageBatch,
     ...(compactFragments ? { compactFragments } : {}),
     historyProjection,
+    ...(channelOutputTools ? { channelOutputTools } : {}),
   });
   await value.init();
   return { value, channel, root };
@@ -780,39 +782,64 @@ describe("ChannelRuntime scheduling", () => {
     }
   });
 
-  it("blocks send_message for a silent post and allows it otherwise", async () => {
-    let blockedDuringTurn: unknown;
-    let allowedAfterTurn: unknown;
+  it("blocks authored and registered channel output for a silent post and allows it otherwise", async () => {
+    let blockedDuringTurn: Record<string, unknown> = {};
+    let allowedAfterTurn: Record<string, unknown> = {};
     const plugin = () =>
       vi
         .mocked(createAgent)
         .mock.calls.at(-1)?.[0]
         .plugins?.find((item) => item.name === "core.silent-turn");
-    state.run.mockImplementation(() =>
-      (async function* () {
-        yield { type: "turn.start", turnId: "turn-1" };
-        blockedDuringTurn = await plugin()?.beforeToolCall?.(
-          { toolCallId: "c1", toolName: "send_message", args: {} } as never,
-          {
-            turnId: "turn-1",
-          } as never,
-        );
-        yield { type: "turn.done", turnId: "turn-1" };
-      })(),
-    );
-    const { value, root } = await runtime();
-    try {
-      const result = await value.post(event, { delivery: "silent" });
-      if (result.kind === "run") await result.done;
-      allowedAfterTurn = await plugin()?.beforeToolCall?.(
-        { toolCallId: "c2", toolName: "send_message", args: {} } as never,
+    const check = (toolName: string, toolCallId: string) =>
+      plugin()?.beforeToolCall?.(
+        { toolCallId, toolName, args: {} } as never,
         {
           turnId: "turn-1",
         } as never,
       );
+    state.run.mockImplementation(() =>
+      (async function* () {
+        yield { type: "turn.start", turnId: "turn-1" };
+        blockedDuringTurn = {
+          send: await check("send_message", "c1"),
+          forward: await check("onebot_send_forward_message", "c2"),
+          sticker: await check("sticker_send", "c3"),
+          unrelated: await check("onebot_get_forward_message", "c4"),
+        };
+        yield { type: "turn.done", turnId: "turn-1" };
+      })(),
+    );
+    const { value, root } = await runtime(
+      undefined,
+      {},
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      new Set(["onebot_send_forward_message", "sticker_send"]),
+    );
+    try {
+      const result = await value.post(event, { delivery: "silent" });
+      if (result.kind === "run") await result.done;
+      allowedAfterTurn = {
+        send: await check("send_message", "c5"),
+        forward: await check("onebot_send_forward_message", "c6"),
+        sticker: await check("sticker_send", "c7"),
+        unrelated: await check("onebot_get_forward_message", "c8"),
+      };
 
-      expect(blockedDuringTurn).toMatchObject({ type: "block" });
-      expect(allowedAfterTurn).toEqual({ type: "allow" });
+      expect(blockedDuringTurn.send).toMatchObject({ type: "block" });
+      expect(blockedDuringTurn.forward).toMatchObject({ type: "block" });
+      expect(blockedDuringTurn.sticker).toMatchObject({ type: "block" });
+      expect(blockedDuringTurn.unrelated).toEqual({ type: "allow" });
+      expect(allowedAfterTurn).toEqual({
+        send: { type: "allow" },
+        forward: { type: "allow" },
+        sticker: { type: "allow" },
+        unrelated: { type: "allow" },
+      });
     } finally {
       await value.stop();
       await rm(root, { recursive: true, force: true });

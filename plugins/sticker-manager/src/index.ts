@@ -110,6 +110,13 @@ export default class StickerManagerPlugin {
   ): AgentPlugin {
     const modern = runtime?.replyDelivery?.version === 1;
     const deliveryMode: "legacy" | "authored" = modern ? runtime.replyDelivery!.ownership : "legacy";
+    const disposeChannelOutput = runtime?.channelOutput?.version === 1 ? runtime.channelOutput.registerTools(["sticker_send"]) : undefined;
+    let channelOutputDisposed = false;
+    const disposeRegisteredChannelOutput = () => {
+      if (channelOutputDisposed) return;
+      channelOutputDisposed = true;
+      disposeChannelOutput?.();
+    };
     const artifactIds = new Map<string, string>();
     const sendSlot = new StickerSendSlot();
     const previewGate = new StickerPreviewGate();
@@ -186,6 +193,7 @@ export default class StickerManagerPlugin {
         retired = true;
         activeTurn = undefined;
         disposeDelivery?.();
+        disposeRegisteredChannelOutput();
         delivery.stop();
       },
       prepareStep: async (messages, context) => {

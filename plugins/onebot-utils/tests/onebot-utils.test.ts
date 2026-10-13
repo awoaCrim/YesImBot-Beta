@@ -142,6 +142,25 @@ describe("onebot-utils plugin", () => {
     expect(dispose).toHaveBeenCalledOnce();
   });
 
+  it("registers and disposes the direct forward sender as channel output", async () => {
+    const { ctx, plugins } = createContext();
+    const plugin = new OnebotUtilsPlugin(ctx as never, {});
+    await plugin.start();
+    const unregister = vi.fn();
+    const registerTools = vi.fn((_names: readonly string[]) => unregister);
+    const runtimePlugin = await plugins[0]!.setup(
+      createChannelContext() as never,
+      {} as never,
+      {
+        channelOutput: { version: 1, registerTools },
+      } as never,
+    );
+
+    expect(registerTools).toHaveBeenCalledWith(["onebot_send_forward_message"]);
+    await runtimePlugin?.stop?.();
+    expect(unregister).toHaveBeenCalledOnce();
+  });
+
   it("declares the enabled-tool configuration fields", () => {
     const fields = mocks.schema.object.mock.calls.at(-1)?.[0] as Record<string, unknown>;
     expect(Object.keys(fields)).toEqual(["allowedScopes", "enabledTools", "parseImages", "attachImageSummary", "maxForwardPageChars"]);

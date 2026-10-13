@@ -97,6 +97,35 @@ describe("actual Runtimes reply registration boundary", () => {
     expect(selectedAgent().tools?.some((tool) => tool.name === "prepare_reply")).toBe(false);
   });
 
+  it("scopes channel-output tool registration to one runtime and removes only disposed owners", async () => {
+    const f = await fixture();
+    let firstDispose!: () => void;
+    let secondDispose!: () => void;
+    f.agents.use({
+      setup: (_channel, _bot, context) => {
+        const register = context?.channelOutput;
+        if (!register) throw new Error("missing channel output setup");
+        firstDispose = register.registerTools(["onebot_send_forward_message", "", "onebot_send_forward_message"]);
+        return { name: "first-output-owner", stop: firstDispose };
+      },
+    });
+    f.agents.use({
+      setup: (_channel, _bot, context) => {
+        const register = context?.channelOutput;
+        if (!register) throw new Error("missing channel output setup");
+        secondDispose = register.registerTools(["onebot_send_forward_message"]);
+        return { name: "second-output-owner", stop: secondDispose };
+      },
+    });
+    const runtime = await f.get();
+    const options = Reflect.get(runtime, "options") as { channelOutputTools?: ReadonlySet<string> };
+    expect([...(options.channelOutputTools ?? [])]).toEqual(["onebot_send_forward_message"]);
+    firstDispose();
+    expect(options.channelOutputTools?.has("onebot_send_forward_message")).toBe(true);
+    secondDispose();
+    expect(options.channelOutputTools?.has("onebot_send_forward_message")).toBe(false);
+  });
+
   it("freezes registration after setup and disposal invalidates an already-created sender", async () => {
     const f = await fixture();
     let seam!: ReplyDeliverySetupContext;

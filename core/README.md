@@ -136,8 +136,13 @@ See [reply delivery details](../docs/prompt-architecture.md#unified-reply-author
 explicit tool call, plain model text is not a delivered reply. Core requires a
 terminal tool to finish a turn; the runtime may repair a missing terminal call.
 
-Silent scheduled posts (`delivery: "silent"`) block `send_message` for that
-turn, so a background task cannot leak its working notes into the channel.
+Silent posts (`delivery: "silent"`) block `send_message` and registered direct
+channel-output tools for that turn, so a background task cannot leak its working
+notes into the channel. Automation notifications that should be visible must
+explicitly call `messenger.post()` with `delivery: "channel"`; `historyMode: "event"`
+can remain enabled to isolate the notification from ordinary conversation history.
+The external `notify-webhook` deployment must provide those options at its call site;
+Core does not infer channel delivery from an event type or notification text.
 
 ## Storage and records
 

@@ -125,6 +125,8 @@ export interface ChannelRuntimeOptions {
   readonly compactFragments?: CompactFragmentRecallSource;
   /** Optional reply-delivery capability collected before runtime construction. */
   readonly sticker?: ReplyStickerProvider;
+  /** Core-owned names of plugin tools that directly deliver content to the current channel. */
+  readonly channelOutputTools?: ReadonlySet<string>;
   /** Bound registry/setup/model generation; checked at every modern await/transport boundary. */
   readonly replyStillCurrent?: () => boolean;
 }
@@ -1183,14 +1185,16 @@ export class ChannelRuntime {
     };
   }
 
-  /** Silent posts must not reach the channel, so `send_message` is refused for their turns. */
+  /** Silent posts must not reach the channel, so authored and registered output tools are refused. */
   private silentTurnPlugin(): AgentPlugin {
     return {
       name: "core.silent-turn",
-      beforeToolCall: (call, context) =>
-        call.toolName === "send_message" && this.silentTurns.has(context.turnId)
-          ? { type: "block", reason: "本轮是静默后台任务，不能向频道发送消息。完成任务后调用 finish 结束本轮。" }
-          : { type: "allow" },
+      beforeToolCall: (call, context) => {
+        const channelOutput = call.toolName === "send_message" || (this.options.channelOutputTools?.has(call.toolName) ?? false);
+        return channelOutput && this.silentTurns.has(context.turnId)
+          ? { type: "block", reason: "本轮是静默后台任务，不能向频道发送消息或调用频道输出工具。完成任务后调用 finish 结束本轮。" }
+          : { type: "allow" };
+      },
     };
   }
 }

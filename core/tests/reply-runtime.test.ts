@@ -18,13 +18,22 @@ import { config as stickerConfig, createDeps, scope, stickerId } from "../../plu
 import { Channel } from "../src/channels/index.js";
 import { collectDeliveredSourceRecords } from "../src/conversations/internal-history.js";
 import { ChannelRuntime, type ChannelRuntimeOptions } from "../src/runtimes/channel.js";
-import { defaultConfig, defaultMessageRecord, deliveryFailedEvent } from "./helpers/index.js";
+import { defaultConfig, defaultMessageRecord } from "./helpers/index.js";
 
 type Call = { toolName: string; input: Record<string, unknown> };
 
 type Step = Call | ((messages: ModelMessage[]) => Call);
 const text = (value: string) => ({ kind: "text" as const, text: value });
 const finish = { toolName: "finish", input: {} };
+const notifyWebhookEvent = {
+  eventType: "notify-webhook",
+  platform: "test",
+  selfId: "bot",
+  timestamp: 2,
+  channel: { id: scope.channelId, type: 0 },
+  text: "[SYSTEM_NOTIFICATION] webhook completed",
+  payload: { status: "completed", result: "ok" },
+} as never;
 const roots: string[] = [];
 const runtimes: ChannelRuntime[] = [];
 afterEach(async () => {
@@ -219,10 +228,26 @@ describe("actual ChannelRuntime modern reply boundaries", () => {
     expect(f.sendMessage).not.toHaveBeenCalled();
     expect([...collectDeliveredSourceRecords(await f.channel.conversation.storage.read()).values()]).toEqual([]);
   });
-  it("silent event turns block authored sending and cannot read ordinary history", async () => {
+  it("explicit channel delivery lets a notify event author a reply without ordinary history", async () => {
+    const f = await fixture([{ toolName: "send_message", input: { parts: [text("notification delivered")] } }]);
+    await f.channel.conversation.storage.append(createEntry("message", { role: "user", id: "ordinary", timestamp: 1, content: "ORDINARY PRIVATE HISTORY" }));
+    const outcome = await f.runtime.post(notifyWebhookEvent, {
+      trigger: true,
+      ifBusy: "defer",
+      delivery: "channel",
+      historyMode: "event",
+    });
+    if (outcome.kind === "run") await outcome.done;
+    expect(f.sendMessage).toHaveBeenCalledOnce();
+    expect(JSON.stringify(f.prompts)).not.toContain("ORDINARY PRIVATE HISTORY");
+    expect([...collectDeliveredSourceRecords(await f.channel.conversation.storage.read()).values()].flat().map((record) => record.text)).toEqual([
+      "notification delivered",
+    ]);
+  });
+  it("silent notify events block authored sending and cannot read ordinary history", async () => {
     const f = await fixture([{ toolName: "send_message", input: { parts: [text("must not send")] } }, finish]);
     await f.channel.conversation.storage.append(createEntry("message", { role: "user", id: "ordinary", timestamp: 1, content: "ORDINARY PRIVATE HISTORY" }));
-    const outcome = await f.runtime.post(deliveryFailedEvent(), { delivery: "silent", historyMode: "event" });
+    const outcome = await f.runtime.post(notifyWebhookEvent, { trigger: true, ifBusy: "defer", delivery: "silent", historyMode: "event" });
     if (outcome.kind === "run") await outcome.done;
     expect(f.sendMessage).not.toHaveBeenCalled();
     expect(JSON.stringify(f.prompts)).not.toContain("ORDINARY PRIVATE HISTORY");
