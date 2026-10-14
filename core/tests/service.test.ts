@@ -81,6 +81,16 @@ describe("YesImBotService facade", () => {
     await expect(service.conversation.read(context, options)).resolves.toEqual(result);
     expect(resolve).toHaveBeenCalledWith(context);
   });
+  it("threads independent opt-in video input through the service resource facade", async () => {
+    const ctx = new Context();
+    ctx.baseDir = tmpdir();
+    Object.assign(ctx, { "yesimbot.model": {}, database: { get: vi.fn() } });
+    const service = new YesImBotService(ctx as never, { ...config, basePath: join(tmpdir(), `yesimbot-service-video-${randomUUID()}`), videoInput: true });
+    const resources = await service.resource.get({ type: "guild", platform: "test", channelId: "room", guildId: "room" });
+    expect(resources.videoInput).toBe(true);
+    expect(resources.imageInput).toBe(false);
+  });
+
   it("threads image input and converts resource timeout seconds", async () => {
     vi.useFakeTimers();
     try {

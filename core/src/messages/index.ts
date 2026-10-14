@@ -3,6 +3,7 @@ import type { UserContent, UserModelMessage } from "ai";
 import { h, type Element, type Universal } from "koishi";
 
 import { formatImageFailure, type ImageFailureCode } from "../resources/image-failure.js";
+import { formatVideoFailure } from "../resources/video-failure.js";
 
 export const PARAGRAPH_BREAK = /\r?\n[^\S\r\n]*\r?\n(?:[^\S\r\n]*\r?\n)*/;
 
@@ -267,6 +268,8 @@ function formatElementWithImages(element: Element, quotedMessageId: string | und
     return formatElement(element, quotedMessageId);
   }
   if (element.type === "file") return formatElement(element, quotedMessageId);
+  // Video stays URI/text based even when image bytes are enabled: native video is on-demand.
+  if (element.type === "video") return formatElement(element, quotedMessageId);
   return String(
     h(
       element.type,
@@ -359,6 +362,12 @@ function formatElement(element: Element, quotedMessageId?: string): string {
       return element.type === "img" ? `[图片：asset://${id}]` : `[文件：${name}asset://${id}]`;
     }
     return element.type === "img" ? formatImageFailure(element.attrs.yesimbotFailure) : "[文件]";
+  }
+  if (element.type === "video") {
+    const id = element.attrs.id;
+    // The model reads videos on demand through `read`; only the stable URI is rendered here.
+    if (typeof id === "string" && /^[a-f0-9]{32}$/.test(id)) return `[视频：asset://${id}]`;
+    return formatVideoFailure(element.attrs.yesimbotFailure);
   }
   return String(
     h(

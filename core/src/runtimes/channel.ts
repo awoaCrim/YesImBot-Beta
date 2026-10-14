@@ -8,6 +8,7 @@ import {
   createRandomId,
   createSystemMessage,
   EphemeralImageProjectionStore,
+  EphemeralVideoProjectionStore,
   type Agent,
   type AgentEntry,
   type AgentHistoryMode,
@@ -31,6 +32,7 @@ import {
   createReadTool,
   type DeliveredNotice,
   type ReadImagePolicy,
+  type ReadVideoPolicy,
   type SendFailedNotice,
 } from "../agents/tools.js";
 import type { WillBatchDecision, WillEngine, WillReservationOutcome, WillState } from "../agents/will.js";
@@ -111,6 +113,9 @@ export interface ChannelRuntimeOptions {
   readonly providerTools?: ToolSet;
   readonly visionModel?: LanguageModel;
   readonly readImagePolicy: ReadImagePolicy;
+  /** Resolved only from the primary model, explicit transport and the opt-in Core flag. */
+  readonly readVideoPolicy?: Pick<ReadVideoPolicy, "mode">;
+  readonly videoProjection?: EphemeralVideoProjectionStore;
   readonly imageProjection?: EphemeralImageProjectionStore;
   readonly config: Config;
   readonly plugins: readonly AgentPlugin[];
@@ -156,6 +161,9 @@ export class ChannelRuntime {
   private readonly agent: Agent;
   private readonly contextWorkspace?: ContextWorkspace;
   private readonly imageProjection: EphemeralImageProjectionStore;
+  private readonly videoProjection: EphemeralVideoProjectionStore | undefined;
+  /** Turn ids that already received one successful native video payload. */
+  private readonly videoReadTurns = new Set<string>();
   private readonly logger: Logger;
   private messageBatchController: MessageBatchController | undefined;
   private readonly pendingBatchInputs = new Map<string, MessageBatchInput>();
@@ -180,11 +188,26 @@ export class ChannelRuntime {
     this.context = options.channel.context;
     this.selfId = options.bot.selfId;
     this.imageProjection = options.imageProjection ?? new EphemeralImageProjectionStore();
+    this.videoProjection = options.videoProjection;
     this.logger = ctx.logger("yesimbot/channel-runtime");
     this.logger.level = options.config.logLevel ?? 2;
     const tools: AgentToolSet = [
       ...this.createModernReplyTools(options),
-      createReadTool(options.channel.resources, options.readImagePolicy, this.imageProjection),
+      createReadTool(
+        options.channel.resources,
+        options.readImagePolicy,
+        this.imageProjection,
+        options.readVideoPolicy?.mode === "native" && this.videoProjection
+          ? {
+              policy: {
+                mode: "native",
+                reserve: (turnId) => this.reserveVideoRead(turnId),
+                release: (turnId) => this.videoReadTurns.delete(turnId),
+              },
+              projection: this.videoProjection,
+            }
+          : undefined,
+      ),
       ...(options.config.session.magicContext?.enabled ? [] : [createExpandCompartmentTool(options.channel.conversation)]),
       createFinishTool(),
     ];
@@ -489,6 +512,8 @@ export class ChannelRuntime {
       reason: "stop",
     });
     this.stopped = true;
+    this.videoProjection?.clearAll();
+    this.videoReadTurns.clear();
     this.modernReplies?.invalidate();
     const batchController = this.messageBatchController;
     this.messageBatchController = undefined;
@@ -1046,9 +1071,32 @@ export class ChannelRuntime {
   private imageProjectionPlugin(): AgentPlugin {
     return {
       name: "core.image-projection",
-      onTurnFinish: (_result, context) => this.imageProjection.clearTurn(context.turnId),
-      stop: () => this.imageProjection.clearAll(),
+      onTurnFinish: (_result, context) => {
+        this.clearMediaProjections(context.turnId);
+      },
+      stop: () => {
+        this.imageProjection.clearAll();
+        this.videoProjection?.clearAll();
+        this.videoReadTurns.clear();
+      },
     };
+  }
+
+  private clearMediaProjections(turnId: string): void {
+    this.imageProjection.clearTurn(turnId);
+    this.videoProjection?.clearTurn(turnId);
+    this.videoReadTurns.delete(turnId);
+  }
+
+  /**
+   * Synchronous per-turn reservation for the one native video payload. It is independent of the
+   * projection TTL and of call-id reuse, so a repeated or retried call cannot reset the budget.
+   * Failed admissions never reserve, and a later turn may read a retained asset afresh.
+   */
+  private reserveVideoRead(turnId: string): boolean {
+    if (this.stopped || this.agent.getActiveTurnId() !== turnId || this.videoReadTurns.has(turnId)) return false;
+    this.videoReadTurns.add(turnId);
+    return true;
   }
 
   /**

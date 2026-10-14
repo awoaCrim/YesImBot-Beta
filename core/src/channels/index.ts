@@ -18,6 +18,7 @@ export interface ChannelsOptions {
   readonly basePath: string;
   readonly logLevel?: number;
   readonly imageInput?: boolean;
+  readonly videoInput?: boolean;
   readonly readTimeoutMs?: number;
   readonly compactConfig?: ConversationCompactConfig;
   readonly magicContext?: boolean;
@@ -43,8 +44,9 @@ export class Channel {
     compactConfig: ConversationCompactConfig = { minMessages: 15, maxFailures: 3 },
     fragments: ChannelFragmentOptions = {},
     magicContext = false,
+    videoInput = false,
   ) {
-    this.resources = new ChannelResources(root, imageInput, readTimeoutMs);
+    this.resources = new ChannelResources(root, imageInput, readTimeoutMs, videoInput);
     this.conversation = new Conversation(root, compactConfig, {
       channelKey: deriveChannelKey(context),
       magicContext,
@@ -64,6 +66,7 @@ export class Channels implements Resources {
   private readonly readers = new Map<string, ResourceReader>();
   private readonly readerDisposers = new Map<ResourceReader, Map<Channel, Disposer>>();
   private readonly imageInput: boolean;
+  private readonly videoInput: boolean;
   private readonly readTimeoutMs: number;
   private readonly compactConfig: ConversationCompactConfig;
   private readonly magicContext: boolean;
@@ -74,6 +77,7 @@ export class Channels implements Resources {
   public constructor(ctx: Context, options: ChannelsOptions) {
     this.channelsPath = resolve(options.basePath, "channels");
     this.imageInput = options.imageInput ?? false;
+    this.videoInput = options.videoInput ?? false;
     this.readTimeoutMs = options.readTimeoutMs ?? 10_000;
     this.compactConfig = options.compactConfig ?? { minMessages: 15, maxFailures: 3 };
     this.magicContext = options.magicContext ?? false;
@@ -158,7 +162,7 @@ export class Channels implements Resources {
       onError: (operation, cause) =>
         this.logger.warn("channels.compact_fragment_failed", { key, operation, errorName: cause instanceof Error ? cause.name : typeof cause }),
     };
-    const channel = new Channel(ctx, root, this.imageInput, this.readTimeoutMs, this.compactConfig, fragments, this.magicContext);
+    const channel = new Channel(ctx, root, this.imageInput, this.readTimeoutMs, this.compactConfig, fragments, this.magicContext, this.videoInput);
     for (const reader of this.readers.values()) {
       this.readerDisposers.get(reader)!.set(channel, channel.resources.use(reader));
     }

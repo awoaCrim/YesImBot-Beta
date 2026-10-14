@@ -76,6 +76,29 @@ through `ResourceReader.init()`. When a model supports image input and
 current model call; history is never re-requested from a platform API. Set
 `imageInput: false` to disable projection.
 
+Native QQ group/private video messages are opt-in with `videoInput: true`. Core
+persists one valid MP4 of at most 10 MiB per input persistence call in a separate
+pool (image/text limits stay unchanged), strips platform transport URLs, and renders
+its exact asset URI in both ordinary and image-enabled current/quoted input. Video
+is not attached eagerly: `read` supplies the original file to the same main model
+only when its explicit input modalities include `video` and the provider declares
+`videoToolResult: "native"`. Unknown/unsupported transport fails closed; no vision
+model, separate summary or frame-extraction fallback is used.
+
+The Google provider defaults `videoToolResultSupport` to `unknown`. Operators must
+opt their existing verified native-video route into `native` and add `video` to the
+selected main model override in `models.json`, preserving all other modalities and
+model settings. See [activation instructions](../docs/setup-koishi.md#qq-原生视频读取).
+This source change does not modify production configuration or select another model.
+
+Only one successful native video read is admitted per turn, independent of TTL or
+call-id reuse. The original file remains in the scoped immutable assets store;
+raw request payloads are ephemeral and removed from durable/replayed chat history.
+Timeout, abort, missing/expired projection and unsupported content produce explicit
+failures. Audio is retained in the file but audio recognition is not promised. The
+byte cap is not a duration/token guarantee, and upstream codec/context limits still
+apply. Web links, generic-file MP4 attachments and other containers are out of scope.
+
 ## Prompt composition
 
 Core composes its stable system prompt in Chinese from `src/runtimes/prompt.ts`:

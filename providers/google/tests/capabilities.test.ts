@@ -9,13 +9,14 @@ import { apply } from "../src/index.js";
 type RegisteredProvider = {
   chatCapabilities?(modelId: string): {
     readonly imageToolResult?: "native" | "unsupported" | "unknown";
+    readonly videoToolResult?: "native" | "unsupported" | "unknown";
     readonly historyProjection?: "default" | "gemini-native";
   };
 };
 
 const fixtureBase64 = Buffer.from([0, 1, 2, 3]).toString("base64");
 
-function registerProvider(): RegisteredProvider {
+function registerProvider(config: { videoToolResultSupport?: "native" | "unsupported" | "unknown" } = {}): RegisteredProvider {
   let ready: (() => void) | undefined;
   const model = { register: vi.fn(() => () => undefined) };
   const ctx = {
@@ -24,7 +25,7 @@ function registerProvider(): RegisteredProvider {
     },
     yesimbot: { model },
   };
-  apply(ctx as never, { id: "google", apiKey: "test", chatModels: [], embeddingModels: [] } as never);
+  apply(ctx as never, { id: "google", apiKey: "test", chatModels: [], embeddingModels: [], ...config } as never);
   if (!ready) throw new Error("provider did not register a ready callback");
   ready();
   return model.register.mock.calls[0]?.[0] as RegisteredProvider;
@@ -66,7 +67,16 @@ function createImageToolResultPrompt(): LanguageModelV3Prompt {
 describe("Google provider capabilities", () => {
   it("declares native image tool-result support", () => {
     const provider = registerProvider();
-    expect(provider.chatCapabilities?.("gemini-3.7-flash-high")).toEqual({ imageToolResult: "native", historyProjection: "gemini-native" });
+    expect(provider.chatCapabilities?.("gemini-3.7-flash-high")).toEqual({
+      imageToolResult: "native",
+      videoToolResult: "unknown",
+      historyProjection: "gemini-native",
+    });
+  });
+
+  it.each(["native", "unsupported", "unknown"] as const)("requires explicit video transport opt-in (%s)", (videoToolResultSupport) => {
+    const provider = registerProvider({ videoToolResultSupport });
+    expect(provider.chatCapabilities?.("gemini-3.8-flash-high")?.videoToolResult).toBe(videoToolResultSupport);
   });
 
   it("serializes a Gemini 3 tool-result image inside functionResponse.parts", async () => {

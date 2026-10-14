@@ -37,10 +37,14 @@ export type AuxiliaryModelErrorCode = "missing-config" | "invalid-config" | "unr
 
 export type ImageToolResultSupport = "native" | "unsupported" | "unknown";
 
+/** Explicit native video-tool-result transport declaration; absent or invalid normalizes unknown. */
+export type VideoToolResultSupport = "native" | "unsupported" | "unknown";
+
 export type HistoryProjectionMode = "default" | "gemini-native";
 
 export interface ChatModelCapabilities {
   readonly imageToolResult: ImageToolResultSupport;
+  readonly videoToolResult?: VideoToolResultSupport;
   readonly historyProjection?: HistoryProjectionMode;
 }
 
@@ -206,6 +210,12 @@ export class ModelService {
       imageToolResult:
         declaredCapabilities?.imageToolResult === "native" || declaredCapabilities?.imageToolResult === "unsupported"
           ? declaredCapabilities.imageToolResult
+          : "unknown",
+      // Never inferred from names, image support or an OpenAI-compatible label: only an explicit
+      // native/unsupported declaration enables or denies video transport.
+      videoToolResult:
+        declaredCapabilities?.videoToolResult === "native" || declaredCapabilities?.videoToolResult === "unsupported"
+          ? declaredCapabilities.videoToolResult
           : "unknown",
       historyProjection: declaredCapabilities?.historyProjection === "gemini-native" ? "gemini-native" : "default",
     };

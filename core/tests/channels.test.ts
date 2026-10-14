@@ -28,6 +28,16 @@ describe("Channels", () => {
     expect(first).toBe(second);
     expect(await channels.get(direct)).not.toBe(first);
   });
+  it("keeps old channel configuration video-disabled and propagates video opt-in", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-channels-video-"));
+    roots.push(root);
+    const shared = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as const;
+    const old = new Channels(new Context(), { basePath: root });
+    expect((await old.get(shared)).videoInput).toBe(false);
+    const enabled = new Channels(new Context(), { basePath: root, videoInput: true });
+    expect((await enabled.get(shared)).videoInput).toBe(true);
+  });
+
   it("passes image input and read timeout to newly created resources", async () => {
     const root = await mkdtemp(join(tmpdir(), "yesimbot-channels-config-"));
     roots.push(root);

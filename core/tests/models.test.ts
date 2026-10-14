@@ -211,7 +211,11 @@ describe("models.json modalities", () => {
   it("fails closed when a provider does not declare image tool-result support", async () => {
     const service = await createModelService({});
 
-    expect(service.resolveChatModel("openai:gpt-4o").capabilities).toEqual({ imageToolResult: "unknown", historyProjection: "default" });
+    expect(service.resolveChatModel("openai:gpt-4o").capabilities).toEqual({
+      imageToolResult: "unknown",
+      videoToolResult: "unknown",
+      historyProjection: "default",
+    });
   });
 
   it("propagates explicit unsupported image tool-result transport capabilities", async () => {
@@ -221,8 +225,29 @@ describe("models.json modalities", () => {
     };
     const service = await createModelService({}, undefined, provider);
 
-    expect(service.resolveChatModel("openai:gpt-4o").capabilities).toEqual({ imageToolResult: "unsupported", historyProjection: "default" });
+    expect(service.resolveChatModel("openai:gpt-4o").capabilities).toEqual({
+      imageToolResult: "unsupported",
+      videoToolResult: "unknown",
+      historyProjection: "default",
+    });
     expect(provider.chatCapabilities).toHaveBeenCalledWith("gpt-4o");
+  });
+
+  it.each([
+    [undefined, "unknown"],
+    ["unknown", "unknown"],
+    ["unsupported", "unsupported"],
+    ["native", "native"],
+    ["invalid", "unknown"],
+  ])("normalizes explicit video transport %s without inferring from image support", async (declared, expected) => {
+    const provider: ModelProvider = {
+      ...createProviderWithImage(),
+      chatCapabilities: vi.fn(() => ({ imageToolResult: "native", videoToolResult: declared }) as never),
+    };
+    const service = await createModelService({}, undefined, provider);
+    const resolved = service.resolveChatModel("openai:gpt-4o");
+    expect(resolved.capabilities.videoToolResult).toBe(expected);
+    expect(resolved.capabilities.imageToolResult).toBe("native");
   });
 
   it("resolves provider-scoped history projection capabilities and defaults unknown providers", async () => {

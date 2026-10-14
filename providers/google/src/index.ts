@@ -18,6 +18,13 @@ export const inject = ["yesimbot"];
 
 export const imageToolResultSupport = "native" as const;
 
+/**
+ * Native video tool-result transport is opt-in: Google serializes `file-data` into
+ * `functionResponse.parts.inlineData`, but only an operator whose route has actually verified
+ * video reads should declare it. The unknown default keeps unverified routes failing closed.
+ */
+export const videoToolResultSupport = "unknown" as const;
+
 export const Config: Schema<Config> = Schema.object({
   id: Schema.string().default("google").description("提供商标识"),
   apiKey: Schema.string().role("secret").required().description("API Key"),
@@ -45,13 +52,18 @@ export const Config: Schema<Config> = Schema.object({
     .role("table")
     .default([])
     .description("可用嵌入模型列表"),
+  videoToolResultSupport: Schema.union([Schema.const("native"), Schema.const("unsupported"), Schema.const("unknown")])
+    .default("unknown")
+    .description("原生视频工具结果传输：仅在实际验证过视频读取的线路上设为 native；unknown/unsupported 均按不支持处理"),
 });
 
 const GOOGLE_DEFAULT_THINKING_LEVELS: ThinkingLevelMap = { minimal: "minimal", low: "low", medium: "medium", high: "high" };
 
 type GoogleNativeThinkingLevel = "minimal" | "low" | "medium" | "high";
 
-interface Config extends BaseProviderConfig {}
+interface Config extends BaseProviderConfig {
+  videoToolResultSupport?: "native" | "unsupported" | "unknown";
+}
 
 interface GoogleThinkingResolution {
   readonly clamped: boolean;
@@ -110,7 +122,11 @@ export function apply(ctx: Context, config: Config) {
           middleware: [defaultSettingsMiddleware({ settings: { providerOptions: { google: resolution.providerOptions } } })],
         });
       },
-      chatCapabilities: () => ({ imageToolResult: imageToolResultSupport, historyProjection: "gemini-native" as const }),
+      chatCapabilities: () => ({
+        imageToolResult: imageToolResultSupport,
+        videoToolResult: config.videoToolResultSupport ?? videoToolResultSupport,
+        historyProjection: "gemini-native" as const,
+      }),
       embedding: (modelId: string) => client.embedding(modelId),
     });
     ctx.on("dispose", dispose);

@@ -7,6 +7,7 @@ import { ChannelArtifactStore, type ArtifactStore } from "./artifact.js";
 import { ChannelAssetStore, type AssetStore } from "./asset.js";
 import { persistElements as persistInboundElements } from "./input.js";
 import { detectImageMediaType } from "./media.js";
+import { detectVideoMediaType, VIDEO_MAX_BYTES } from "./video-media.js";
 
 export const RESOURCE_MAX_BYTES = 5 * 1024 * 1024;
 const COMPLETE_ASSET_ID = /^[a-f0-9]{32}$/;
@@ -22,6 +23,7 @@ export type ResourceReadErrorCode =
   | "timeout"
   | "resource_read_aborted"
   | "resource_too_large"
+  | "resource_not_video"
   | "resource_read_failed"
   | "resource_delivery_restricted";
 
@@ -64,6 +66,7 @@ export class ChannelResources {
     public readonly path: string,
     public readonly imageInput = false,
     private readonly readTimeoutMs = 10_000,
+    public readonly videoInput = false,
   ) {
     this.assets = new ChannelAssetStore(path);
     this.artifacts = new ChannelArtifactStore(path);
@@ -86,11 +89,7 @@ export class ChannelResources {
     try {
       if (parsed.protocol === "asset:") {
         if (!COMPLETE_ASSET_ID.test(parsed.hostname) || parsed.pathname !== "") throw new ResourceReadError("invalid_resource_uri");
-        try {
-          return normalize({ bytes: await this.assets.get(parsed.hostname) });
-        } catch {
-          throw new ResourceReadError("resource_not_found");
-        }
+        return normalize({ bytes: await this.readAssetBounded(parsed.hostname, RESOURCE_MAX_BYTES, signal) });
       }
       if (parsed.protocol === "artifact:") {
         if (!parsed.hostname || parsed.pathname === "/") throw new ResourceReadError("invalid_resource_uri");
@@ -109,6 +108,68 @@ export class ChannelResources {
     } catch (cause) {
       if (cause instanceof ResourceReadError) throw cause;
       throw new ResourceReadError("resource_read_failed");
+    }
+  }
+
+  /**
+   * Opens exactly one complete channel asset id as valid MP4 bytes under the narrow video budget.
+   * This never lends the video allowance to ordinary reads: callers must already be admitted by
+   * the native video capability and always use a canonical `asset://<32-hex>` URI.
+   */
+  public async openVideoAssetStrict(uri: string, signal?: AbortSignal): Promise<ResourceOpenResult> {
+    const parsed = parseUri(uri);
+    if (!parsed || parsed.protocol !== "asset:" || !COMPLETE_ASSET_ID.test(parsed.hostname) || parsed.pathname !== "") {
+      throw new ResourceReadError("invalid_resource_uri");
+    }
+    if (signal?.aborted) throw new ResourceReadError("resource_read_aborted");
+    const bytes = await this.readAssetBounded(parsed.hostname, VIDEO_MAX_BYTES, signal);
+    if (signal?.aborted) throw new ResourceReadError("resource_read_aborted");
+    const mediaType = detectVideoMediaType(bytes);
+    if (!mediaType) throw new ResourceReadError("resource_not_video");
+    return { bytes, mediaType };
+  }
+
+  /**
+   * Asset reads used by native media paths. The read timeout is an overall deadline: the check is
+   * re-evaluated after the bounded read and any late result is discarded instead of returned.
+   */
+  private async readAssetBounded(id: string, maxBytes: number, signal?: AbortSignal): Promise<Uint8Array> {
+    if (signal?.aborted) throw new ResourceReadError("resource_read_aborted");
+    const controller = new AbortController();
+    let rejectAborted!: (reason: unknown) => void;
+    const cancelled = new Promise<never>((_, reject) => {
+      rejectAborted = reject;
+    });
+    const onAbort = () => {
+      controller.abort(signal?.reason);
+      rejectAborted(new ResourceReadError("resource_read_aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    let timeout: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => {
+        const error = new ResourceReadError("timeout");
+        controller.abort(error);
+        reject(error);
+      }, this.readTimeoutMs);
+    });
+    try {
+      const bytes = await Promise.race([this.assets.get(id, { maxBytes, signal: controller.signal }), deadline, cancelled]);
+      if (signal?.aborted) throw new ResourceReadError("resource_read_aborted");
+      controller.signal.throwIfAborted();
+      if (!(bytes instanceof Uint8Array)) throw new ResourceReadError("resource_read_failed");
+      if (bytes.byteLength > maxBytes) throw new ResourceReadError("resource_too_large");
+      return bytes;
+    } catch (cause) {
+      if (signal?.aborted) throw new ResourceReadError("resource_read_aborted");
+      if (cause instanceof ResourceReadError) throw cause;
+      if (cause instanceof Error && /exceeds byte limit/i.test(cause.message)) throw new ResourceReadError("resource_too_large");
+      if ((cause as NodeJS.ErrnoException)?.code === "ENOENT" || (cause instanceof Error && /asset not found/i.test(cause.message)))
+        throw new ResourceReadError("resource_not_found");
+      throw new ResourceReadError("resource_read_failed");
+    } finally {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", onAbort);
     }
   }
 
@@ -162,7 +223,7 @@ export class ChannelResources {
     }
   }
 
-  /** Persists inbound image and restricted text-file elements while the Session is live. */
+  /** Persists inbound image, native video and restricted text-file elements while the Session is live. */
   public async persistElements(ctx: Context, elements: readonly Element[]): Promise<Element[]> {
     return persistInboundElements(ctx, elements, this, this.readTimeoutMs);
   }
@@ -263,8 +324,13 @@ function normalize(value: unknown): ResourceOpenResult {
 
 export { detectImageMediaType } from "./media.js";
 
+/** Narrow native-video allowance; ordinary readers, images and output stay at RESOURCE_MAX_BYTES. */
+export { detectVideoMediaType, VIDEO_MAX_BYTES } from "./video-media.js";
+
 export { type ImageFailureCode, formatImageFailure, imageFailureLabel, isImageFailureCode } from "./image-failure.js";
+
+export { type VideoFailureCode, formatVideoFailure, isVideoFailureCode, videoFailureLabel } from "./video-failure.js";
 
 export { type ArtifactOpenResult, type ArtifactStore, type ArtifactWriter } from "./artifact.js";
 
-export { type AssetStore } from "./asset.js";
+export { type AssetReadOptions, type AssetStore } from "./asset.js";

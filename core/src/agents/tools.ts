@@ -1,4 +1,4 @@
-import { EphemeralImageProjectionStore, jsonSchema, type AgentTool } from "@yesimbot/agent-runtime";
+import { EphemeralImageProjectionStore, EphemeralVideoProjectionStore, jsonSchema, type AgentTool } from "@yesimbot/agent-runtime";
 import type { LanguageModel } from "ai";
 import { h, type Bot, type Element } from "koishi";
 
@@ -6,7 +6,14 @@ import type { PacingConfig } from "../config.js";
 import { ContextSourceError } from "../conversations/context-blocks.js";
 import type { CompartmentExpansionRecord, Conversation } from "../conversations/index.js";
 import { parseReply } from "../messages/index.js";
-import { detectImageMediaType, prepareOutputSegments, ResourceReadError, type ChannelResources } from "../resources/index.js";
+import {
+  detectImageMediaType,
+  detectVideoMediaType,
+  prepareOutputSegments,
+  ResourceReadError,
+  VIDEO_MAX_BYTES,
+  type ChannelResources,
+} from "../resources/index.js";
 import { ContextBudgetError } from "../runtimes/context-budget.js";
 import type { ContextWorkspace, ContextBlocksInput, ContextLoadInput } from "../runtimes/context-workspace.js";
 import { describeImageBytes } from "./image-preview.js";
@@ -14,14 +21,10 @@ import { describeImageBytes } from "./image-preview.js";
 const READ_MAX_TEXT_CHARS = 30_000;
 const ONEBOT_GROUP_CHANNEL_PREFIX = "group:";
 
-type ResourceReadInput = { uri: string };
-
 export type ReadImageMode = "native" | "vision" | "unavailable";
 
-export interface ReadImagePolicy {
-  readonly mode: ReadImageMode;
-  readonly visionModel?: LanguageModel;
-}
+/** Native video admission outcome reported to the model for one `read` call. */
+export type VideoReadMode = "native" | "unavailable";
 
 export type ResourceReadResult = {
   uri: string;
@@ -29,8 +32,11 @@ export type ResourceReadResult = {
   mediaType?: string;
   text?: string;
   imageMode?: ReadImageMode;
+  videoMode?: VideoReadMode;
   error?: string;
 };
+
+type ResourceReadInput = { uri: string };
 
 type DescribeImageInput = { uri: string; question: string };
 
@@ -49,6 +55,32 @@ type SendMessageInput = {
 type SendMessageOutput =
   | { ok: true; messageIds: string[]; count: number }
   | { ok: false; error: { name: string; message: string }; sent: string[]; failedAt: number };
+
+/** Execution context fields the native video branch needs; the rest stays in the AI SDK type. */
+type ReadExecution = {
+  readonly toolCallId: string;
+  readonly turnId: string;
+  readonly abortSignal?: AbortSignal;
+};
+
+export interface ReadImagePolicy {
+  readonly mode: ReadImageMode;
+  readonly visionModel?: LanguageModel;
+}
+
+export interface ReadVideoPolicy {
+  readonly mode: VideoReadMode;
+  /** Core owns a synchronous per-turn budget, independent of cache TTL and call-id reuse. */
+  readonly reserve: (turnId: string, toolCallId: string) => boolean;
+  /** Rolls back a reservation when no payload could be staged. */
+  readonly release?: (turnId: string, toolCallId: string) => void;
+}
+
+/** Optional additive native-video wiring; absent keeps every existing image/boolean behavior. */
+export interface ReadVideoOptions {
+  readonly policy?: ReadVideoPolicy;
+  readonly projection?: EphemeralVideoProjectionStore;
+}
 
 /** Facts about one delivered platform message, reported so the owner can announce it. */
 export interface DeliveredNotice {
@@ -171,12 +203,71 @@ export function createReadTool(
   resources: ChannelResources,
   policyInput: ReadImagePolicy | boolean,
   imageProjection = new EphemeralImageProjectionStore(),
+  videoOptions: ReadVideoOptions = {},
 ): AgentTool<{ uri: string }, ResourceReadResult> {
   const policy: ReadImagePolicy = typeof policyInput === "boolean" ? { mode: policyInput && resources.imageInput ? "native" : "unavailable" } : policyInput;
+  const videoPolicy = videoOptions.policy;
+  const videoProjection = videoOptions.projection;
+  // Owner tags bind the original execution result to its current projection without retaining
+  // bytes in this WeakMap or serializing a private live-generation field in the receipt.
+  const videoOwners = new WeakMap<ResourceReadResult, object>();
+
+  /**
+   * One successful native video read per turn. The synchronous reservation happens before any
+   * projection work, so repeated call ids, retries or a stale TTL can never grant a second payload.
+   */
+  const readVideo = (uri: string, opened: { bytes: Uint8Array; mediaType?: string }, execution: ReadExecution): ResourceReadResult => {
+    const abortSignal = execution.abortSignal;
+    if (videoPolicy?.mode !== "native" || !resources.videoInput || !videoProjection) {
+      return { uri, mediaType: opened.mediaType, videoMode: "unavailable", error: "video_input_unavailable", text: "模型没有看到视频内容。" };
+    }
+    if (opened.bytes.byteLength > VIDEO_MAX_BYTES) {
+      return { uri, mediaType: opened.mediaType, videoMode: "unavailable", error: "resource_too_large", text: "模型没有看到视频内容。" };
+    }
+    if (abortSignal?.aborted) {
+      return { uri, mediaType: opened.mediaType, videoMode: "unavailable", error: "resource_read_aborted", text: "模型没有看到视频内容。" };
+    }
+    if (!videoPolicy.reserve(execution.turnId, execution.toolCallId)) {
+      return {
+        uri,
+        mediaType: opened.mediaType,
+        videoMode: "unavailable",
+        error: "video_turn_limit",
+        text: "本回合已经成功读取过一个视频；本轮不会再次提供视频内容。",
+      };
+    }
+    const owner = {};
+    if (
+      !videoProjection.stage({
+        toolCallId: execution.toolCallId,
+        turnId: execution.turnId,
+        bytes: opened.bytes,
+        mediaType: "video/mp4",
+        owner,
+        ...(abortSignal === undefined ? {} : { signal: abortSignal }),
+      })
+    ) {
+      videoPolicy.release?.(execution.turnId, execution.toolCallId);
+      return {
+        uri,
+        videoMode: "unavailable",
+        error: abortSignal?.aborted ? "resource_read_aborted" : "video_projection_unavailable",
+        text: "模型没有看到视频内容。",
+      };
+    }
+    const result: ResourceReadResult = {
+      uri,
+      mediaType: "video/mp4",
+      text: `[视频资源，video/mp4，${formatBytes(opened.bytes.byteLength)}]`,
+      videoMode: "native",
+    };
+    videoOwners.set(result, owner);
+    return result;
+  };
   const lines = [
     "读取资源内容。仅在确实需要内容时读取精确 URI，不要猜测或拼造 URI。",
     "URI 形如 scheme://authority[/path]，不能包含 ?、#、%，也不能有 . 或 .. 路径段。",
-    "- asset://<32位十六进制id>：平台输入的不可变资源，包括图片与文本文件。消息里看到的 [图片：asset://xxx] 和 [文件：名字 asset://xxx] 就是它；路径部分必须为空。",
+    "- asset://<32位十六进制id>：平台输入的不可变资源，包括图片、视频与文本文件。消息里看到的 [图片：asset://xxx]、[视频：asset://xxx] 和 [文件：名字 asset://xxx] 就是它；路径部分必须为空。",
     "- artifact://<tool>/<uuid>：工具输出的不可变工件，uuid 由工具返回，原样传入。",
   ];
   for (const reader of resources
@@ -185,7 +276,11 @@ export function createReadTool(
     .sort((a, b) => a.scheme.localeCompare(b.scheme))) {
     lines.push(`- ${reader.scheme}://：${reader.prompt}`);
   }
-  lines.push("", "返回 {uri, filename?, mediaType?, text?, imageMode?, error?}。", "- 文本资源在 text 中直接给出内容，过长会被截断并以 [内容已截断] 结尾。");
+  lines.push(
+    "",
+    "返回 {uri, filename?, mediaType?, text?, imageMode?, videoMode?, error?}。",
+    "- 文本资源在 text 中直接给出内容，过长会被截断并以 [内容已截断] 结尾。",
+  );
   if (policy.mode === "native") {
     lines.push("- 图片资源：读取后图片字节将随结果返回，你可以直接查看图片内容。查看图片必须使用本工具读取。");
   } else if (policy.mode === "vision") {
@@ -193,9 +288,16 @@ export function createReadTool(
   } else {
     lines.push("- 图片资源只返回明确的不可用结果，当前无法查看图片内容；不要根据文件名或上下文猜测画面。");
   }
+  if (videoPolicy?.mode === "native" && videoProjection && resources.videoInput) {
+    lines.push(
+      "- 视频资源：仅支持不超过 10 MiB 的 MP4 频道资产。原文件随工具结果交给当前主模型，不调用其他模型或抽帧；本轮最多成功读取一个视频。声音识别不作保证，不可用时返回 videoMode=unavailable 与 error。",
+    );
+  } else {
+    lines.push("- 视频资源只返回明确的不可用结果，当前无法查看视频内容；不要根据文件名或上下文猜测画面。");
+  }
   lines.push(
     "- 其他二进制只给出类型与大小，无法查看内容。",
-    "- error 可能为：invalid_resource_uri、resource_not_found、resource_unavailable、resource_too_large、timeout、resource_read_aborted、resource_read_failed、invalid_image_data、vision_call_failed 或 image_input_unavailable。",
+    "- error 可能为：invalid_resource_uri、resource_not_found、resource_unavailable、resource_too_large、resource_not_video、timeout、resource_read_aborted、resource_read_failed、invalid_image_data、vision_call_failed、video_input_unavailable、video_turn_limit 或 image_input_unavailable。",
   );
 
   return {
@@ -205,13 +307,40 @@ export function createReadTool(
     execute: async ({ uri }, execution) => {
       // A retried/reused tool call ID must never inherit bytes from an earlier read.
       imageProjection.clear(execution.toolCallId);
+      videoProjection?.clear(execution.toolCallId);
+      const videoAdmitted = videoPolicy?.mode === "native" && videoProjection !== undefined && resources.videoInput && isAssetUri(uri);
       let opened: Awaited<ReturnType<ChannelResources["openStrict"]>>;
       try {
+        // Always preserve the ordinary image/text path. Only its oversize asset rejection may
+        // use the narrow MP4 allowance, and only after explicit native-video admission.
         opened = await resources.openStrict(uri, execution.abortSignal);
       } catch (cause) {
-        if (cause instanceof ResourceReadError) return { uri, error: cause.code };
-        return { uri, error: "resource_read_failed" };
+        if (!(cause instanceof ResourceReadError)) return { uri, error: "resource_read_failed" };
+        if (videoAdmitted && cause.code === "resource_too_large") {
+          try {
+            return readVideo(uri, await resources.openVideoAssetStrict(uri, execution.abortSignal), execution);
+          } catch (videoCause) {
+            if (videoCause instanceof ResourceReadError && (videoCause.code === "timeout" || videoCause.code === "resource_read_aborted"))
+              return { uri, error: videoCause.code };
+            return { uri, error: cause.code };
+          }
+        }
+        return { uri, error: cause.code };
       }
+
+      const detectedVideoType = detectVideoMediaType(opened.bytes);
+      if (detectedVideoType) {
+        if (videoAdmitted) return readVideo(uri, { ...opened, mediaType: detectedVideoType }, execution);
+        return {
+          uri,
+          filename: opened.filename,
+          mediaType: detectedVideoType,
+          videoMode: "unavailable",
+          error: "video_input_unavailable",
+          text: "模型没有看到视频内容。",
+        };
+      }
+      if (opened.mediaType?.startsWith("video/")) return { uri, videoMode: "unavailable", error: "invalid_video_data", text: "模型没有看到视频内容。" };
 
       const detectedImageType = detectImageMediaType(opened.bytes);
       const declaredImage = opened.mediaType?.startsWith("image/") ?? false;
@@ -283,6 +412,22 @@ export function createReadTool(
       };
     },
     toModelOutput: ({ toolCallId, output }) => {
+      if (output.videoMode === "native") {
+        const video = videoProjection?.get(toolCallId);
+        const owner = videoOwners.get(output);
+        if (!video || !owner || video.owner !== owner) {
+          return { type: "json", value: { ...output, videoMode: "unavailable", error: "video_projection_unavailable", text: "模型没有看到视频内容。" } };
+        }
+        // Repeated projection of this same live result is allowed; expired, aborted or reused
+        // call ids cannot project a different result or silently claim metadata was viewed.
+        return {
+          type: "content",
+          value: [
+            ...(output.text ? [{ type: "text" as const, text: output.text }] : []),
+            { type: "file-data" as const, data: Buffer.from(video.bytes).toString("base64"), mediaType: video.mediaType },
+          ],
+        };
+      }
       const image = imageProjection.get(toolCallId);
       if (!image) return { type: "json", value: output };
       // AI SDK may project the same live tool result more than once: once for
@@ -542,6 +687,11 @@ ${
 
 ## 资源与格式
 只有 <img> 和 <file> 的 src 支持频道资源 URI；<audio>、<video> 只能使用平台可直接访问的地址。资源引用前先确认 URI 存在，解析失败的资源元素会被丢弃，其余消息仍继续发送；平台不支持的修饰元素不要作为结构依赖。`;
+}
+
+/** `asset://<32-hex>` is the only video scheme; every other URI keeps the ordinary read path. */
+function isAssetUri(uri: string): boolean {
+  return /^asset:\/\/[a-f0-9]{32}$/.test(uri);
 }
 
 function describeBytes(bytes: Uint8Array, mediaType?: string): string {

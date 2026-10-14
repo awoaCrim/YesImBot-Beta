@@ -75,7 +75,10 @@ describe("provisional tool-result costs", () => {
     expect(again.toolResults.size).toBe(2048);
   });
 
-  it("never serializes native media bodies into token costs or treats them as known text", () => {
+  it.each([
+    { type: "image-data" as const, mediaType: "image/png" },
+    { type: "file-data" as const, mediaType: "video/mp4" },
+  ])("never serializes $mediaType bodies into token costs or treats them as known text", ({ type, mediaType }) => {
     const media = (size: number): ModelMessage => ({
       role: "tool",
       content: [
@@ -83,7 +86,7 @@ describe("provisional tool-result costs", () => {
           type: "tool-result",
           toolCallId: "image",
           toolName: "read",
-          output: { type: "content", value: [{ type: "image-data", data: "A".repeat(size), mediaType: "image/png" }] },
+          output: { type: "content", value: [{ type, data: "A".repeat(size), mediaType }] },
         },
       ],
     });

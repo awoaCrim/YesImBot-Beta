@@ -49,6 +49,7 @@ import { createMessage, type Event, type MessageRecord } from "../src/messages/i
 import { ChannelRuntime, createModelInputPlugin, type ChannelRuntimeOptions } from "../src/runtimes/channel.js";
 import { resolveReadImagePolicy, Runtimes } from "../src/runtimes/index.js";
 import { PNG_BYTES } from "./helpers/index.js";
+import { VIDEO_BYTES } from "./helpers/video.js";
 
 const config: Config = {
   basePath: "/tmp",
@@ -2196,6 +2197,51 @@ describe("Runtimes identity", () => {
       expect(replacement).not.toBe(first);
       await runtimes.stop();
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { enabled: true, video: true, transport: "native" as const, admitted: true },
+    { enabled: false, video: true, transport: "native" as const, admitted: false },
+    { enabled: true, video: false, transport: "native" as const, admitted: false },
+    { enabled: true, video: true, transport: "unknown" as const, admitted: false },
+  ])("wires built-in video read from the actual primary gate: $enabled/$video/$transport", async ({ enabled, video, transport, admitted }) => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-video-policy-"));
+    const ctx = new Context();
+    const channels = new Channels(ctx, { basePath: root, videoInput: enabled });
+    const model = {
+      resolveChatModel: vi.fn((_id: string) => ({
+        model: {} as never,
+        entry: { modalities: { input: video ? ["text", "video"] : ["text"] } },
+        capabilities: { imageToolResult: "unsupported", videoToolResult: transport },
+      })),
+    };
+    const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root, videoInput: enabled }, new Agents(ctx));
+    try {
+      const scope = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as const;
+      const channel = await channels.resolve(scope);
+      await runtimes.get(channel, { platform: "test", selfId: "bot" } as never);
+      const agentConfig = vi.mocked(createAgent).mock.calls.at(-1)![0];
+      const read = agentConfig.tools!.find((tool) => tool.name === "read")!;
+      const uri = "asset://" + (await channel.resources.assets.put(VIDEO_BYTES));
+      state.active = "video-turn";
+      const result = await read.execute({ uri }, { toolCallId: "video-read", turnId: state.active, messages: [] } as never);
+      expect(result).toMatchObject({ videoMode: admitted ? "native" : "unavailable" });
+      const output = await read.toModelOutput!({ toolCallId: "video-read", input: { uri }, output: result });
+      expect(output.type).toBe(admitted ? "content" : "json");
+      if (admitted) {
+        const lifecycle = agentConfig.plugins!.find((plugin) => plugin.name === "core.image-projection")!;
+        await lifecycle.onTurnFinish!({ turnId: state.active, status: "done", messages: [] }, { turnId: state.active } as never);
+        expect(await read.toModelOutput!({ toolCallId: "video-read", input: { uri }, output: result })).toMatchObject({
+          type: "json",
+          value: { error: "video_projection_unavailable" },
+        });
+      }
+      expect(model.resolveChatModel.mock.calls.every(([id]) => id === config.chatModel)).toBe(true);
+    } finally {
+      state.active = null;
+      await runtimes.stop();
       await rm(root, { recursive: true, force: true });
     }
   });

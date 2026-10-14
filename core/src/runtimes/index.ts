@@ -1,9 +1,9 @@
-import { EphemeralImageProjectionStore } from "@yesimbot/agent-runtime";
+import { EphemeralImageProjectionStore, EphemeralVideoProjectionStore } from "@yesimbot/agent-runtime";
 import type { Bot, Context, Logger, Session } from "koishi";
 
 import { createImagePreviewCapability } from "../agents/image-preview.js";
 import { Agents, type ReplyStickerProvider } from "../agents/index.js";
-import type { ReadImagePolicy } from "../agents/tools.js";
+import type { ReadImagePolicy, ReadVideoPolicy } from "../agents/tools.js";
 import type { Channel, Channels } from "../channels/index.js";
 import { type ChannelContext, type ChannelKey, deriveChannelKey } from "../channels/index.js";
 import type { Config } from "../config.js";
@@ -103,6 +103,8 @@ export class Runtimes {
       const vision = this.resolveVision(channel.context);
       const imageProjection = new EphemeralImageProjectionStore();
       const readImagePolicy = resolveReadImagePolicy(chat, vision, this.config.imageInput);
+      const readVideoPolicy = resolveReadVideoPolicy(chat, this.config.videoInput === true);
+      const videoProjection = readVideoPolicy.mode === "native" ? new EphemeralVideoProjectionStore() : undefined;
       const registriesCurrent = () =>
         !this.stopped &&
         this.agents.revision === agentRevision &&
@@ -204,6 +206,8 @@ export class Runtimes {
         providerTools: chat.tools,
         visionModel: vision?.model,
         readImagePolicy,
+        readVideoPolicy,
+        ...(videoProjection ? { videoProjection } : {}),
         imageProjection,
         config: this.config,
         plugins,
@@ -482,6 +486,16 @@ export function resolveReadImagePolicy(primary: ChatModelRef, vision: ChatModelR
   }
 
   return { mode: "unavailable" };
+}
+
+/**
+ * Native video admission gate, kept entirely separate from the image policy: the configured flag,
+ * the primary model's `video` input modality and an explicit native video-tool-result transport
+ * must all hold. Unknown/unsupported declarations and every auxiliary/vision route fail closed.
+ */
+export function resolveReadVideoPolicy(primary: ChatModelRef, videoInput: boolean): Pick<ReadVideoPolicy, "mode"> {
+  const native = videoInput && (primary.entry.modalities?.input?.includes("video") ?? false) && primary.capabilities.videoToolResult === "native";
+  return { mode: native ? "native" : "unavailable" };
 }
 
 function formatBytes(size: number): string {

@@ -52,6 +52,7 @@ export default class YesImBotService extends Service<Config> {
       basePath: config.basePath || ctx.baseDir,
       logLevel: config.logLevel,
       imageInput: config.imageInput,
+      videoInput: config.videoInput,
       readTimeoutMs: config.resourceReadTimeout * 1000,
       compactConfig: config.session.compact,
       magicContext: config.session.magicContext?.enabled,

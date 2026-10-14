@@ -5,6 +5,15 @@ vi.mock("koishi", async () => import("@koishijs/core"));
 import { Config } from "../src/config.js";
 
 describe("Config schema", () => {
+  it("keeps video input opt-in and preserves independent image configuration", () => {
+    const old = Config({ chatModel: "test:model", imageInput: true } as never) as { videoInput?: boolean; imageInput: boolean };
+    expect(old.videoInput).toBe(false);
+    expect(old.imageInput).toBe(true);
+    const video = Config({ chatModel: "test:model", videoInput: true, imageInput: false } as never) as typeof old;
+    expect(video.videoInput).toBe(true);
+    expect(video.imageInput).toBe(false);
+  });
+
   it("keeps session management fields under the 会话管理 group", () => {
     const json = Config.toJSON() as {
       refs: Record<

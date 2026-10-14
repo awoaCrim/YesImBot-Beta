@@ -5,14 +5,18 @@ import { fileURLToPath } from "node:url";
 import { h, type Context, type Element } from "koishi";
 
 import type { AssetStore } from "./asset.js";
-import type { ImageFailureCode } from "./image-failure.js";
+import { isImageFailureCode, type ImageFailureCode } from "./image-failure.js";
 import type { ChannelResources } from "./index.js";
+import { isVideoFailureCode, type VideoFailureCode } from "./video-failure.js";
+import { detectVideoMediaType, VIDEO_MAX_BYTES } from "./video-media.js";
 
 const DATA_URL = /^data:([^;,]+)(;base64)?,([\s\S]*)$/;
 const BASE64_URL = /^base64:\/\/([\s\S]*)$/;
 const MAX_IMAGES = 4;
 const MAX_BYTES_PER_IMAGE = 5 * 1024 * 1024;
 const MAX_FILES = 2;
+/** One bounded native video per persistence call; its budget is separate from the image/text pool. */
+const MAX_VIDEOS = 1;
 
 /** 1 MiB of UTF-8 text already exceeds the read tool's character truncation; larger is useless to the model. */
 const MAX_BYTES_PER_FILE = 1024 * 1024;
@@ -27,12 +31,14 @@ const TEXT_FILE_EXTENSIONS: readonly string[] = [ "txt", "md", "markdown", "rst"
 const AMBIGUOUS_TYPES: readonly string[] = ["application/octet-stream", "binary/octet-stream", "application/unknown"];
 const BINARY_KINDS: readonly string[] = ["image", "audio", "video", "font"] as const;
 
-type ResourceKind = "image" | "text";
+type ResourceKind = "image" | "text" | "video";
 
 interface ResourceBudget {
   images: number;
   files: number;
+  videos: number;
   bytes: number;
+  videoBytes: number;
   timeoutMs: number;
 }
 
@@ -42,34 +48,36 @@ interface DownloadState {
 }
 
 class InputResourceError extends Error {
-  public constructor(public readonly code: ImageFailureCode) {
+  public constructor(public readonly code: ImageFailureCode | VideoFailureCode) {
     super(code);
   }
 }
 
-/** Persists inbound image and restricted text-file elements while the Session is live. */
+/** Persists inbound image, native video and restricted text-file elements while the Session is live. */
 export async function persistElements(
   ctx: Context,
   elements: readonly Element[],
   resources: ChannelResources,
   timeoutMs = RESOURCE_TIMEOUT_MS,
 ): Promise<Element[]> {
-  const budget: ResourceBudget = { images: 0, files: 0, bytes: 0, timeoutMs };
-  const prepared = await Promise.all(elements.map((element) => persistElement(ctx, element, resources.assets, budget)));
+  const budget: ResourceBudget = { images: 0, files: 0, videos: 0, bytes: 0, videoBytes: 0, timeoutMs };
+  const prepared = await Promise.all(elements.map((element) => persistElement(ctx, element, resources.assets, budget, resources.videoInput === true)));
   const logger = ctx.logger("yesimbot.resources");
   const imageCount = countElements(prepared, "img");
   const fileCount = countElements(prepared, "file");
-  if (imageCount || fileCount) {
-    logger.debug("resources.input.persisted", { imageCount, fileCount });
+  const videoCount = countElements(prepared, "video");
+  if (imageCount || fileCount || videoCount) {
+    logger.debug("resources.input.persisted", { imageCount, fileCount, videoCount });
   }
   return prepared;
 }
 
-async function persistElement(ctx: Context, element: Element, store: AssetStore, budget: ResourceBudget): Promise<Element> {
+async function persistElement(ctx: Context, element: Element, store: AssetStore, budget: ResourceBudget, videoInput: boolean): Promise<Element> {
   if (element.type === "img") return storeImage(ctx, element, store, budget);
+  if (element.type === "video") return storeVideo(ctx, element, store, budget, videoInput);
   if (element.type === "file") return storeTextFile(ctx, element, store, budget);
   if (element.children.length === 0) return element;
-  return h(element.type, element.attrs, await Promise.all(element.children.map((child) => persistElement(ctx, child, store, budget))));
+  return h(element.type, element.attrs, await Promise.all(element.children.map((child) => persistElement(ctx, child, store, budget, videoInput))));
 }
 
 async function storeImage(ctx: Context, element: Element, store: AssetStore, budget: ResourceBudget): Promise<Element> {
@@ -86,7 +94,7 @@ async function storeImage(ctx: Context, element: Element, store: AssetStore, bud
   try {
     data = await loadResource(ctx, source, "image", Math.min(MAX_BYTES_PER_IMAGE, remaining), budget.timeoutMs);
   } catch (cause) {
-    return failedImage(cause instanceof InputResourceError ? cause.code : "download_failed");
+    return failedImage(cause instanceof InputResourceError && isImageFailureCode(cause.code) ? cause.code : "download_failed");
   }
   if (budget.bytes + data.byteLength > MAX_TOTAL_BYTES) return failedImage("total_size_limit");
 
@@ -109,6 +117,52 @@ async function storeImage(ctx: Context, element: Element, store: AssetStore, bud
 
 function failedImage(code: ImageFailureCode): Element {
   return h("img", { yesimbotFailure: code });
+}
+
+/**
+ * Persists one valid MP4 as an immutable channel asset while its platform source is live. The
+ * replacement element carries only the asset id: signed/platform transport attributes such as
+ * `src`, `file`, `fileSize` and `url` are dropped so history never retains a temporary source.
+ * When native video input is disabled the element keeps its shape but loses those sources too.
+ */
+async function storeVideo(ctx: Context, element: Element, store: AssetStore, budget: ResourceBudget, enabled: boolean): Promise<Element> {
+  const existingId = element.attrs.id;
+  if (typeof existingId === "string" && /^[a-f0-9]{32}$/.test(existingId)) return safeVideoElement(existingId);
+  const source = element.attrs.src;
+  if (!enabled) return failedVideo("video_input_unavailable");
+  if (typeof source !== "string" || source.trim().length === 0) return failedVideo("missing_source");
+  if (budget.videos >= MAX_VIDEOS) return failedVideo("video_limit");
+  budget.videos += 1;
+  const remaining = VIDEO_MAX_BYTES - budget.videoBytes;
+  if (remaining <= 0) return failedVideo("total_size_limit");
+
+  let data: Uint8Array;
+  try {
+    data = await loadResource(ctx, source, "video", Math.min(VIDEO_MAX_BYTES, remaining), budget.timeoutMs);
+  } catch (cause) {
+    return failedVideo(cause instanceof InputResourceError && isVideoFailureCode(cause.code) ? cause.code : "download_failed");
+  }
+  if (budget.videoBytes + data.byteLength > VIDEO_MAX_BYTES || !detectVideoMediaType(data)) return failedVideo("not_video");
+
+  // Reserve the bytes before awaiting the store so concurrent elements cannot exceed the pool.
+  budget.videoBytes += data.byteLength;
+  let id: string;
+  try {
+    id = await store.put(data);
+  } catch {
+    budget.videoBytes -= data.byteLength;
+    return failedVideo("save_failed");
+  }
+  return safeVideoElement(id);
+}
+
+function failedVideo(code: VideoFailureCode): Element {
+  return h("video", { yesimbotFailure: code });
+}
+
+/** Only the durable asset id survives; cosmetic input attributes are not part of the video contract. */
+function safeVideoElement(id: string): Element {
+  return h("video", { id });
 }
 
 async function storeTextFile(ctx: Context, element: Element, store: AssetStore, budget: ResourceBudget): Promise<Element> {
@@ -165,7 +219,7 @@ async function loadResource(ctx: Context, src: string, kind: ResourceKind, maxBy
     controller.signal.throwIfAborted();
     return data;
   } catch (cause) {
-    const code: ImageFailureCode = controller.signal.aborted
+    const code: ImageFailureCode | VideoFailureCode = controller.signal.aborted
       ? "timeout"
       : cause instanceof InputResourceError
         ? cause.code
@@ -210,7 +264,7 @@ async function loadRemote(ctx: Context, src: string, kind: ResourceKind, signal:
     const rawType = response.headers.get("content-type");
     if (rawLength !== null && /^\d+$/.test(rawLength) && Number(rawLength) > maxBytes) throw new InputResourceError("too_large");
     const type = rawType === null ? null : rawType.split(";")[0]!.trim().toLowerCase();
-    if (!matchesKind(type, kind)) throw new InputResourceError(kind === "image" ? "not_image" : "download_failed");
+    if (!matchesKind(type, kind)) throw new InputResourceError(kind === "image" ? "not_image" : kind === "video" ? "not_video" : "download_failed");
   } catch (cause) {
     void response.data.cancel().catch(() => undefined);
     throw cause;
@@ -222,6 +276,7 @@ async function loadRemote(ctx: Context, src: string, kind: ResourceKind, signal:
 function matchesKind(type: string | null, kind: ResourceKind): boolean {
   if (type === null) return true;
   if (kind === "image") return type.startsWith("image/") || AMBIGUOUS_TYPES.includes(type);
+  if (kind === "video") return type === "video/mp4" || type === "application/mp4" || AMBIGUOUS_TYPES.includes(type);
   return !BINARY_KINDS.some((prefix) => type.startsWith(`${prefix}/`));
 }
 
@@ -273,7 +328,9 @@ function decodeDataUrl(src: string, maxBytes: number): Uint8Array | null {
   const match = DATA_URL.exec(src);
   if (!match) return null;
   const [, _mime, base64, payload] = match;
-  if (base64 && Math.ceil(payload.length / 4) * 3 > maxBytes) throw new Error("Resource exceeds byte limit");
+  // Bound encoded input before decoding; canonical padding must not reject an exact byte limit.
+  // The observed-byte check below still enforces the unchanged image/text/video allowance.
+  if (base64 && payload.length > Math.ceil(maxBytes / 3) * 4) throw new Error("Resource exceeds byte limit");
   if (!base64 && payload.length > maxBytes) throw new Error("Resource exceeds byte limit");
   const decoded = base64 ? new Uint8Array(Buffer.from(payload, "base64")) : new TextEncoder().encode(decodeURIComponent(payload));
   if (decoded.byteLength > maxBytes) throw new Error("Resource exceeds byte limit");
@@ -284,7 +341,7 @@ function decodeBase64Url(src: string, maxBytes: number): Uint8Array | null {
   const match = BASE64_URL.exec(src);
   if (!match) return null;
   const payload = match[1]!;
-  if (Math.ceil(payload.length / 4) * 3 > maxBytes) throw new Error("Resource exceeds byte limit");
+  if (payload.length > Math.ceil(maxBytes / 3) * 4) throw new Error("Resource exceeds byte limit");
   const decoded = new Uint8Array(Buffer.from(payload, "base64"));
   if (decoded.byteLength > maxBytes) throw new Error("Resource exceeds byte limit");
   return decoded;

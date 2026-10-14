@@ -29,3 +29,5 @@ export * from "./storage.js";
 export * from "./tools.js";
 
 export * from "./turn.js";
+
+export * from "./video-projection.js";

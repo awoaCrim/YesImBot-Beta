@@ -29,6 +29,9 @@ export const Config: Schema<Config> = Schema.intersect([
   }).description("基础配置"),
   Schema.object({
     imageInput: Schema.boolean().default(true).description("允许支持图片输入的模型直接接收当前消息图片，并通过 read 工具读取图片"),
+    videoInput: Schema.boolean()
+      .default(false)
+      .description("允许主模型通过 read 工具读取当前消息中不超过 10 MiB 的 MP4 视频原件；默认关闭，需模型与提供商同时支持原生视频工具结果"),
     modelRetries: Schema.number().min(0).max(5).default(3).description("主聊天模型遇到可重试 HTTP 429 时的最大重试次数"),
     resourceReadTimeout: Schema.number().min(1).default(30).description("上传图片/文件下载及资源读取的超时时间（秒）"),
   }).description("模型输入与资源读取"),
@@ -146,6 +149,7 @@ export interface Config {
   logLevel: number;
   allowedChannels: ChannelAllowRule[];
   imageInput: boolean;
+  videoInput?: boolean;
   modelRetries: number;
   resourceReadTimeout: number;
   pacing: PacingConfig;
