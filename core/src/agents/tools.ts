@@ -628,6 +628,7 @@ export function sleep(timeout: number, signal?: AbortSignal): Promise<void> {
 function sendMessageDescription(innerThought: boolean): string {
   return `向频道发送文字或消息元素。你的普通文本输出不会被发送；调用本工具才能发送 messages 中的内容。其他实际提供的发送工具可以发送它们各自支持的内容。
 调用后生成真正展示给用户的消息，可以针对某个用户或所有用户回复；只写在普通文本输出里的内容不会被送达。
+消息正文使用普通文本，不使用 Markdown 格式。
 
 # 参数
 

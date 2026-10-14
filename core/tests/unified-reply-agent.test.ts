@@ -8,7 +8,7 @@ vi.mock("../src/agents/tools.js", async (original) => ({ ...(await original<obje
 import { StickerDeliveryService } from "../../plugins/sticker-manager/src/delivery.js";
 import type { StickerStore } from "../../plugins/sticker-manager/src/store.js";
 import { config, createDeps, scope, stickerId } from "../../plugins/sticker-manager/tests/preview-fixtures.js";
-import { createReplyTools } from "../src/agents/reply-tools.js";
+import { authoredDescription, createReplyTools } from "../src/agents/reply-tools.js";
 import { createFinishTool } from "../src/agents/tools.js";
 import { collectDeliveredSourceRecords, createInternalHistoryProjectionPlugin, stripInternalAssistantInputs } from "../src/conversations/internal-history.js";
 import { beginReplyJournal, createReplyJournalHistoryPlugin } from "../src/conversations/reply-journal.js";
@@ -121,6 +121,17 @@ async function run(steps: Step[], options: { failedPreview?: boolean; cancelAfte
 }
 const send = (parts: object[], keepGoing = false): Call => ({ toolName: "send_message", input: { parts, continue: keepGoing } });
 
+describe("send_message formatting prompt", () => {
+  it.each([
+    { innerThought: false, stickerAvailable: false },
+    { innerThought: false, stickerAvailable: true },
+    { innerThought: true, stickerAvailable: false },
+    { innerThought: true, stickerAvailable: true },
+  ])("requires plain text without Markdown for %j", ({ innerThought, stickerAvailable }) => {
+    expect(authoredDescription(innerThought, stickerAvailable)).toContain("消息正文使用普通文本，不使用 Markdown 格式。");
+  });
+});
+
 describe("actual SDK unified reply orchestration", () => {
   it.each([
     { name: "short text", parts: [text("short")], kinds: ["text"] },
@@ -134,6 +145,9 @@ describe("actual SDK unified reply orchestration", () => {
     expect(f.events).not.toContain("turn.failed");
     expect(f.sendMessage.mock.calls.map((call) => call[1].map((element) => (element as { type: string }).type).join(""))).toEqual(kinds);
     expect(f.records).toHaveLength(parts.length);
+    expect(f.model.doStreamCalls[0]?.tools?.find((tool) => tool.name === "send_message")?.description).toContain(
+      "消息正文使用普通文本，不使用 Markdown 格式。",
+    );
     // Only the scripted main-model steps run: no second expression/auxiliary inference exists.
     expect(f.model.doStreamCalls).toHaveLength(1);
     expect(JSON.stringify(f.entries)).not.toContain('"type":"image-data"');

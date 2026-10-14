@@ -327,6 +327,7 @@ describe("send_message tool", () => {
     const tool = createSendMessageTool({ bot: { sendMessage } as never, channelId: "room", resources, pacing: PACING, innerThought: true });
 
     expect(tool.description).not.toContain("唯一途径");
+    expect(tool.description).toContain("消息正文使用普通文本，不使用 Markdown 格式。");
     expect(tool.description).toContain("你的普通文本输出不会被发送");
     expect(tool.description).toContain("其他实际提供的发送工具");
     expect(tool.description).toContain("必须检查 ok");
@@ -387,6 +388,7 @@ describe("send_message tool", () => {
     });
 
     expect(tool.description).not.toContain("inner_thought");
+    expect(tool.description).toContain("消息正文使用普通文本，不使用 Markdown 格式。");
     expect(JSON.stringify(tool.inputSchema)).not.toContain("inner_thought");
   });
 
