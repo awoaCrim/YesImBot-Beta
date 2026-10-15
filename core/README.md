@@ -122,6 +122,15 @@ or a required output tag. Its detailed contract lives in the tool definition;
 provider-native reasoning and existing history remain unchanged. Message splitting,
 `continue`, element syntax and escaping also belong to `send_message`, not Persona.
 
+`preventSelfStyleImitation` (default `false`, **防止沿用历史回复文风** in the
+configuration UI) adds a fixed expression reminder to every main-Agent request in
+both group and direct channels. Enable it to discourage copying the bot's own
+previous wording, emotional intensity, joke patterns and message layout. It retains
+facts, relationships, tool results and explicit Persona/card examples; it does not
+rewrite history or apply to auxiliary models. The reminder adds prompt cost and is
+not a hard output limit or a factual-correctness guarantee. Toggle it through the
+normal Koishi plugin reload/runtime recreation lifecycle.
+
 Prompts are frozen for each runtime, not reloaded from disk every turn. See
 [main-Agent prompt ownership](../docs/prompt-architecture.md) for precedence,
 plugin-managed role sections and an opt-in Anon reference draft.

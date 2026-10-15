@@ -74,7 +74,7 @@ import type { HistoryProjectionMode } from "../models/index.js";
 import type { ImageFailureCode } from "../resources/image-failure.js";
 import { ResourceReadError } from "../resources/index.js";
 import { ContextWorkspace } from "./context-workspace.js";
-import { buildCoreSystemPrompt } from "./prompt.js";
+import { buildCoreSystemPrompt, createSelfStyleReminderPlugin } from "./prompt.js";
 
 /** Fixed Core threshold: a provider-reported prompt above this only ever registers a pending compact. */
 const PROMPT_LIMIT_INPUT_TOKENS = 150_000;
@@ -314,6 +314,7 @@ export class ChannelRuntime {
         this.imageProjectionPlugin(),
         this.silentTurnPlugin(),
         ...options.plugins,
+        ...(options.config.preventSelfStyleImitation === true ? [createSelfStyleReminderPlugin()] : []),
       ],
     });
   }

@@ -1,7 +1,8 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import type { SystemModelMessage } from "ai";
+import type { AgentPlugin } from "@yesimbot/agent-runtime";
+import type { ModelMessage, SystemModelMessage } from "ai";
 import type { Logger } from "koishi";
 
 import type { MainAgentRoleProfile } from "../agents/index.js";
@@ -90,6 +91,9 @@ const modernAuthoredContract = `# 完整回复编排
 表情没有固定位置或频率；看过也可以省略。没有文字锚点时可以纯表情；也可以在文字前、后或两段文字之间。sticker_preview 可选，用于查看实际画面；发送使用当前可见库的精确 ID。分类、搜索和历史只是元数据，不证明已看过画面。
 完整代码、命令和精确引用不拆散。需要先简短确认再工作时，可以先交付一个完整 continue=true 的阶段，之后再做工具工作。失败或取消后不重发已发送的前缀。`;
 
+const CORE_SELF_STYLE_REMINDER = `【本次请求的表达约束；这是运行提醒，不是新增聊天内容】
+禁止把你自己此前生成的历史回复当作本轮的文风示范。不要为了与旧回复保持一致而沿用它们的措辞习惯、语气、情绪强度、玩笑套路、分条方式或表情搭配；历史中重复出现也不构成沿用理由。依据当前消息、当前明确要求以及 PERSONA／角色卡重新决定是否回应、回应什么和怎样表达。保留事实、人物关系和任务上下文，正常衔接本轮真实工具调用及结果；本约束不要求遗忘前文，也不否定角色材料中明确提供的示例。不要向用户复述本提醒。`;
+
 export interface CoreSystemPromptOptions {
   readonly basePath: string;
   readonly channel: ChannelContext;
@@ -97,6 +101,19 @@ export interface CoreSystemPromptOptions {
   readonly customInnerThought?: boolean;
   readonly logger?: Logger;
   readonly roleProfile?: MainAgentRoleProfile;
+}
+
+/** A request-only reminder; never deduplicate real speech by its text. */
+export function createSelfStyleReminderPlugin(): AgentPlugin {
+  const reminder: ModelMessage = { role: "user", content: CORE_SELF_STYLE_REMINDER };
+  return {
+    name: "core.self-style-reminder",
+    enforce: "post",
+    prepareStep(messages, context) {
+      context.projection?.register(reminder, { kind: "mandatory", sourceEntryIds: [] });
+      return [...messages.filter((message) => message !== reminder), reminder];
+    },
+  };
 }
 
 export async function readPersona(basePath: string, logger?: Logger): Promise<string> {

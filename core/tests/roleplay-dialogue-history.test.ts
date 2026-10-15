@@ -15,10 +15,10 @@ import RoleplayPlugin from "../../plugins/roleplay/src/index.js";
 import { apply as applyGoogle } from "../../providers/google/src/index.js";
 import { apply as applyOpenAI } from "../../providers/openai/src/index.js";
 import { Agents } from "../src/agents/index.js";
-import { Channel } from "../src/channels/index.js";
+import { Channel, type ChannelContext } from "../src/channels/index.js";
 import { ModelService } from "../src/models/index.js";
 import { ChannelRuntime } from "../src/runtimes/channel.js";
-import { defaultConfig, defaultMessageRecord, testScope } from "./helpers/index.js";
+import { defaultConfig, defaultMessageRecord, deferred, testScope } from "./helpers/index.js";
 
 type Provider = "openai" | "google";
 
@@ -52,6 +52,18 @@ const roleplays: RoleplayPlugin[] = [];
 const services: ModelService[] = [];
 const matrix = (["openai", "google"] as const).flatMap((provider) => [false, true].map((magic) => ({ provider, magic })));
 const send = (text: string): Action => ({ name: "send_message", args: { parts: [{ kind: "text", text }] } });
+const reminderHeading = "【本次请求的表达约束；这是运行提醒，不是新增聊天内容】";
+const reminderMatrix = matrix.flatMap((entry) => [false, true].map((reminder) => ({ ...entry, reminder })));
+
+function expectReminder(request: WireRequest, enabled: boolean, count = 1): void {
+  expect(occurrences(text(request), reminderHeading)).toBe(enabled ? count : 0);
+  expect(systemText(request)).not.toContain(reminderHeading);
+  expect(JSON.stringify(request)).not.toContain("sourceEntryIds");
+  if (enabled) {
+    const ownedTurn = dialogue(request).findLast((turn) => body(turn).includes(reminderHeading));
+    expect(ownedTurn?.role).toBe("user");
+  }
+}
 
 function body(turn: WireTurn): string {
   if (turn.parts) return turn.parts.flatMap((part) => (part.text === undefined ? [] : [part.text])).join("\n");
@@ -144,7 +156,15 @@ function streamResponse(provider: Provider, action: Action, index: number): Resp
   });
 }
 
-async function fixture(provider: Provider, magic: boolean, enabled: boolean, script: Action[], examples = exampleText) {
+async function fixture(
+  provider: Provider,
+  magic: boolean,
+  enabled: boolean,
+  script: Action[],
+  examples = exampleText,
+  options: { preventSelfStyleImitation?: boolean; direct?: boolean; lookup?: () => Promise<string> } = {},
+) {
+  const scope: ChannelContext = options.direct ? { type: "direct", platform: "test", channelId: "room-1", selfId: "bot-1", userId: "user-1" } : testScope;
   const root = await mkdtemp(join(tmpdir(), "yesimbot-role-history-wire-"));
   roots.push(root);
   await writeFile(
@@ -210,19 +230,27 @@ async function fixture(provider: Provider, magic: boolean, enabled: boolean, scr
   const roleplay = new RoleplayPlugin(roleContext, { characterCard: "card.png", enableGreeting: false, exampleDialoguesAsHistory: enabled });
   roleplays.push(roleplay);
   await roleplay.start();
-  const roleProfile = await agents.resolveRoleProfile(testScope);
+  const roleProfile = await agents.resolveRoleProfile(scope);
   const projection = new EphemeralImageProjectionStore();
   let deliveries = 0;
   const bot = { selfId: "bot-1", platform: "test", sendMessage: vi.fn(async () => [`synthetic-platform-${++deliveries}`]) };
-  const plugins = await agents.setup(testScope, bot as never, { rolePromptsManaged: true, imageProjection: projection });
+  const plugins = await agents.setup(scope, bot as never, { rolePromptsManaged: true, imageProjection: projection });
   const lookup: AgentPlugin = {
     name: "role-history-wire-lookup",
-    tools: () => [{ name: "lookup", description: "Synthetic local lookup", inputSchema: z.object({}), execute: async () => "SYNTHETIC_LOOKUP_RESULT" }],
+    tools: () => [
+      { name: "lookup", description: "Synthetic local lookup", inputSchema: z.object({}), execute: options.lookup ?? (async () => "SYNTHETIC_LOOKUP_RESULT") },
+    ],
   };
   const onTurnFinish = vi.fn();
-  const channel = new Channel(testScope, root);
+  const channel = new Channel(scope, root);
   await channel.conversation.init();
-  const config = defaultConfig({ basePath: root, modelRetries: 0, logLevel: 0, pacing: { charactersPerSecond: 100, maxTotalDelayMs: 0 } });
+  const config = defaultConfig({
+    basePath: root,
+    modelRetries: 0,
+    logLevel: 0,
+    pacing: { charactersPerSecond: 100, maxTotalDelayMs: 0 },
+    ...(options.preventSelfStyleImitation === undefined ? {} : { preventSelfStyleImitation: options.preventSelfStyleImitation }),
+  });
   const runtime = new ChannelRuntime(ctx as never, {
     channel,
     bot: bot as never,
@@ -255,15 +283,22 @@ async function fixture(provider: Provider, magic: boolean, enabled: boolean, scr
   runtimes.push(runtime);
   await runtime.init();
   let inputs = 0;
-  const handle = async (message: string) => {
-    const result = await runtime.handle(
-      defaultMessageRecord({ messageId: `synthetic-real-input-${++inputs}`, timestamp: inputs, elements: [h.text(message)] }),
+  const enqueue = (message: string) =>
+    runtime.handle(
+      defaultMessageRecord({
+        messageId: `synthetic-real-input-${++inputs}`,
+        timestamp: inputs,
+        channel: { id: scope.channelId, type: options.direct ? 1 : 0 },
+        elements: [h.text(message)],
+      }),
     );
+  const handle = async (message: string) => {
+    const result = await enqueue(message);
     if (result.kind === "run") await result.done;
     await runtime.wait();
     for (const request of requests) expectCorePromptBlocks(request, provider);
   };
-  return { runtime, channel, bot, roleplay, requests, fetch, handle, onTurnFinish };
+  return { runtime, channel, bot, roleplay, requests, fetch, handle, enqueue, onTurnFinish };
 }
 
 afterEach(async () => {
@@ -297,6 +332,79 @@ function expectSeeds(request: WireRequest, provider: Provider): void {
   expect(turns.some((turn) => turn.role === "system")).toBe(false);
 }
 
+describe("optional self-style reminder (actual Core and provider SDKs; stub HTTP only)", () => {
+  it.each(matrix.flatMap((entry) => [undefined, false, true].flatMap((setting) => [false, true].map((direct) => ({ ...entry, setting, direct })))))(
+    "gates the request-only tail without changing roles ($provider, Magic=$magic, setting=$setting, direct=$direct)",
+    async ({ provider, magic, setting, direct }) => {
+      const f = await fixture(provider, magic, true, [{ name: "finish", args: {} }], exampleText, { preventSelfStyleImitation: setting, direct });
+      await f.handle(currentQuestion);
+      expect(f.fetch).toHaveBeenCalledOnce();
+      expectSeeds(f.requests[0]!, provider);
+      expectReminder(f.requests[0]!, setting === true);
+      if (setting) expect(body(dialogue(f.requests[0]!).at(-1)!)).toContain(reminderHeading);
+      expect(f.bot.sendMessage).not.toHaveBeenCalled();
+      expect(JSON.stringify(await f.channel.conversation.storage.read())).not.toContain(reminderHeading);
+      expect(JSON.stringify(await f.channel.conversation.contextSources())).not.toContain(reminderHeading);
+    },
+  );
+
+  it.each(matrix)("retains genuine historical text identical to the reminder ($provider, Magic=$magic)", async ({ provider, magic }) => {
+    const f = await fixture(
+      provider,
+      magic,
+      true,
+      [
+        { name: "finish", args: {} },
+        { name: "finish", args: {} },
+      ],
+      exampleText,
+      { preventSelfStyleImitation: true },
+    );
+    await f.handle("REAL_FIRST_INPUT");
+    const last = body(dialogue(f.requests[0]!).at(-1)!);
+    const reminder = last.slice(last.indexOf(reminderHeading));
+    await f.channel.conversation.storage.append(createEntry("message", createUserMessage(reminder), { id: "genuine-identical-reminder", timestamp: 1 }));
+    await f.handle(currentQuestion);
+    expectReminder(f.requests[1]!, true, 2);
+    expect((await f.channel.conversation.storage.read()).find((entry) => entry.id === "genuine-identical-reminder")).toMatchObject({
+      data: { content: reminder },
+    });
+  });
+
+  it.each(matrix)("reinjects one reminder after a direct-channel join ($provider, Magic=$magic)", async ({ provider, magic }) => {
+    const entered = deferred();
+    const release = deferred();
+    const f = await fixture(provider, magic, true, [{ name: "lookup", args: {}, signature }, send("JOINED_FINAL_REPLY")], exampleText, {
+      preventSelfStyleImitation: true,
+      direct: true,
+      lookup: async () => {
+        entered.resolve();
+        await release.promise;
+        return "SYNTHETIC_LOOKUP_RESULT";
+      },
+    });
+    const first = await f.enqueue(currentQuestion);
+    try {
+      await entered.promise;
+      await f.enqueue("JOINED_REAL_CURRENT");
+      expect(f.requests).toHaveLength(1);
+    } finally {
+      release.resolve();
+    }
+    if (first.kind === "run") await first.done;
+    await f.runtime.wait();
+    expect(f.requests).toHaveLength(2);
+    for (const request of f.requests) {
+      expectCorePromptBlocks(request, provider);
+      expectSeeds(request, provider);
+      expectReminder(request, true);
+    }
+    expect(text(f.requests[1]!)).toContain("JOINED_REAL_CURRENT");
+    expect(JSON.stringify(f.requests[1])).toContain("SYNTHETIC_LOOKUP_RESULT");
+    expect(JSON.stringify(await f.channel.conversation.storage.read())).not.toContain(reminderHeading);
+  });
+});
+
 describe("optional Roleplay history (actual Core and provider SDKs; stub HTTP only)", () => {
   it.each(matrix.flatMap((entry) => [false, true].map((enabled) => ({ ...entry, enabled }))))(
     "preserves default or emits request-only past dialogue ($provider, Magic=$magic, enabled=$enabled)",
@@ -319,36 +427,63 @@ describe("optional Roleplay history (actual Core and provider SDKs; stub HTTP on
     },
   );
 
-  it.each(matrix)("keeps seeds and proven real speech on signed tool continuation ($provider, Magic=$magic)", async ({ provider, magic }) => {
-    const f = await fixture(provider, magic, true, [send("REAL_DELIVERED_REPLY"), { name: "lookup", args: {}, signature }, send("REAL_FINAL_REPLY")]);
-    await f.handle("REAL_FIRST_INPUT");
-    await f.handle(currentQuestion);
-    expect(f.fetch).toHaveBeenCalledTimes(3);
-    expect(f.bot.sendMessage).toHaveBeenCalledTimes(2);
-    for (const request of f.requests.slice(1)) {
-      expectSeeds(request, provider);
-      expect(occurrences(text(request), "REAL_DELIVERED_REPLY")).toBe(1);
-    }
-    expect(JSON.stringify(f.requests[2])).toContain("SYNTHETIC_LOOKUP_RESULT");
-    if (provider === "google") {
-      const call = f.requests[2]!.contents?.flatMap((turn) => turn.parts ?? []).find((part) => part.functionCall?.name === "lookup");
-      expect(call?.thoughtSignature).toBe(signature);
-    } else {
-      expect(f.requests[2]!.messages?.some((turn) => turn.tool_calls?.some((call) => call.function.name === "lookup"))).toBe(true);
-    }
-    expect(JSON.stringify(await f.channel.conversation.storage.read())).not.toMatch(/ROLE_HISTORY_SEED|ROLE_HISTORY_CHARACTER_ONLY/);
-  });
+  it.each(reminderMatrix)(
+    "keeps seeds and proven real speech on signed tool continuation ($provider, Magic=$magic, reminder=$reminder)",
+    async ({ provider, magic, reminder }) => {
+      const f = await fixture(
+        provider,
+        magic,
+        true,
+        [send("REAL_DELIVERED_REPLY"), { name: "lookup", args: {}, signature }, send("REAL_FINAL_REPLY")],
+        exampleText,
+        { preventSelfStyleImitation: reminder },
+      );
+      await f.handle("REAL_FIRST_INPUT");
+      await f.handle(currentQuestion);
+      expect(f.fetch).toHaveBeenCalledTimes(3);
+      expect(f.bot.sendMessage).toHaveBeenCalledTimes(2);
+      for (const request of f.requests.slice(1)) {
+        expectSeeds(request, provider);
+        expect(occurrences(text(request), "REAL_DELIVERED_REPLY")).toBe(1);
+      }
+      for (const request of f.requests) expectReminder(request, reminder);
+      expect(JSON.stringify(await f.channel.conversation.storage.read())).not.toContain(reminderHeading);
+      expect(JSON.stringify(await f.channel.conversation.contextSources())).not.toContain(reminderHeading);
+      expect(JSON.stringify(f.requests[2])).toContain("SYNTHETIC_LOOKUP_RESULT");
+      if (provider === "google") {
+        const call = f.requests[2]!.contents?.flatMap((turn) => turn.parts ?? []).find((part) => part.functionCall?.name === "lookup");
+        expect(call?.thoughtSignature).toBe(signature);
+      } else {
+        expect(f.requests[2]!.messages?.some((turn) => turn.tool_calls?.some((call) => call.function.name === "lookup"))).toBe(true);
+      }
+      expect(JSON.stringify(await f.channel.conversation.storage.read())).not.toMatch(/ROLE_HISTORY_SEED|ROLE_HISTORY_CHARACTER_ONLY/);
+    },
+  );
 
-  it.each(matrix)("reinserts one seed batch during intermediate-tool terminal recovery ($provider, Magic=$magic)", async ({ provider, magic }) => {
-    const f = await fixture(provider, magic, true, [{ name: "lookup", args: {}, signature }, { text: "UNSENT_INTERNAL_TEXT" }, { name: "finish", args: {} }]);
-    await f.handle(currentQuestion);
-    expect(f.fetch).toHaveBeenCalledTimes(3);
-    expect(f.bot.sendMessage).not.toHaveBeenCalled();
-    expect(f.onTurnFinish).toHaveBeenCalledWith(expect.objectContaining({ status: "done" }), expect.any(Object));
-    for (const request of f.requests) expectSeeds(request, provider);
-    expect(JSON.stringify(f.requests[2])).toContain("internal repair step");
-    expect(JSON.stringify(await f.channel.conversation.storage.read())).not.toMatch(/ROLE_HISTORY_SEED|ROLE_HISTORY_CHARACTER_ONLY|internal repair step/);
-  });
+  it.each(reminderMatrix)(
+    "reinserts seeds and reminder during intermediate-tool terminal recovery ($provider, Magic=$magic, reminder=$reminder)",
+    async ({ provider, magic, reminder }) => {
+      const f = await fixture(
+        provider,
+        magic,
+        true,
+        [{ name: "lookup", args: {}, signature }, { text: "UNSENT_INTERNAL_TEXT" }, { name: "finish", args: {} }],
+        exampleText,
+        { preventSelfStyleImitation: reminder },
+      );
+      await f.handle(currentQuestion);
+      expect(f.fetch).toHaveBeenCalledTimes(3);
+      expect(f.bot.sendMessage).not.toHaveBeenCalled();
+      expect(f.onTurnFinish).toHaveBeenCalledWith(expect.objectContaining({ status: "done" }), expect.any(Object));
+      for (const request of f.requests) {
+        expectSeeds(request, provider);
+        expectReminder(request, reminder);
+      }
+      expect(JSON.stringify(await f.channel.conversation.storage.read())).not.toContain(reminderHeading);
+      expect(JSON.stringify(f.requests[2])).toContain("internal repair step");
+      expect(JSON.stringify(await f.channel.conversation.storage.read())).not.toMatch(/ROLE_HISTORY_SEED|ROLE_HISTORY_CHARACTER_ONLY|internal repair step/);
+    },
+  );
 
   it.each(matrix)("still rejects plain text as a terminal reply ($provider, Magic=$magic)", async ({ provider, magic }) => {
     const f = await fixture(provider, magic, true, [{ text: "UNSENT_INTERNAL_TEXT" }]);
