@@ -53,12 +53,12 @@ export function createStickerPreviewTool(options: StickerPreviewToolOptions): Ag
   return {
     name: "sticker_preview",
     description: [
-      "可选地查看已有表情包的实际画面，不是发送前置条件；分类、标签和搜索元数据不算看过。",
-      "可传精确 sticker_id，或按 category/index/tags 选定一张；不传参数随机挑选候选供查看，不会直接发送。",
+      "查看已有表情包的实际画面；分类、标签和搜索结果仅为元数据。",
+      "可传精确 sticker_id，或按 category/index/tags 选择；不传参数随机挑选供查看。",
       options.deliveryMode === "authored"
-        ? "返回实际画面或视觉描述及精确 id；可以把当前可见库的精确 id 放入 send_message 完整 parts，查看不限制发送目标。"
-        : "返回实际画面或视觉描述及精确 id；sticker_send 可发送当前可见库的任意精确 id，查看不限制发送目标。",
-      "查看不会发送、不会增加使用次数，也不代表必须发送。动图可能只提供标明位置的采样帧，不要假设看到了整个动画。",
+        ? "返回画面或视觉描述及精确 ID，可用于 send_message 的 sticker parts；预览不是发送前置条件。"
+        : "返回画面或视觉描述及精确 ID，可用于 sticker_send；预览不是发送前置条件。",
+      "只查看，不发送或增加使用次数；动图采样帧不能代表完整动画。",
     ].join("\n"),
     inputSchema: jsonSchema<PreviewStickerInput>({
       type: "object",

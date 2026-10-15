@@ -31,6 +31,8 @@ node scripts/setup-koishi.mjs --create-app ../my-koishi --start
 - 表情包可以单独回应，也可以放在文字前后或两段文字之间；不要求每轮都发，同一轮最多发一张。
 - 找不到分类时会告诉你，或问管理员先导入。
 
+表情包库概览不会自动附加到每轮模型请求。模型需要挑选时，可用 `sticker_categories` 或 `sticker_search` 查询当前库，再自主决定是否使用；不要求群友先提出，也没有固定发送频率。
+
 群友不需要记任何命令。
 
 与支持统一回复编排的 Core 配套时，主 Agent 通过一次 `send_message` 的有序 `parts` 交付完整的文字与表情顺序，不再使用独立的 `sticker_send`。搜索、预览、收藏和管理员命令保留；旧版/独立接入仍可使用精确 ID 的单独发送工具。

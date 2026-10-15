@@ -123,6 +123,25 @@ describe("buildCoreSystemPrompt", () => {
     }
   });
 
+  it("keeps sticker-specific guidance out of general reply authorship", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-prompt-"));
+    try {
+      const prompt = await buildCoreSystemPrompt({
+        basePath: root,
+        channel: { type: "direct", platform: "test", channelId: "user", selfId: "bot" },
+        selfId: "bot",
+      });
+      const authored = String(prompt.find((block) => String(block.content).startsWith("# 完整回复编排"))?.content);
+      expect(authored).toContain("send_message");
+      expect(authored).toContain("parts");
+      expect(authored).toContain("continue=true");
+      expect(authored).toContain("完整代码、命令和精确引用不拆散");
+      expect(authored).not.toMatch(/表情|sticker|预览/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("requires explicit delivery without excluding plugin-owned sending tools", async () => {
     const root = await mkdtemp(join(tmpdir(), "yesimbot-prompt-"));
     try {

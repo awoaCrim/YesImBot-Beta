@@ -128,7 +128,19 @@ describe("send_message formatting prompt", () => {
     { innerThought: true, stickerAvailable: false },
     { innerThought: true, stickerAvailable: true },
   ])("requires plain text without Markdown for %j", ({ innerThought, stickerAvailable }) => {
-    expect(authoredDescription(innerThought, stickerAvailable)).toContain("消息正文使用普通文本，不使用 Markdown 格式。");
+    const description = authoredDescription(innerThought, stickerAvailable);
+    expect(description).toContain("消息正文使用普通文本，不使用 Markdown 格式。");
+    expect(description).toContain("parts 顺序就是发送顺序");
+    expect(description).toContain("continue 默认 false");
+    expect(description).not.toMatch(/两段文字之间|固定数量或搭配|看过并不意味着/);
+    if (stickerAvailable) {
+      expect(description).toContain('{kind:"sticker",sticker_id:"..."}');
+      expect(description).toContain("精确");
+      expect(description).toContain("sticker_preview 可选");
+    } else {
+      expect(description).toContain("当前没有表情发送能力");
+      expect(description).not.toContain("sticker_preview");
+    }
   });
 });
 

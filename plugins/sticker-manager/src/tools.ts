@@ -136,11 +136,10 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
     name: "sticker_send",
     terminal: (input) => !input.continue,
     description: [
-      "发送当前可见库的一张表情包，必须使用完整精确 sticker_id；sticker_preview 可选，不限制发送目标。",
-      "同一轮最多实际发送一张；本轮成功或结果不确定后再次调用会返回 sticker_send_limit_reached。",
-      "表情包可以单独作为回应，也可以放在文字之前或之后；顺序由你决定，没有固定搭配。",
-      "默认发送后结束本轮；continue=true 时继续下一步，用于在表情包之后还要发送文字。",
-      "不合适的场合可以直接省略表情包、只用文字回应，不要为了发送而选无关内容。",
+      "发送当前可见库的一张表情包，使用完整精确 sticker_id；sticker_preview 可选。",
+      "同一轮最多一次确认或不确定的发送；再次调用返回 sticker_send_limit_reached。",
+      "默认结束本轮；continue=true 时继续下一步。",
+      "不要用 <sticker/> 或历史 artifact://sticker/ 链接替代此工具。",
       ...(config.sendStaticAsGif ? ["静态图片会自动转成单帧 GIF 后发送。"] : []),
     ].join("\n"),
     inputSchema: jsonSchema<SendStickerInput>({
@@ -177,9 +176,7 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
 
   const categoriesTool: AgentTool<Record<string, never>, ToolResult> = {
     name: "sticker_categories",
-    description: config.enableSteal
-      ? "列出当前可见的表情包分类和每类数量，用于选择 sticker_steal 或 sticker_preview 的分类。"
-      : "列出当前可见的表情包分类和每类数量，用于选择 sticker_preview 的分类。",
+    description: "查询当前可见库的分类和每类数量。",
     inputSchema: jsonSchema<Record<string, never>>({ type: "object", additionalProperties: false }),
     execute: async () => {
       const categories = await store.listCategories(scopeKey);
@@ -204,7 +201,7 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
     description: [
       "搜索当前可见的表情包，返回紧凑 id 候选列表。",
       "category 按完整分类名精确匹配；keyword 只是分类名、id 或标签的单个子串，不支持 OR/AND 运算，也不按图片画面或人物进行语义搜索。",
-      "搜索结果只是候选元数据，不代表你已经看过画面；可用 sticker_preview 查看实际画面，也可直接发送当前可见库的精确 id。",
+      "搜索结果只是候选元数据，不代表你已经看过画面；sticker_preview 可查看实际画面。",
       "绝不能把返回的 id 拼成 artifact:// 等资源 URI。",
       ...(config.tagMode ? ["实验性 tag 模式开启时，可按 tags 过滤。"] : []),
     ].join("\n"),
@@ -238,7 +235,7 @@ export function createStickerTools(options: StickerToolsOptions): AgentTool[] {
   const manageTool: AgentTool<ManageStickerInput, ToolResult> = {
     name: "sticker_manage",
     description:
-      "管理当前可见库：move 单张重新分类；rename_category 分类改名；merge_category 分类合并；delete 删除精确单张（含管理员导入）。不支持整类或批量删除，不要循环单张删除模拟批量操作；批量需求交给管理员确认。分类通过记录创建，当前工具/查询结果比回合开始快照更新。",
+      "管理当前可见库：move 单张重新分类；rename_category 分类改名；merge_category 分类合并；delete 删除精确单张（含管理员导入）。不支持整类或批量删除，不要循环单张删除模拟批量操作；批量需求交给管理员确认。分类通过记录创建，修改后重新查询可获取当前状态。",
     inputSchema: jsonSchema<ManageStickerInput>({
       oneOf: [
         {

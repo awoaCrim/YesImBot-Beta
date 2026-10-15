@@ -203,7 +203,8 @@ describe("StickerManagerPlugin", () => {
     const prompt = await pluginPrompt(plugin);
     expect(prompt).not.toContain("sticker_send");
     expect(prompt).not.toContain("continue 设为 true");
-    expect(prompt).toContain("完整 parts");
+    expect(prompt).toContain("send_message");
+    expect(prompt).toContain("sticker parts");
     const tools = typeof plugin?.tools === "function" ? await plugin.tools({} as never) : [];
     expect(tools?.find((tool) => tool.name === "sticker_preview")?.description).not.toContain("sticker_send");
     const provider = registerSticker.mock.calls[0]![0];
@@ -268,79 +269,104 @@ describe("StickerManagerPlugin", () => {
     expect(await toolNames(plugin)).toContain("sticker_send");
   });
 
-  it("requires sticker_send instead of advertising direct sticker output", async () => {
-    const harness = createHarness({ enableSteal: false, stickerElement: true });
-    const agentPlugin = await harness.start();
-
+  it("keeps optional choice in the capability note and legacy mechanics in the sending tool", async () => {
+    const agentPlugin = await createHarness({ enableSteal: false, stickerElement: true }).start();
     const prompt = await pluginPrompt(agentPlugin);
-    expect(prompt).toContain("发送表情包必须调用 sticker_send");
-    expect(prompt).not.toContain("当前角色本身喜欢用表情包");
-    expect(prompt).not.toContain("千早爱音");
-    expect(prompt).toContain("同一轮最多实际发送一张");
-    expect(prompt).toContain("开心、得意、吐槽、害羞");
-    expect(prompt).toContain("不要求每轮都发表情包");
-    expect(prompt).toContain("先表情后文字");
-    expect(prompt).toContain("只发文字");
-    expect(prompt).toContain("sticker_preview 是可选");
-    expect(prompt.length).toBeLessThan(700);
-    expect(prompt).not.toContain("再调用 terminal 的 sticker_send");
-    expect(prompt).toContain("continue 设为 true");
-    expect(prompt).not.toContain("也可以直接输出 <sticker");
-    expect(prompt).not.toContain("需要发图时可直接输出");
-    expect(prompt).not.toContain("不需要调用 sticker_send");
+    expect(prompt).toContain("自主选用");
+    expect(prompt).toContain("sticker_categories");
+    expect(prompt).toContain("sticker_search");
+    expect(prompt).toContain("sticker_send");
+    expect(prompt).not.toMatch(/开心、得意|先表情后文字|两段文字之间|同一轮最多|continue|artifact:/);
+    expect(prompt.length).toBeLessThan(300);
 
     const tools = typeof agentPlugin?.tools === "function" ? ((await agentPlugin.tools({} as never)) ?? []) : [];
     const sendTool = tools.find((tool) => tool.name === "sticker_send");
+    expect(sendTool?.description).toContain("精确 sticker_id");
     expect(sendTool?.description).toContain("sticker_preview 可选");
+    expect(sendTool?.description).toContain("sticker_send_limit_reached");
     expect(sendTool?.description).toContain("continue=true");
+    expect(sendTool?.description).toContain("artifact://sticker/");
+    expect(sendTool?.description).not.toMatch(/文字之前或之后|固定搭配|不合适的场合/);
+  });
+
+  it.each(
+    [false, true].flatMap((modern) =>
+      [false, true].flatMap((enableSteal) =>
+        [false, true].flatMap((enableManage) => [false, true].map((tagMode) => ({ modern, enableSteal, enableManage, tagMode }))),
+      ),
+    ),
+  )("keeps a compact capability note for %j", async ({ modern, enableSteal, enableManage, tagMode }) => {
+    const harness = createHarness({ enableSteal, enableManage, tagMode });
+    const plugin = await harness.start(
+      { selfId: "bot" },
+      scope,
+      modern
+        ? {
+            imageProjection: new EphemeralImageProjectionStore(),
+            replyDelivery: { version: 1, ownership: "authored", registerSticker: () => () => {} },
+          }
+        : undefined,
+    );
+    const prompt = await pluginPrompt(plugin);
+    const names = await toolNames(plugin);
+    expect(prompt).toContain("自主选用");
+    expect(prompt).toContain("sticker_categories");
+    expect(prompt).toContain("sticker_search");
+    expect(prompt).toContain(modern ? "send_message" : "sticker_send");
+    expect(prompt.includes("sticker_steal")).toBe(enableSteal);
+    expect(prompt.includes("sticker_manage")).toBe(enableManage);
+    expect(prompt.includes("sticker_tags")).toBe(tagMode);
+    expect(names.includes("sticker_send")).toBe(!modern);
+    expect(names.includes("sticker_steal")).toBe(enableSteal);
+    expect(names.includes("sticker_manage")).toBe(enableManage);
+    expect(names.includes("sticker_tags")).toBe(tagMode);
+    expect(prompt.length).toBeLessThan(300);
+    expect(prompt.split("\n").length).toBeLessThanOrEqual(5);
+    expect(prompt).not.toMatch(/表情包库概览|回合开始快照|开心、得意|两段文字之间|每轮发送/);
   });
 
   function preparation(turnId: string, stepNumber = 0) {
     return { turnId, stepNumber } as never;
   }
 
-  function catalogFrom(messages: readonly ModelMessage[]) {
-    const catalog = messages.find((message) => message.role === "user" && typeof message.content === "string" && message.content.startsWith("[表情包库概览"));
-    if (!catalog || typeof catalog.content !== "string") throw new Error("missing sticker catalog");
-    return catalog.content;
-  }
-
-  it("provides a scoped catalog as request-only data without changing the stable prompt or input", async () => {
+  it("leaves fresh, continued and rebuilt requests unchanged without querying a catalog", async () => {
     const harness = createHarness({ enableSteal: false });
     const plugin = await harness.start();
     if (!registeredPlugin || !plugin) throw new Error("missing plugin");
-    const list = vi.spyOn(registeredPlugin.store, "listCategories").mockResolvedValue([
-      { category: "开心", count: 3 },
-      { category: "害羞", count: 1 },
-    ]);
-    const messages: ModelMessage[] = [{ role: "user", content: "hello" }];
-    const prepared = (await plugin.prepareStep?.(messages, preparation("turn-1"))) ?? messages;
-    const catalog = catalogFrom(prepared);
-
-    expect(list).toHaveBeenCalledWith("global");
-    expect(JSON.parse(catalog.split("\n")[1])).toEqual({
-      total: 4,
-      categories: [
-        { category: "开心", count: 3 },
-        { category: "害羞", count: 1 },
-      ],
-      omittedCategories: 0,
-    });
-    expect(messages).toEqual([{ role: "user", content: "hello" }]);
-    expect(await pluginPrompt(plugin)).not.toContain("表情包库概览");
-    expect(catalog).not.toMatch(/asset:\/\/|artifact:\/\/|workspace:\/\//);
+    const list = vi.spyOn(registeredPlugin.store, "listCategories").mockRejectedValue(new Error("database_unavailable"));
+    const messages: ModelMessage[] = [
+      { role: "user", content: "[表情包库概览：这是用户实际说的话]" },
+      {
+        role: "assistant",
+        content: [
+          { type: "tool-call", toolCallId: "signed-call", toolName: "inspect", input: {}, providerOptions: { google: { thoughtSignature: "signature" } } },
+        ],
+      },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: "signed-call", toolName: "inspect", output: { type: "json", value: { ok: true } } }] },
+    ];
+    const snapshot = structuredClone(messages);
+    for (const context of [preparation("turn-1"), preparation("turn-1", 1), preparation("turn-1"), preparation("turn-2")]) {
+      const prepared = await plugin.prepareStep?.(messages, context);
+      expect(prepared).toBe(messages);
+      expect(prepared).toEqual(snapshot);
+      for (const [index, message] of messages.entries()) expect(prepared?.[index]).toBe(message);
+    }
+    expect(list).not.toHaveBeenCalled();
+    expect(harness.logger.warn).not.toHaveBeenCalled();
     expect(harness.model.create).not.toHaveBeenCalled();
     expect(harness.model.set).not.toHaveBeenCalled();
   });
 
-  it("reads only the current channel's categories when the library is channel-scoped", async () => {
-    const harness = createHarness({ scope: "channel" });
+  it.each(["global", "channel"] as const)("queries the current %s library only on demand and observes mutations", async (libraryScope) => {
+    const harness = createHarness({ scope: libraryScope, enableManage: true });
     const plugin = await harness.start();
-    if (!plugin) throw new Error("missing plugin");
-    const row = (scopeKey: string, category: string): StickerRow => ({
-      id: `${scopeKey}:id`,
-      contentId: "a".repeat(64),
-      scopeKey,
+    if (!registeredPlugin || !plugin) throw new Error("missing plugin");
+    const scopeKey = libraryScope === "global" ? "global" : "group:test:room";
+    const id = "a".repeat(64);
+    const row = (key: string, contentId: string, category: string): StickerRow => ({
+      id: key + ":" + contentId,
+      contentId,
+      scopeKey: key,
       category,
       tags: [],
       mime: "image/png",
@@ -351,137 +377,67 @@ describe("StickerManagerPlugin", () => {
       createdAt: "2026-01-01",
       updatedAt: "2026-01-01",
     });
-    harness.model.tables.set("yesimbot_sticker", [row("group:test:room", "本频道"), row("group:test:other", "其他频道")]);
-    const prepared = (await plugin.prepareStep?.([], preparation("turn-1"))) ?? [];
-
-    expect(harness.model.get).toHaveBeenCalledWith("yesimbot_sticker", { scopeKey: "group:test:room" });
-    expect(catalogFrom(prepared)).toContain("本频道");
-    expect(catalogFrom(prepared)).not.toContain("其他频道");
-  });
-
-  it("keeps one snapshot across steps and rebuilds, then refreshes for a new turn", async () => {
-    const harness = createHarness();
-    const plugin = await harness.start();
-    if (!registeredPlugin || !plugin) throw new Error("missing plugin");
-    const list = vi
-      .spyOn(registeredPlugin.store, "listCategories")
-      .mockResolvedValueOnce([{ category: "旧分类", count: 1 }])
-      .mockResolvedValue([{ category: "新分类", count: 2 }]);
-    const first = (await plugin.prepareStep?.([], preparation("turn-1"))) ?? [];
-    const nextStep = (await plugin.prepareStep?.([], preparation("turn-1", 1))) ?? [];
-    const rebuild = (await plugin.prepareStep?.(first, preparation("turn-1"))) ?? [];
-
-    expect(catalogFrom(nextStep)).toBe(catalogFrom(first));
-    expect(rebuild).toBe(first);
-    expect(list).toHaveBeenCalledOnce();
-    const nextTurn = (await plugin.prepareStep?.([], preparation("turn-2"))) ?? [];
-    expect(catalogFrom(nextTurn)).toContain("新分类");
-    expect(catalogFrom(nextTurn)).not.toContain("旧分类");
-    expect(list).toHaveBeenCalledTimes(2);
-  });
-
-  it("clears the catalog snapshot when the turn finishes", async () => {
-    const harness = createHarness();
-    const plugin = await harness.start();
-    if (!registeredPlugin || !plugin) throw new Error("missing plugin");
-    const list = vi.spyOn(registeredPlugin.store, "listCategories").mockResolvedValue([]);
+    harness.model.tables.set("yesimbot_sticker", [row(scopeKey, id, "old"), row("group:test:other", "b".repeat(64), "foreign")]);
+    const list = vi.spyOn(registeredPlugin.store, "listCategories");
     await plugin.prepareStep?.([], preparation("turn-1"));
-    await plugin.onTurnFinish?.({ turnId: "turn-1", status: "done", messages: [] }, { turnId: "turn-1" } as never);
-    await plugin.prepareStep?.([], preparation("turn-1"));
-    expect(list).toHaveBeenCalledOnce();
-    await plugin.prepareStep?.([], preparation("turn-2"));
-    expect(list).toHaveBeenCalledTimes(2);
+    expect(list).not.toHaveBeenCalled();
+    const tools = typeof plugin.tools === "function" ? await plugin.tools({} as never) : [];
+    const execute = async (name: string, input: unknown) => {
+      const tool = tools?.find((candidate) => candidate.name === name);
+      if (!tool) throw new Error("missing " + name);
+      return tool.execute(input, { turnId: "turn-1", messages: [] } as never);
+    };
+    expect(await execute("sticker_categories", {})).toMatchObject({ ok: true, categories: [{ category: "old", count: 1 }] });
+    expect(list).toHaveBeenCalledWith(scopeKey);
+    expect(await execute("sticker_manage", { action: "rename_category", source_category: "old", category: "new" })).toMatchObject({ ok: true, affected: 1 });
+    expect(await execute("sticker_categories", {})).toMatchObject({ ok: true, categories: [{ category: "new", count: 1 }] });
+    expect(await execute("sticker_search", { category: "new" })).toMatchObject({ ok: true, stickers: [{ id, category: "new" }] });
+    expect(await execute("sticker_search", { category: "foreign" })).toMatchObject({ ok: true, stickers: [] });
   });
 
-  it("catalog completion cannot reopen a finished turn or let retained mutation tools bypass lifecycle", async () => {
+  it.each(["finish", "replacement", "stop"] as const)("retains awaited mutation guards after %s without catalog preparation", async (boundary) => {
     const harness = createHarness({ enableManage: true });
     const plugin = await harness.start();
     if (!registeredPlugin || !plugin) throw new Error("missing plugin");
-    let complete!: (value: { category: string; count: number }[]) => void;
-    vi.spyOn(registeredPlugin.store, "listCategories").mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          complete = resolve;
-        }),
-    );
-    const pending = plugin.prepareStep?.([], preparation("turn-1"));
-    await plugin.onTurnFinish?.({ turnId: "turn-1", status: "done", messages: [] }, { turnId: "turn-1" } as never);
-    complete([{ category: "late", count: 1 }]);
-    expect(await pending).toEqual([]);
-    expect(await plugin.prepareStep?.([], preparation("turn-1"))).toEqual([]);
+    await plugin.prepareStep?.([], preparation("turn-1"));
+    let complete!: () => void;
+    const pause = new Promise<void>((resolve) => {
+      complete = resolve;
+    });
+    let stillAllowed: (() => boolean) | undefined;
+    const remove = vi.spyOn(registeredPlugin.store, "deleteSticker").mockImplementationOnce(async (_key, _id, guard) => {
+      stillAllowed = guard?.stillAllowed;
+      await pause;
+      throw new Error("retired operation");
+    });
     const tools = typeof plugin.tools === "function" ? await plugin.tools({} as never) : [];
     const manage = tools?.find((tool) => tool.name === "sticker_manage");
     if (!manage) throw new Error("missing management tool");
     const input = { action: "delete", sticker_id: "a".repeat(64) };
-    expect(await manage.execute(input, { turnId: "turn-1", messages: [] } as never)).toMatchObject({ error: "StickerCapabilityRetired" });
-    await plugin.prepareStep?.([], preparation("turn-2"));
-    await harness.stop();
-    expect(await manage.execute(input, { turnId: "turn-2", messages: [] } as never)).toMatchObject({ error: "StickerCapabilityRetired" });
+    const pending = manage.execute(input, { turnId: "turn-1", messages: [] } as never);
+    try {
+      expect(remove).toHaveBeenCalledOnce();
+      expect(stillAllowed?.()).toBe(true);
+      if (boundary === "finish") {
+        await plugin.onTurnFinish?.({ turnId: "turn-1", status: "done", messages: [] }, { turnId: "turn-1" } as never);
+        await plugin.prepareStep?.([], preparation("turn-1"));
+      } else if (boundary === "replacement") {
+        await plugin.prepareStep?.([], preparation("turn-2"));
+      } else {
+        await harness.stop();
+        await plugin.prepareStep?.([], preparation("turn-2"));
+      }
+      expect(stillAllowed?.()).toBe(false);
+      expect(await manage.execute(input, { turnId: "turn-1", messages: [] } as never)).toMatchObject({ error: "StickerCapabilityRetired" });
+      expect(remove).toHaveBeenCalledOnce();
+    } finally {
+      complete();
+      expect(await pending).toMatchObject({ error: "StickerCapabilityRetired" });
+    }
     expect(harness.model.remove).not.toHaveBeenCalled();
   });
 
-  it("limits catalog entries without enumerating every sticker", async () => {
-    const harness = createHarness();
-    const plugin = await harness.start();
-    if (!registeredPlugin || !plugin) throw new Error("missing plugin");
-    const categories = Array.from({ length: 50 }, (_, index) => ({ category: `分类-${index}`, count: 50 - index }));
-    vi.spyOn(registeredPlugin.store, "listCategories").mockResolvedValue(categories);
-    const text = catalogFrom((await plugin.prepareStep?.([], preparation("turn-1"))) ?? []);
-    const data = JSON.parse(text.split("\n")[1]);
-
-    expect(text.length).toBeLessThanOrEqual(2000);
-    expect(data.categories).toHaveLength(20);
-    expect(data.omittedCategories).toBe(30);
-    expect(data.total).toBe(1275);
-    expect(data.categories[0]).toEqual({ category: "分类-0", count: 50 });
-  });
-
-  it("caps serialized characters and preserves complete JSON-quoted category names", async () => {
-    const harness = createHarness();
-    const plugin = await harness.start();
-    if (!registeredPlugin || !plugin) throw new Error("missing plugin");
-    const names = Array.from({ length: 20 }, (_, index) => `${"\\".repeat(60)}${index}`);
-    const categories = [{ category: "x".repeat(3000), count: 99 }, ...names.map((category) => ({ category, count: 1 }))];
-    vi.spyOn(registeredPlugin.store, "listCategories").mockResolvedValue(categories);
-    const text = catalogFrom((await plugin.prepareStep?.([], preparation("turn-1"))) ?? []);
-    const data = JSON.parse(text.split("\n")[1]);
-
-    expect(text.length).toBeLessThanOrEqual(2000);
-    expect(data.categories.length).toBeGreaterThan(0);
-    expect(data.categories.length).toBeLessThan(20);
-    expect(data.categories.every((item: { category: string }) => names.includes(item.category))).toBe(true);
-    expect(data.omittedCategories).toBe(categories.length - data.categories.length);
-  });
-
-  it("announces an empty visible library without attempting delivery", async () => {
-    const harness = createHarness({ enableSteal: false });
-    const sendMessage = vi.fn();
-    const plugin = await harness.start({ selfId: "bot", sendMessage });
-    const text = catalogFrom((await plugin?.prepareStep?.([], preparation("turn-1"))) ?? []);
-
-    expect(text).toContain("回合开始时可见库为空");
-    expect(text).toContain("可以正常发送文字");
-    expect(sendMessage).not.toHaveBeenCalled();
-  });
-
-  it("fails open for a catalog read error and retries on the next turn", async () => {
-    const harness = createHarness();
-    const plugin = await harness.start();
-    if (!registeredPlugin || !plugin) throw new Error("missing plugin");
-    const list = vi
-      .spyOn(registeredPlugin.store, "listCategories")
-      .mockRejectedValueOnce(new Error("database_unavailable"))
-      .mockResolvedValue([{ category: "恢复", count: 1 }]);
-    const messages: ModelMessage[] = [{ role: "user", content: "hello" }];
-
-    expect(await plugin.prepareStep?.(messages, preparation("turn-1"))).toBe(messages);
-    expect(await plugin.prepareStep?.(messages, preparation("turn-1", 1))).toBe(messages);
-    expect(list).toHaveBeenCalledOnce();
-    expect(harness.logger.warn).toHaveBeenCalledOnce();
-    expect(catalogFrom((await plugin.prepareStep?.(messages, preparation("turn-2"))) ?? messages)).toContain("恢复");
-  });
-
-  it("includes the catalog in the real model request but never persists it in Agent storage", async () => {
+  it("keeps automatic catalogs out of real model requests and storage across tool steps and turns", async () => {
     const harness = createHarness();
     const plugin = await harness.start();
     if (!registeredPlugin || !plugin) throw new Error("missing plugin");
@@ -493,7 +449,7 @@ describe("StickerManagerPlugin", () => {
         return {
           stream: convertArrayToReadableStream([
             { type: "stream-start", warnings: [] },
-            { type: "tool-call", toolCallId: `call-${index}`, toolName: index === 0 ? "inspect" : "finish", input: "{}" },
+            { type: "tool-call", toolCallId: "call-" + index, toolName: index % 2 === 0 ? "inspect" : "finish", input: "{}" },
             {
               type: "finish",
               finishReason: { unified: "tool-calls", raw: "tool-calls" },
@@ -514,12 +470,16 @@ describe("StickerManagerPlugin", () => {
       ],
     });
     try {
-      agent.send(createUserMessage("hello"));
-      await agent.wait();
-      expect(model.doStreamCalls).toHaveLength(2);
-      expect(model.doStreamCalls.every((call) => JSON.stringify(call.prompt).includes("CATALOG_SENTINEL"))).toBe(true);
-      expect(list).toHaveBeenCalledOnce();
-      expect(JSON.stringify(await agent.storage.read())).not.toContain("CATALOG_SENTINEL");
+      for (const text of ["hello", "next scene"]) {
+        agent.send(createUserMessage(text));
+        await agent.wait();
+      }
+      expect(model.doStreamCalls).toHaveLength(4);
+      for (const call of model.doStreamCalls) {
+        expect(JSON.stringify(call.prompt)).not.toMatch(/CATALOG_SENTINEL|表情包库概览/);
+      }
+      expect(list).not.toHaveBeenCalled();
+      expect(JSON.stringify(await agent.storage.read())).not.toMatch(/CATALOG_SENTINEL|表情包库概览/);
       expect(harness.model.create).not.toHaveBeenCalled();
     } finally {
       await agent.stop();
@@ -533,7 +493,7 @@ describe("StickerManagerPlugin", () => {
     await expectToolNames(agentPlugin, ["sticker_preview", "sticker_steal", "sticker_send", "sticker_categories", "sticker_search"]);
     const prompt = await pluginPrompt(agentPlugin);
     expect(prompt).toContain("sticker_steal");
-    expect(prompt).toContain("收藏当前聊天");
+    expect(prompt).toContain("聊天图片");
   });
 
   it("clears the per-turn sticker claim when the Agent turn finishes", async () => {

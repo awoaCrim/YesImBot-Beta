@@ -19,6 +19,21 @@ describe("sticker agent tools", () => {
     expect(createDeps().tools.some((t) => t.name === "sticker_steal")).toBe(true);
   });
 
+  it("keeps discovery and delivery mechanics without preference or snapshot coaching", () => {
+    const deps = createDeps({ enableManage: true });
+    expect(deps.tool("sticker_categories").description).toContain("分类");
+    expect(deps.tool("sticker_categories").description).toContain("数量");
+    expect(deps.tool("sticker_categories").description).not.toContain("用于选择");
+    const description = deps.tool("sticker_send").description;
+    expect(description).toContain("精确 sticker_id");
+    expect(description).toContain("sticker_preview 可选");
+    expect(description).toContain("sticker_send_limit_reached");
+    expect(description).toContain("continue=true");
+    expect(description).toContain("artifact://sticker/");
+    expect(description).not.toMatch(/文字之前或之后|固定搭配|不合适的场合/);
+    expect(deps.tool("sticker_manage").description).not.toContain("快照");
+  });
+
   it("makes continuation explicit and keeps search metadata-only", () => {
     const deps = createDeps();
     const terminal = deps.tool("sticker_send").terminal;
