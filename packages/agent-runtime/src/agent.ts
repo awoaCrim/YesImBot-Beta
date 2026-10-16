@@ -417,6 +417,7 @@ export function createAgent(config: AgentConfig): Agent {
     turnId: string,
     currentEntries: Array<Extract<AgentEntry, { type: "message" }>>,
     liveEntries: ReadonlyMap<string, Extract<AgentEntry, { type: "message" }>>,
+    activeInputs: readonly AgentMessage[],
     signal: AbortSignal,
     historyMode: AgentHistoryMode,
   ) => {
@@ -459,6 +460,7 @@ export function createAgent(config: AgentConfig): Agent {
     return buildModelMessages({
       history,
       current,
+      activeInputs,
       live,
       pluginHost,
       context: { runtime: { id }, channel, state, turnId, signal, ...(projection ? { projection } : {}) },
@@ -521,6 +523,7 @@ export function createAgent(config: AgentConfig): Agent {
   const executeTurn = async (request: TurnRequest): Promise<TurnResult> => {
     const allMessages: AgentMessage[] = [];
     const liveTurnEntries = new Map<string, Extract<AgentEntry, { type: "message" }>>();
+    let activeInputs: readonly AgentMessage[] = [];
     const rememberLiveEntries = (entries: readonly AgentEntry[]) => {
       for (const entry of entries) {
         if (entry.type === "message") liveTurnEntries.set(entry.id, entry);
@@ -555,10 +558,18 @@ export function createAgent(config: AgentConfig): Agent {
         runTerminalRecovery = false;
 
         const currentEntries = isTerminalRecovery ? [] : await persistCurrentMessages(currentBatch, request.turnId);
+        if (currentEntries.length) activeInputs = currentEntries.map((entry) => entry.data);
         rememberLiveEntries(currentEntries);
         allMessages.push(...currentEntries.map((entry) => entry.data));
 
-        const baseModelMessages = await buildBoundaryModelMessages(request.turnId, currentEntries, liveTurnEntries, abortSignal, request.historyMode);
+        const baseModelMessages = await buildBoundaryModelMessages(
+          request.turnId,
+          currentEntries,
+          liveTurnEntries,
+          activeInputs,
+          abortSignal,
+          request.historyMode,
+        );
         const recoveryMessage: ModelMessage | undefined = isTerminalRecovery ? { role: "user", content: TERMINAL_TOOL_RECOVERY_PROMPT } : undefined;
         const prepareRequestMessages = (messages: readonly ModelMessage[]): ModelMessage[] => {
           if (!recoveryMessage) return [...messages];
@@ -591,12 +602,13 @@ export function createAgent(config: AgentConfig): Agent {
             if (stepNumber > 0) {
               const joined = await request.drainJoined();
               if (joined.length === 0) {
-                messages = await buildBoundaryModelMessages(request.turnId, [], liveTurnEntries, abortSignal, request.historyMode);
+                messages = await buildBoundaryModelMessages(request.turnId, [], liveTurnEntries, activeInputs, abortSignal, request.historyMode);
               } else {
                 const joinedEntries = await persistCurrentMessages(joined, request.turnId);
+                if (joinedEntries.length) activeInputs = joinedEntries.map((entry) => entry.data);
                 rememberLiveEntries(joinedEntries);
                 allMessages.push(...joinedEntries.map((entry) => entry.data));
-                messages = await buildBoundaryModelMessages(request.turnId, joinedEntries, liveTurnEntries, abortSignal, request.historyMode);
+                messages = await buildBoundaryModelMessages(request.turnId, joinedEntries, liveTurnEntries, activeInputs, abortSignal, request.historyMode);
               }
             }
 
@@ -635,6 +647,7 @@ export function createAgent(config: AgentConfig): Agent {
                   request.turnId,
                   [...liveTurnEntries.values()],
                   liveTurnEntries,
+                  activeInputs,
                   abortSignal,
                   request.historyMode,
                 );

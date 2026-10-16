@@ -4,13 +4,40 @@ const mocks = vi.hoisted(() => ({ generateText: vi.fn<() => Promise<{ text: stri
 
 vi.mock("ai", () => ({ generateText: mocks.generateText }));
 
-import { executeCompact, filterEntriesForCompression, formatCompactTimestamp } from "../src/conversations/compact.js";
+import { executeCompact, executeContinuity, filterEntriesForCompression, formatCompactTimestamp } from "../src/conversations/compact.js";
 
 afterEach(() => {
   mocks.generateText.mockReset();
 });
 
 describe("conversation compaction prompt", () => {
+  // These verify source/policy transport, not the semantic quality of scripted output.
+  it.each(["summary", "compartment", "assistantFacts", "continuity"] as const)("keeps attribution and selective original references in %s", async (mode) => {
+    const source =
+      "[2026-10-01 12:00] [Alice]: 请创作标题《云端星币王》的文案\n[2026-10-01 12:01] [assistant]: 暂称 Alice 为星币队长；猜她想拉别人付钱，尚未确认。\n[2026-10-01 12:02] [Alice]: 以后固定叫我小云；明天 13 点交稿。\n[2026-10-01 12:03] [Alice]: 我与 Bob 是队友；拉别人付钱只是机器人的猜测。\n[2026-10-01 12:04] [Bob]: 我和 Alice 确实同队，明天一起交付 2 张图。";
+    mocks.generateText.mockResolvedValue({
+      text:
+        mode === "continuity"
+          ? JSON.stringify({ goal: "记录来源", decisions: [], constraints: [], facts: [], unresolved: [], completed: [], pending: [] })
+          : "scripted historical record",
+    });
+    if (mode === "continuity") await executeContinuity({ model: {} as never, conversation: source });
+    else
+      await executeCompact({
+        model: {} as never,
+        conversation: source,
+        mode: mode === "compartment" ? "compartment" : "summary",
+        assistantAsFacts: mode === "assistantFacts",
+      });
+    const request = mocks.generateText.mock.calls[0]?.[0] as { system: string; prompt: string };
+    for (const rule of ["谁说了什么", "是否确认", "一次性玩笑", "固定称呼", "受托创作", "动机", "关键承诺", "未完成事项"])
+      expect(request.system).toContain(rule);
+    expect(request.system.split("主要记录谁说了什么")).toHaveLength(2);
+    expect(request.prompt).toContain(source);
+    expect(request.system).not.toContain("两边的内容都要保留");
+    expect(request.system).not.toContain("不要改写成“助手建议…”");
+  });
+
   it("uses an objective third-person prompt for compartment history", async () => {
     mocks.generateText.mockResolvedValue({ text: "用户在 2026-09-24 认识了项目 alpha。" });
 
@@ -144,13 +171,14 @@ describe("compaction input rendering", () => {
     expect(rendered).not.toContain("messageIds");
   });
 
-  it("states that assistant lines are the character speaking, not a third-party report", async () => {
+  it("keeps real assistant commitments as attributed history instead of a style sample", async () => {
     mocks.generateText.mockResolvedValue({ text: "ok" });
     await executeCompact({ model: {} as never, conversation: "[assistant]: 说好的一早就来" });
     const request = mocks.generateText.mock.calls[0]?.[0] as { system?: string };
-    expect(request.system).toContain("是这个角色本人说过的话");
+    expect(request.system).toContain("机器人已发送的历史记录");
     expect(request.system).toContain("承诺");
-    expect(request.system).toContain("第三方叙述");
+    expect(request.system).toContain("有来源的第三人称条目");
+    expect(request.system).toContain("必要原话可用引号保留");
   });
 
   it("anchors every rendered line with its Asia/Shanghai source date and minute", () => {

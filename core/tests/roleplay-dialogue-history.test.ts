@@ -92,6 +92,8 @@ function expectCorePromptBlocks(request: WireRequest, provider: Provider): void 
   expect(offsets.every((offset) => offset >= 0)).toBe(true);
   expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
   for (const heading of headings) expect(occurrences(all, heading)).toBe(1);
+  expect(occurrences(all, "回应不必附带点评")).toBe(1);
+  expect(occurrences(all, "同一作者、同一产品的其他动态不等于当前引用的上下文")).toBe(1);
   for (const marker of ["SYNTHETIC_CHARACTER_DEFINITION", "SYNTHETIC_CARD_RULE", "SYNTHETIC_POST_RULE"]) {
     expect(occurrences(all, marker)).toBe(1);
     expect(all.indexOf(marker)).toBeGreaterThan(all.indexOf("# 角色"));
@@ -107,6 +109,11 @@ function expectCorePromptBlocks(request: WireRequest, provider: Provider): void 
 
 function text(request: WireRequest): string {
   return dialogue(request).map(body).join("\n");
+}
+
+function expectFocus(request: WireRequest, expected: string): void {
+  const matches = [...text(request).matchAll(/\[CURRENT_MESSAGE\]\n?([\s\S]*?)\n?\[\/CURRENT_MESSAGE\]/g)];
+  expect(matches.map((match) => match[1]?.trim())).toEqual([expected]);
 }
 
 function occurrences(value: string, marker: string): number {
@@ -374,15 +381,22 @@ describe("optional self-style reminder (actual Core and provider SDKs; stub HTTP
   it.each(matrix)("reinjects one reminder after a direct-channel join ($provider, Magic=$magic)", async ({ provider, magic }) => {
     const entered = deferred();
     const release = deferred();
-    const f = await fixture(provider, magic, true, [{ name: "lookup", args: {}, signature }, send("JOINED_FINAL_REPLY")], exampleText, {
-      preventSelfStyleImitation: true,
-      direct: true,
-      lookup: async () => {
-        entered.resolve();
-        await release.promise;
-        return "SYNTHETIC_LOOKUP_RESULT";
+    const f = await fixture(
+      provider,
+      magic,
+      true,
+      [{ name: "lookup", args: {}, signature }, { name: "lookup", args: {}, signature }, send("JOINED_FINAL_REPLY")],
+      exampleText,
+      {
+        preventSelfStyleImitation: true,
+        direct: true,
+        lookup: async () => {
+          entered.resolve();
+          await release.promise;
+          return "SYNTHETIC_LOOKUP_RESULT";
+        },
       },
-    });
+    );
     const first = await f.enqueue(currentQuestion);
     try {
       await entered.promise;
@@ -393,7 +407,9 @@ describe("optional self-style reminder (actual Core and provider SDKs; stub HTTP
     }
     if (first.kind === "run") await first.done;
     await f.runtime.wait();
-    expect(f.requests).toHaveLength(2);
+    expect(f.requests).toHaveLength(3);
+    expectFocus(f.requests[0]!, currentQuestion);
+    for (const request of f.requests.slice(1)) expectFocus(request, "JOINED_REAL_CURRENT");
     for (const request of f.requests) {
       expectCorePromptBlocks(request, provider);
       expectSeeds(request, provider);
@@ -428,33 +444,36 @@ describe("optional Roleplay history (actual Core and provider SDKs; stub HTTP on
   );
 
   it.each(reminderMatrix)(
-    "keeps seeds and proven real speech on signed tool continuation ($provider, Magic=$magic, reminder=$reminder)",
+    "keeps focus, seeds and proven speech across two signed tool steps ($provider, Magic=$magic, reminder=$reminder)",
     async ({ provider, magic, reminder }) => {
       const f = await fixture(
         provider,
         magic,
         true,
-        [send("REAL_DELIVERED_REPLY"), { name: "lookup", args: {}, signature }, send("REAL_FINAL_REPLY")],
+        [send("REAL_DELIVERED_REPLY"), { name: "lookup", args: {}, signature }, { name: "lookup", args: {}, signature }, send("REAL_FINAL_REPLY")],
         exampleText,
         { preventSelfStyleImitation: reminder },
       );
       await f.handle("REAL_FIRST_INPUT");
       await f.handle(currentQuestion);
-      expect(f.fetch).toHaveBeenCalledTimes(3);
+      expect(f.fetch).toHaveBeenCalledTimes(4);
       expect(f.bot.sendMessage).toHaveBeenCalledTimes(2);
       for (const request of f.requests.slice(1)) {
+        expectFocus(request, currentQuestion);
         expectSeeds(request, provider);
         expect(occurrences(text(request), "REAL_DELIVERED_REPLY")).toBe(1);
       }
       for (const request of f.requests) expectReminder(request, reminder);
       expect(JSON.stringify(await f.channel.conversation.storage.read())).not.toContain(reminderHeading);
       expect(JSON.stringify(await f.channel.conversation.contextSources())).not.toContain(reminderHeading);
-      expect(JSON.stringify(f.requests[2])).toContain("SYNTHETIC_LOOKUP_RESULT");
+      const finalRequest = f.requests[3]!;
+      expect(JSON.stringify(finalRequest)).toContain("SYNTHETIC_LOOKUP_RESULT");
       if (provider === "google") {
-        const call = f.requests[2]!.contents?.flatMap((turn) => turn.parts ?? []).find((part) => part.functionCall?.name === "lookup");
-        expect(call?.thoughtSignature).toBe(signature);
+        const calls = finalRequest.contents?.flatMap((turn) => turn.parts ?? []).filter((part) => part.functionCall?.name === "lookup");
+        expect(calls).toHaveLength(2);
+        expect(calls?.every((call) => call.thoughtSignature === signature)).toBe(true);
       } else {
-        expect(f.requests[2]!.messages?.some((turn) => turn.tool_calls?.some((call) => call.function.name === "lookup"))).toBe(true);
+        expect(finalRequest.messages?.flatMap((turn) => turn.tool_calls ?? []).filter((call) => call.function.name === "lookup")).toHaveLength(2);
       }
       expect(JSON.stringify(await f.channel.conversation.storage.read())).not.toMatch(/ROLE_HISTORY_SEED|ROLE_HISTORY_CHARACTER_ONLY/);
     },
@@ -476,6 +495,7 @@ describe("optional Roleplay history (actual Core and provider SDKs; stub HTTP on
       expect(f.bot.sendMessage).not.toHaveBeenCalled();
       expect(f.onTurnFinish).toHaveBeenCalledWith(expect.objectContaining({ status: "done" }), expect.any(Object));
       for (const request of f.requests) {
+        expectFocus(request, currentQuestion);
         expectSeeds(request, provider);
         expectReminder(request, reminder);
       }

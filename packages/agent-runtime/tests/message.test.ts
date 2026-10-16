@@ -109,6 +109,8 @@ describe("model conversion", () => {
     expect(contexts.every((conversionContext) => conversionContext === firstContext)).toBe(true);
     expect(firstContext?.history).toEqual(transformedHistory);
     expect(firstContext?.current).toEqual(current);
+    expect(firstContext?.activeInputs).toEqual(current);
+    expect(Object.isFrozen(firstContext?.activeInputs)).toBe(true);
     expect(Object.isFrozen(firstContext)).toBe(true);
     expect(Object.isFrozen(firstContext?.history)).toBe(true);
     expect(Object.isFrozen(firstContext?.current)).toBe(true);
@@ -123,6 +125,35 @@ describe("model conversion", () => {
     await buildModelMessages({ history, current, pluginHost, context });
 
     expect(contexts.at(-1)).not.toBe(firstContext);
+  });
+
+  it("keeps an ordered focus snapshot independent of live/current batches", async () => {
+    const first = createCustomMessage("custom.visible", { text: "first input" });
+    const second = createCustomMessage("custom.visible", { text: "second input" });
+    const other = createCustomMessage("custom.visible", { text: "other live message" });
+    const activeInputs = [first, second];
+    const contexts: Array<Parameters<NonNullable<AgentPlugin["toModelMessages"]>>[1]> = [];
+    const { pluginHost, context } = createModelContext([
+      {
+        name: "focus-snapshot",
+        toModelMessages(message, conversionContext) {
+          contexts.push(conversionContext);
+          return message.role === "custom" && message.type === "custom.visible" ? { role: "user", content: message.data.text } : undefined;
+        },
+      },
+    ]);
+    await pluginHost.init();
+    const result = await buildModelMessages({ history: [first, second], current: [other], live: [first, second, other], activeInputs, pluginHost, context });
+    const snapshot = contexts[0];
+    expect(snapshot?.activeInputs).toEqual([first, second]);
+    expect(Object.isFrozen(snapshot?.activeInputs)).toBe(true);
+    expect(snapshot?.current).toEqual([other]);
+    expect(result.map((message) => message.content)).toEqual(["first input", "second input", "other live message"]);
+    activeInputs.reverse();
+    expect(snapshot?.activeInputs).toEqual([first, second]);
+    await buildModelMessages({ history: [first, second], current: [other], activeInputs: [], pluginHost, context });
+    expect(contexts.at(-1)?.activeInputs).toEqual([]);
+    expect(JSON.stringify(result)).not.toContain("activeInputs");
   });
 
   it("exposes initial and joined batches only to their submitting model requests", async () => {
@@ -167,8 +198,10 @@ describe("model conversion", () => {
 
     expect(contexts).toHaveLength(3);
     expect(contexts[0]?.current).toEqual([initial]);
+    expect(contexts[0]?.activeInputs).toEqual([initial]);
     expect(contexts[1]?.history).toEqual([initial]);
     expect(contexts[1]?.current).toEqual([joined]);
+    expect(contexts[1]?.activeInputs).toEqual([joined]);
     expect(contexts[2]).toBe(contexts[1]);
   });
 
@@ -204,6 +237,47 @@ describe("model conversion", () => {
     expect(contexts[0]?.current).toEqual([initial]);
     expect(contexts[1]?.history).toEqual([initial]);
     expect(contexts[1]?.current).toEqual([]);
+    expect(contexts[1]?.activeInputs).toEqual([initial]);
+  });
+
+  it("keeps admitted inputs separate from all live entries on guard rebuilds", async () => {
+    const contexts: Array<Parameters<NonNullable<AgentPlugin["toModelMessages"]>>[1]> = [];
+    streamTextMock.mockImplementationOnce((options) => ({
+      fullStream: (async function* () {
+        await options.prepareStep?.({ stepNumber: 0 });
+        await options.prepareStep?.({ stepNumber: 1 });
+        yield* [];
+      })(),
+    }));
+    const initial = createCustomMessage("custom.visible", { text: "initial" });
+    const unscoped = createCustomMessage("custom.visible", { text: "not an admitted input" });
+    let appended = false;
+    const agent = createAgent({
+      model: {} as never,
+      plugins: [
+        {
+          name: "observer",
+          toModelMessages(message, context) {
+            contexts.push(context);
+            return message.role === "custom" && message.type === "custom.visible" ? { role: "user", content: message.data.text } : undefined;
+          },
+        },
+      ],
+      beforeModelRequest: async (request) => {
+        if (!appended) {
+          appended = true;
+          await agent.append(unscoped);
+        }
+        return request.rebuildMessages();
+      },
+    });
+    agent.send(initial);
+    await agent.wait();
+    expect(contexts.length).toBeGreaterThan(3);
+    expect(contexts.every((context) => context.activeInputs?.length === 1 && context.activeInputs[0]?.id === initial.id)).toBe(true);
+    expect(contexts.some((context) => context.current.some((input) => input.id === unscoped.id))).toBe(true);
+    expect(contexts.some((context) => context.current.length === 0)).toBe(true);
+    expect(JSON.stringify(await agent.storage.read())).not.toContain("activeInputs");
   });
 
   it("keeps persisted custom projections as a later model-request prefix", async () => {
@@ -240,6 +314,8 @@ describe("model conversion", () => {
     expect(laterRequest?.at(-1)).toEqual({ role: "user", content: "second current" });
     expect(contexts[1]?.history).toEqual([first]);
     expect(contexts[1]?.current).toEqual([second]);
+    expect(contexts[1]?.activeInputs).toEqual([second]);
+    expect(contexts[1]?.activeInputs).not.toContain(first);
     expect(contexts[1]).not.toHaveProperty("session");
   });
 

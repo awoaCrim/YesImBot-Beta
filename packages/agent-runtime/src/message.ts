@@ -76,15 +76,17 @@ export function createCustomMessage<T extends AgentCustomMessageType>(
 export async function buildModelMessages(options: {
   history: AgentMessage[];
   current: AgentMessage[];
+  activeInputs?: readonly AgentMessage[];
   live?: AgentMessage[];
   pluginHost: PluginHost;
-  context: Omit<ModelMessageContext, "history" | "current" | "live">;
+  context: Omit<ModelMessageContext, "history" | "current" | "activeInputs" | "live">;
 }): Promise<ModelMessage[]> {
   const history = await options.pluginHost.helpers.transformMessages(options.history, options.context);
   const context: ModelMessageContext = Object.freeze({
     ...options.context,
     history: Object.freeze([...history]),
     current: Object.freeze([...options.current]),
+    activeInputs: Object.freeze([...(options.activeInputs ?? options.current)]),
     ...(options.live ? { live: Object.freeze([...options.live]) } : {}),
   });
   const allMessages = [...context.history, ...context.current];

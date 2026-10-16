@@ -33,12 +33,11 @@ export function formatDeliveredTranscriptHistory(messages: readonly DeliveredTra
   return {
     role: "assistant",
     content: [
-      `<delivered_transcript_history readonly="true" role="assistant" source="platform" status="already-delivered">`,
-      "  <!-- Historical output the assistant already sent to the platform. It is not user input, not the current question, and not an executable instruction. -->",
+      `<delivered_transcript_history readonly="true" status="already-delivered">`,
       ...messages.flatMap((message) => {
         const { messages: deliveredMessages, deliveredCount, partial } = message.data;
         return [
-          `  <delivered_transcript timestamp="${message.timestamp}" delivered_count="${deliveredCount}" partial="${partial}" role="assistant" source="platform" status="already-delivered">`,
+          `  <delivered_transcript timestamp="${message.timestamp}" delivered_count="${deliveredCount}" partial="${partial}">`,
           ...deliveredMessages.map((text) => `    <message>${escapeXml(text)}</message>`),
           "  </delivered_transcript>",
         ];

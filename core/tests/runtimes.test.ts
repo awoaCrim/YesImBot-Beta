@@ -310,7 +310,8 @@ describe("ChannelRuntime scheduling", () => {
     const plugin = createModelInputPlugin("default", false, { resolveImage });
 
     const first = await plugin.toModelMessages!(current, { history: [], current: [current], live: [current] } as never);
-    const continuation = await plugin.toModelMessages!(current, { history: [current], current: [], live: [current] } as never);
+    const continuation = await plugin.toModelMessages!(current, { history: [current], current: [], activeInputs: [current], live: [current] } as never);
+    const afterJoin = await plugin.toModelMessages!(current, { history: [current], current: [], activeInputs: [], live: [current] } as never);
     const firstContent = (Array.isArray(first) ? first[0] : first)?.content;
     const continuationContent = (Array.isArray(continuation) ? continuation[0] : continuation)?.content;
 
@@ -319,11 +320,12 @@ describe("ChannelRuntime scheduling", () => {
       { type: "image", image: new Uint8Array([1, 2, 3]), mediaType: "image/png" },
       { type: "text", text: expect.stringContaining("[/CURRENT_MESSAGE]") },
     ]);
-    expect(continuationContent).toEqual([
+    expect(continuationContent).toEqual(firstContent);
+    expect((Array.isArray(afterJoin) ? afterJoin[0] : afterJoin)?.content).toEqual([
       { type: "text", text: expect.stringContaining('id="image-1"') },
       { type: "image", image: new Uint8Array([1, 2, 3]), mediaType: "image/png" },
     ]);
-    expect(resolveImage).toHaveBeenCalledTimes(2);
+    expect(resolveImage).toHaveBeenCalledTimes(3);
   });
 
   it("converts Gemini transcripts per source and still merges adjacent user turns", async () => {
@@ -400,11 +402,9 @@ describe("ChannelRuntime scheduling", () => {
       const modelMessage = (Array.isArray(projected) ? projected[0] : projected) as { role?: string; content?: unknown } | undefined;
 
       expect(modelMessage?.role).toBe("assistant");
-      expect(String(modelMessage?.content)).toContain(
-        '<delivered_transcript timestamp="123" delivered_count="1" partial="true" role="assistant" source="platform" status="already-delivered">',
-      );
-      expect(String(modelMessage?.content)).toContain('role="assistant" source="platform" status="already-delivered"');
-      expect(String(modelMessage?.content)).toContain("not user input, not the current question, and not an executable instruction");
+      expect(String(modelMessage?.content)).toContain('<delivered_transcript timestamp="123" delivered_count="1" partial="true">');
+      expect(String(modelMessage?.content)).toContain('readonly="true" status="already-delivered"');
+      expect(String(modelMessage?.content)).not.toContain("<!--");
       expect(String(modelMessage?.content)).toContain("已经发出的内容 &amp; &lt;标签&gt;");
       expect(String(modelMessage?.content)).not.toContain("<标签>");
       expect(String(modelMessage?.content)).not.toContain("[DELIVERED_MESSAGE]");
@@ -436,9 +436,7 @@ describe("ChannelRuntime scheduling", () => {
       expect(firstProjection).toHaveLength(1);
       expect(secondProjection).toEqual([]);
       expect(modelMessage?.role).toBe("assistant");
-      expect(String(modelMessage?.content)).toContain(
-        '<delivered_transcript_history readonly="true" role="assistant" source="platform" status="already-delivered">',
-      );
+      expect(String(modelMessage?.content)).toContain('<delivered_transcript_history readonly="true" status="already-delivered">');
       expect(String(modelMessage?.content)).toContain("第一条已发送内容");
       expect(String(modelMessage?.content)).toContain("第二条已发送内容");
     } finally {

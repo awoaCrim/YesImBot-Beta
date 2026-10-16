@@ -11,7 +11,13 @@ import { z } from "zod";
 
 import { createAgent, createEntry, createMemoryStorage } from "../src/index.js";
 import type { AgentEntry, AgentInternalEvent, AgentMessage, AgentPlugin } from "../src/index.js";
-import { createUserMessage } from "../src/message.js";
+import { createCustomMessage, createUserMessage } from "../src/message.js";
+
+declare module "../src/message.js" {
+  interface AgentCustomMessages {
+    "test.input": CustomMessageBase<"test.input", { text: string }>;
+  }
+}
 
 const SEND_TOOL_CALL_ID = "call_send_1";
 const SECOND_SEND_TOOL_CALL_ID = "call_send_2";
@@ -216,15 +222,27 @@ describe("transformEntries hook", () => {
   it("keeps continuation context while event history mode excludes persisted conversation history", async () => {
     const modelRequests: LanguageModelV3Message[][] = [];
     const transformEntries = vi.fn((entries: readonly AgentEntry[]) => [...entries]);
+    const focusBatches = new Set<readonly AgentMessage[] | undefined>();
+    const currentEvent = createCustomMessage("test.input", { text: "当前事件" });
     const agent = createAgent({
       model: createSendMessageContinuationModel(modelRequests),
       tools: [createSendMessageTool()],
-      plugins: [{ name: "record-event-transform", transformEntries }],
+      plugins: [
+        {
+          name: "record-event-transform",
+          transformEntries,
+          toModelMessages(message, context) {
+            focusBatches.add(context.activeInputs);
+            if (message.role === "custom" && message.type === "test.input") return { role: "user", content: message.data.text };
+          },
+        },
+      ],
       storage: createMemoryStorage([createEntry("message", createUserMessage("OLD_HISTORY_SENTINEL"), { id: "old-user", timestamp: 1 })]),
     });
 
-    await Array.fromAsync(agent.run(createUserMessage("当前事件"), { historyMode: "event" }));
+    await Array.fromAsync(agent.run(currentEvent, { historyMode: "event" }));
 
+    expect([...focusBatches]).toEqual([[currentEvent], [currentEvent]]);
     expect(transformEntries).not.toHaveBeenCalled();
     expect(modelRequests).toHaveLength(2);
     expect(modelRequests[1].map(flattenPromptContent)).toEqual([
@@ -245,8 +263,18 @@ describe("transformEntries hook", () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
+    const focusBatches = new Set<readonly AgentMessage[] | undefined>();
     const agent = createAgent({
       model: createSendMessageContinuationModel(modelRequests),
+      plugins: [
+        {
+          name: "event-focus",
+          toModelMessages(message, context) {
+            focusBatches.add(context.activeInputs);
+            if (message.role === "custom" && message.type === "test.input") return { role: "user", content: message.data.text };
+          },
+        },
+      ],
       tools: [
         {
           name: "send_message",
@@ -259,7 +287,8 @@ describe("transformEntries hook", () => {
         },
       ],
     });
-    const event = Array.fromAsync(agent.run(createUserMessage("isolated event"), { historyMode: "event" }));
+    const currentEvent = createCustomMessage("test.input", { text: "isolated event" });
+    const event = Array.fromAsync(agent.run(currentEvent, { historyMode: "event" }));
     await ready;
     const ordinary = createUserMessage("DEFERRED ordinary input");
     await agent.append(ordinary);
@@ -267,6 +296,7 @@ describe("transformEntries hook", () => {
     release();
     await event;
     await agent.wait();
+    expect([...focusBatches]).toEqual([[currentEvent], [currentEvent], [ordinary]]);
     expect(JSON.stringify(modelRequests[1])).toContain("isolated event");
     expect(JSON.stringify(modelRequests[1])).not.toContain("DEFERRED ordinary input");
     expect(JSON.stringify(modelRequests[2])).toContain("DEFERRED ordinary input");

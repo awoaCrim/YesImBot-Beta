@@ -103,6 +103,8 @@ describe("four-tier historian", () => {
     expect(request.system).toContain("1200");
     expect(request.system).toContain("软限制");
     expect(request.system).toContain("未完成事项");
+    for (const rule of ["谁说了什么", "是否确认", "一次性玩笑", "固定称呼", "受托创作", "动机", "关键承诺"]) expect(request.system).toContain(rule);
+    expect(request.system.split("主要记录谁说了什么")).toHaveLength(2);
   });
   it.each([
     [undefined, 8192],
@@ -122,15 +124,15 @@ describe("four-tier historian", () => {
     expect(failure).toEqual({ phase: "model", code: "model-limit", retryable: 0 });
     expect(generateText).not.toHaveBeenCalled();
   });
-  it("keeps previously valid v1 prompt regions readable after the generation prompt changes", async () => {
+  it.each(["magic-region-v1", "magic-region-v2"])("keeps stored %s regions readable after the generation prompt changes", async (promptVersion) => {
     const { conversation, path } = await fixture();
     await conversation.storage.append(user("old"));
     const frozen = await conversation.freezeContextRegion(["old"]);
-    expect(frozen.promptVersion).toBe("magic-region-v2");
+    expect(frozen.promptVersion).toBe("magic-region-v3");
     const region = await conversation.commitContextRegion(frozen, draft);
-    const old = { ...region, data: { ...region.data, promptVersion: "magic-region-v1" } };
+    const old = { ...region, data: { ...region.data, promptVersion } };
     await writeFile(path(), [user("old"), old].map((entry) => JSON.stringify(entry)).join("\n") + "\n", "utf8");
-    expect((await conversation.contextRegions())[0]!.data.promptVersion).toBe("magic-region-v1");
+    expect((await conversation.contextRegions())[0]!.data.promptVersion).toBe(promptVersion);
   });
   it("fails oversized original input rather than silently truncating it", async () => {
     const { conversation } = await fixture();

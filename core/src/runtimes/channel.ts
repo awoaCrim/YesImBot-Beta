@@ -1263,7 +1263,7 @@ export function createModelInputPlugin(mode: HistoryProjectionMode = "default", 
         return [output];
       }
       if (!isMessage(message) && !isEvent(message)) return [];
-      const isCurrent = context.current.some((current) => current.id === message.id);
+      const isCurrent = (context.activeInputs ?? context.current).some((current) => current.id === message.id);
       const isLive = directImageInput !== undefined && context.live?.some((live) => live.id === message.id) === true;
       if (directImageInput && (isCurrent || isLive)) {
         const resolve = (assetId: string) => directImageInput.resolveImage(assetId, context.signal);

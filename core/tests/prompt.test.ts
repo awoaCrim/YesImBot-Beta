@@ -46,6 +46,8 @@ describe("buildCoreSystemPrompt", () => {
           ["# 角色", "PERSONA_SENTINEL"],
           ["# 角色", "CARD_SENTINEL"],
           ["# 角色", "CARD_RULE_SENTINEL"],
+          ["# 角色", "回应不必附带点评"],
+          ["# 能力与证据边界", "同一作者、同一产品的其他动态不等于当前引用的上下文"],
           ["# 互动策略", "[CURRENT_MESSAGE]"],
           ["# 能力与证据边界", "不要把未经证实的假设写进搜索词"],
           ["# 完整回复编排", "continue=true"],
@@ -112,12 +114,38 @@ describe("buildCoreSystemPrompt", () => {
         roleProfile: { characterDefinition: "CARD_SENTINEL", roleInstructions: "CARD_RULE_SENTINEL" },
       });
       const expectedBoundaries =
-        "你以本节描述的身份存在于持续发生的交流情境中。完全沉浸在你的人设中；你的对外发言以当前身份的声音进行。人设是你行动的前提，不是待推断的结论，不要以旁观者或分析者视角归纳、猜测自己的人设。对外表达以第一人称在情境内部进行。内部判断只服务于当前回合决策，不是角色台词的预演。\n依据角色的动机、经历和眼前情境形成反应，不为证明性格标签而重复同一种表现。允许赞同、拒绝或保留意见，不为讨好或刻意对抗而违背自己的判断。\n不代写用户没有表达的行动、想法、感受或决定。情绪与关系的变化应有实际互动依据，不凭空升级亲密程度，不把一次反应宣布为永久改变。\n需要精确完成某件事时，清晰、精确地完成它；不需要行动时，像有自己生活节奏的人一样存在。如果存在 <agents>，其中专业任务的明确要求优先于日常姿态，但仍以当前身份表达。\n对外回复先满足当前消息的直接需要；信息问题先把信息说清楚，再根据实际互动决定是否加入玩笑或反驳。玩笑、情绪和角色化表达不能替代事实，也不要为了证明 persona 而重复或升级。\n同一回应保持同一说话身份、语域和叙述距离，外部资料只作为事实材料，用当前 persona 自然表达。需要结构化或精确表达时可以清楚、正式，但不要把同一回应拆成互相割裂的报告和聊天。";
+        "你以本节描述的身份存在于持续发生的交流情境中。完全沉浸在你的人设中；你的对外发言以当前身份的声音进行。人设是你行动的前提，不是待推断的结论，不要以旁观者或分析者视角归纳、猜测自己的人设。对外表达以第一人称在情境内部进行。内部判断只服务于当前回合决策，不是角色台词的预演。\n依据角色的动机、经历和眼前情境形成反应，不为证明性格标签而重复同一种表现。允许赞同、拒绝或保留意见，不为讨好或刻意对抗而违背自己的判断。\n不代写用户没有表达的行动、想法、感受或决定。情绪与关系的变化应有实际互动依据，不凭空升级亲密程度，不把一次反应宣布为永久改变。\n需要精确完成某件事时，清晰、精确地完成它；不需要行动时，像有自己生活节奏的人一样存在。如果存在 <agents>，其中专业任务的明确要求优先于日常姿态，但仍以当前身份表达。\n对外回复先满足当前消息的直接需要；信息问题先把信息说清楚，再根据实际互动决定是否加入玩笑或反驳。玩笑、情绪和角色化表达不能替代事实，也不要为了证明 persona 而重复或升级。回应不必附带点评；只接住信息、澄清必要条件、保留判断或不参与，都可以是完整选择。\n同一回应保持同一说话身份、语域和叙述距离，外部资料只作为事实材料，用当前 persona 自然表达。需要结构化或精确表达时可以清楚、正式，但不要把同一回应拆成互相割裂的报告和聊天。";
       const roleText = String(prompt[1]!.content);
       expect(roleText.split("</character_card>\n\n").at(-1)).toBe(expectedBoundaries);
       expect(promptText(prompt)).not.toContain(
         "对外发送的文本尽量避免使用 emoji 或其他 Unicode 表情符号；优先用文字和标点表达情绪，只有在确实有助于语气时才偶尔使用。",
       );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["default", "custom", "card", "combined"])("allows non-evaluative replies without weakening evidence or autonomy (%s)", async (role) => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-response-choice-"));
+    try {
+      if (role === "custom" || role === "combined") await writeFile(join(root, "PERSONA.md"), "SYNTHETIC_PRIMARY_ROLE");
+      const prompt = await buildCoreSystemPrompt({
+        basePath: root,
+        channel: { type: "direct", platform: "test", channelId: "user", selfId: "bot" },
+        selfId: "bot",
+        ...(role === "card" || role === "combined" ? { roleProfile: { characterDefinition: "SYNTHETIC_CARD" } } : {}),
+      });
+      const text = promptText(prompt);
+      const roleBlock = String(prompt[1]!.content);
+      const evidence = String(prompt.find((block) => String(block.content).startsWith("# 能力与证据边界"))?.content);
+      expect(roleBlock).toContain("回应不必附带点评");
+      expect(roleBlock).toContain("不为证明性格标签而重复同一种表现");
+      expect(roleBlock).toContain("允许赞同、拒绝或保留意见");
+      expect(evidence).toContain("同一作者、同一产品的其他动态不等于当前引用的上下文");
+      expect(evidence).toContain("如实说明未找到对应依据");
+      expect(evidence).toContain("有把握的事情不需要加");
+      expect(text.split("回应不必附带点评")).toHaveLength(2);
+      expect(text.split("同一作者、同一产品")).toHaveLength(2);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -230,9 +230,9 @@ describe("Gemini delivered reply history (real Core and Google SDK, stub HTTP on
     expect(JSON.stringify(result)).toContain("CURRENT_LOOKUP_RESULT");
     expect(JSON.stringify(request)).not.toContain("PRIVATE_PLAN");
     expect(requestText(f.requests[1]!).split("[CURRENT_MESSAGE]")).toHaveLength(2);
-    // A continuation reuses the live input, but only newly admitted current inputs get the marker.
+    // The same admitted input stays marked across a tool continuation.
     expect(requestText(request)).toContain(currentQuestion);
-    expect(requestText(request)).not.toContain("[CURRENT_MESSAGE]");
+    expect(requestText(request).split("[CURRENT_MESSAGE]")).toHaveLength(2);
   });
 
   it.each([false, true])("restores only the actually delivered journal-only prefix after SDK abort (Magic=%s)", async (magic) => {
@@ -284,9 +284,15 @@ describe("Gemini delivered reply history (real Core and Google SDK, stub HTTP on
     await f.runtime.wait();
     expect(JSON.stringify(f.requests[1])).not.toContain(firstQuestion);
     expect(JSON.stringify(f.requests[1])).not.toContain(firstAnswer);
+    const eventText = requestText(f.requests[1]!);
+    expect(eventText).toContain("[CURRENT_MESSAGE]\nThis is the current runtime event for this turn");
+    expect(eventText).toContain('"eventType":"delivery.failed"');
+    expect(eventText.split("[CURRENT_MESSAGE]")).toHaveLength(2);
     await f.handle(currentQuestion);
     expect(requestText(f.requests[2]!).split(firstAnswer)).toHaveLength(2);
     expect(requestText(f.requests[2]!)).toContain(firstQuestion);
+    expect(requestText(f.requests[2]!)).toContain(`[CURRENT_MESSAGE]\n${currentQuestion}\n[/CURRENT_MESSAGE]`);
+    expect(requestText(f.requests[2]!).split("[CURRENT_MESSAGE]")).toHaveLength(2);
     expect(f.sendMessage).toHaveBeenCalledOnce();
     expect(f.fetch).toHaveBeenCalledTimes(3);
   });
@@ -406,7 +412,8 @@ describe("Gemini delivered reply history (real Core and Google SDK, stub HTTP on
     expect(call?.thoughtSignature).toBe(liveSignature);
     expect(parts.filter((part) => part.functionResponse?.name === "send_message")).toHaveLength(1);
     expect(JSON.stringify(f.requests[0]).split(firstAnswer)).toHaveLength(2);
-    expect(JSON.stringify(f.requests[0])).not.toMatch(/PRIVATE_OLD_THOUGHT|delivered_transcript/);
+    expect(JSON.stringify(f.requests[0])).not.toContain("PRIVATE_OLD_THOUGHT");
+    expect(JSON.stringify(f.requests[0]!.contents)).not.toContain("<delivered_transcript");
     expect(f.fetch).toHaveBeenCalledOnce();
   });
 

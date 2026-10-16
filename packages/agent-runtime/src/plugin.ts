@@ -74,6 +74,8 @@ export interface ModelMessageContext extends HookContextBase {
   readonly projection?: AgentRequestProjection;
   readonly history: readonly AgentMessage[];
   readonly current: readonly AgentMessage[];
+  /** Most recently admitted input batch; retained across tool steps and request rebuilds. */
+  readonly activeInputs?: readonly AgentMessage[];
   /** Messages produced during the active turn, including prior step inputs and tool continuations. */
   readonly live?: readonly AgentMessage[];
 }

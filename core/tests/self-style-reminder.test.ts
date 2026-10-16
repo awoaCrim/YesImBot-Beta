@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import {
   AgentRequestProjection,
   createAgent,
@@ -13,13 +14,18 @@ import {
   type PrepareStepContext,
 } from "@yesimbot/agent-runtime";
 import type { ModelMessage } from "ai";
+import { h } from "koishi";
 import { describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
 vi.mock("koishi", async () => import("@koishijs/core"));
 
 import { Conversation } from "../src/conversations/index.js";
+import { createMessage } from "../src/messages/index.js";
+import { createModelInputPlugin } from "../src/runtimes/channel.js";
 import { ContextWorkspace } from "../src/runtimes/context-workspace.js";
 import { createSelfStyleReminderPlugin } from "../src/runtimes/prompt.js";
+import { defaultMessageRecord } from "./helpers/index.js";
 
 function context(projection?: AgentRequestProjection): PrepareStepContext {
   return {
@@ -77,7 +83,7 @@ describe("request-only self-style reminder", () => {
     const reminder = prepared!.at(-1)!;
     expect(reminder.role).toBe("user");
     expect(typeof reminder.content).toBe("string");
-    expect(createHash("sha256").update(String(reminder.content)).digest("hex")).toBe("3facb57721b154faefeaef1e53851476d7dd0b8ba69a5538c435a66843aa542e");
+    expect(createHash("sha256").update(String(reminder.content)).digest("hex")).toBe("7ecc9b0d2f1af61f185ca14e29ecbea88ff43de753c908b1422d824c0d7cd52d");
     expect(projection.origin(reminder)).toEqual({ kind: "mandatory", sourceEntryIds: [] });
     expect(JSON.stringify(reminder)).not.toMatch(/sourceEntryIds|timestamp|thoughtSignature|functionCall/);
   });
@@ -137,6 +143,78 @@ describe("request-only self-style reminder", () => {
       const stored = JSON.stringify(await storage.read());
       expect(stored).toContain("REAL_CURRENT");
       expect(stored).not.toContain("本次请求的表达约束");
+    } finally {
+      await agent.stop();
+    }
+  });
+
+  it("keeps the admitted Core input marked through actual SDK tool steps and guard rebuilds", async () => {
+    const storage = createMemoryStorage();
+    const fake = model();
+    const prompts: LanguageModelV3CallOptions["prompt"][] = [];
+    fake.doStream.mockImplementation(async (options: LanguageModelV3CallOptions) => {
+      const toolName = prompts.length === 0 ? "lookup" : "finish";
+      prompts.push(options.prompt);
+      return {
+        stream: new ReadableStream<LanguageModelV3StreamPart>({
+          start(controller) {
+            controller.enqueue({ type: "stream-start", warnings: [] });
+            controller.enqueue({ type: "tool-call", toolCallId: `guard-call-${prompts.length}`, toolName, input: "{}" });
+            controller.enqueue({
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool_calls" },
+              usage: { inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 1, text: 0, reasoning: 0 } },
+            });
+            controller.close();
+          },
+        }),
+      };
+    });
+    const current = createMessage(defaultMessageRecord({ messageId: "guard-current", elements: [h.text("GUARD_CURRENT")] }));
+    const other = createMessage(defaultMessageRecord({ messageId: "guard-unscoped", user: { id: "other" }, elements: [h.text("UNSCOPED_NOT_CURRENT")] }));
+    let appended = false;
+    const rebuilt: Array<readonly ModelMessage[]> = [];
+    const agent = createAgent({
+      model: fake as never,
+      storage,
+      plugins: [createModelInputPlugin(), createSelfStyleReminderPlugin()],
+      tools: [
+        { name: "lookup", inputSchema: z.object({}), execute: async () => ({ value: "GUARD_LOOKUP_RESULT" }) },
+        { name: "finish", inputSchema: z.object({}), terminal: true, execute: async () => ({ ok: true }) },
+      ],
+      requireTerminalTool: true,
+      maxRetries: 0,
+      beforeModelRequest: async (request) => {
+        if (!appended) {
+          appended = true;
+          await agent.append(other);
+        }
+        const first = await request.rebuildMessages();
+        const second = await request.rebuildMessages();
+        expect(second).toEqual(first);
+        rebuilt.push(second);
+        return second;
+      },
+    });
+    try {
+      const events = await Array.fromAsync(agent.run(current));
+      expect(events.some((event) => event.type === "turn.failed")).toBe(false);
+      expect(prompts).toHaveLength(2);
+      expect(rebuilt).toHaveLength(2);
+      for (const prompt of prompts) {
+        const text = prompt
+          .flatMap((message) =>
+            typeof message.content === "string" ? [message.content] : message.content.filter((part) => part.type === "text").map((part) => part.text),
+          )
+          .join("\n");
+        expect([...text.matchAll(/\[CURRENT_MESSAGE\]\n([\s\S]*?)\n\[\/CURRENT_MESSAGE\]/g)].map((match) => match[1])).toEqual(["GUARD_CURRENT"]);
+        expect(text).toContain('id="guard-current"');
+        expect(text).toContain("UNSCOPED_NOT_CURRENT");
+        expect(text.split("本次请求的表达约束")).toHaveLength(2);
+      }
+      expect(JSON.stringify(prompts[1])).toContain("GUARD_LOOKUP_RESULT");
+      const stored = JSON.stringify(await storage.read());
+      expect(stored).not.toMatch(/本次请求的表达约束|activeInputs/);
     } finally {
       await agent.stop();
     }
