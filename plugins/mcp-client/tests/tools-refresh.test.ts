@@ -116,6 +116,7 @@ describe("mcp-client tool registry", () => {
     mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
 
     const plugin = new McpClientPlugin(ctx as never, {
+      allowedScopes: [{ platform: "test", channelId: "room" }],
       mcpServers: { docs: { type: "http", url: "https://example.test/mcp" } },
     });
 
@@ -140,6 +141,7 @@ describe("mcp-client tool registry", () => {
     mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
 
     const plugin = new McpClientPlugin(ctx as never, {
+      allowedScopes: [{ platform: "test", channelId: "room" }],
       mcpServers: { luckin: { type: "http", url: "https://example.test/mcp" } },
     });
     await plugin.start();
@@ -164,35 +166,25 @@ describe("mcp-client tool registry", () => {
     expect(client.callTool).not.toHaveBeenCalled();
   });
 
-  it("exposes the configured catalog to group and direct runtimes without a global allowlist", async () => {
+  it("applies the configured allowlist to group and direct runtimes", async () => {
     const { client } = createClient([["search"]]);
     const { ctx, plugins } = createContext();
     mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
 
     const plugin = new McpClientPlugin(ctx as never, {
+      allowedScopes: [{ platform: "test", channelId: "room" }],
       mcpServers: { docs: { type: "http", url: "https://example.test/mcp" } },
     });
     await plugin.start();
 
-    const group = await plugins[0]!.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" } as never, {} as never);
-    expect(await resolveToolNames(group!)).toEqual(["docs-search"]);
+    const denied = await plugins[0]!.setup({ type: "guild", platform: "test", channelId: "other", guildId: "other" } as never, {} as never);
+    expect(await resolveToolNames(denied!)).toEqual([]);
+
+    const allowed = await plugins[0]!.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" } as never, {} as never);
+    expect(await resolveToolNames(allowed!)).toEqual(["docs-search"]);
 
     const direct = await plugins[0]!.setup({ type: "direct", platform: "test", channelId: "private:100", userId: "100", selfId: "bot" } as never, {} as never);
-    expect(await resolveToolNames(direct!)).toEqual(["docs-search"]);
-  });
-
-  it("does not apply a legacy global allowedScopes field to MCP catalog visibility", async () => {
-    const { client } = createClient([["search"]]);
-    const { ctx, plugins } = createContext();
-    mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
-    const legacyConfig = {
-      allowedScopes: [],
-      mcpServers: { docs: { type: "http" as const, url: "https://example.test/mcp" } },
-    };
-    const plugin = new McpClientPlugin(ctx as never, legacyConfig);
-    await plugin.start();
-    const runtime = await plugins[0]!.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" } as never, {} as never);
-    expect(await resolveToolNames(runtime!)).toEqual(["docs-search"]);
+    expect(await resolveToolNames(direct!)).toEqual([]);
   });
 
   it("updates server-level confirmation for newly published catalog snapshots", async () => {
@@ -200,7 +192,10 @@ describe("mcp-client tool registry", () => {
     client.callTool.mockResolvedValue({ content: [{ text: "upstream", type: "text" }] });
     const { ctx, plugins } = createContext();
     mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
-    const config = { mcpServers: { orders: { type: "http" as const, url: "https://example.test/mcp", requireConfirmation: false } } };
+    const config = {
+      allowedScopes: [{ platform: "test", channelId: "*" }],
+      mcpServers: { orders: { type: "http" as const, url: "https://example.test/mcp", requireConfirmation: false } },
+    };
     const plugin = new McpClientPlugin(ctx as never, config);
     await plugin.start();
     const scope = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as never;
@@ -219,6 +214,7 @@ describe("mcp-client tool registry", () => {
     mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
 
     const plugin = new McpClientPlugin(ctx as never, {
+      allowedScopes: [{ platform: "test", channelId: "room" }],
       mcpServers: { docs: { type: "http", url: "https://example.test/mcp" } },
     });
     await plugin.start();
@@ -226,5 +222,29 @@ describe("mcp-client tool registry", () => {
     const channelScope = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as never;
     const runtimePlugin = await plugins[0]!.setup(channelScope, {} as never);
     expect(await resolveToolNames(runtimePlugin!)).toEqual(["docs-search_tool", "docs-search_tool_2"]);
+  });
+
+  it("admits a user rule in any group but filters MCP tools by current sender", async () => {
+    const { client } = createClient([["search"]]);
+    const { ctx, plugins } = createContext();
+    mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn<() => Promise<void>>() } });
+
+    const plugin = new McpClientPlugin(ctx as never, {
+      allowedScopes: [{ platform: "test", channelId: "*", userId: "100" }],
+      mcpServers: { docs: { type: "http", url: "https://example.test/mcp" } },
+    });
+    await plugin.start();
+
+    const channelScope = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as never;
+    const runtimePlugin = await plugins[0]!.setup(channelScope, {} as never);
+    const tools = await resolveTools(runtimePlugin!);
+    const message = (userId: string) => ({ role: "custom", type: "yesimbot.message", data: { user: { id: userId } } });
+
+    expect((await runtimePlugin!.filterTools?.(tools, { messages: [message("100")] } as never))?.map((tool) => tool.name)).toEqual(["docs-search"]);
+    expect(await runtimePlugin!.filterTools?.(tools, { messages: [message("101")] } as never)).toEqual([]);
+    expect(await runtimePlugin!.beforeToolCall?.({ toolCallId: "call", toolName: "docs-search", args: {} }, { messages: [message("101")] } as never)).toEqual({
+      type: "block",
+      reason: "当前消息发送者不在 MCP 工具白名单中",
+    });
   });
 });

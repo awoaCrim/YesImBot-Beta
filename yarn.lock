@@ -5913,6 +5913,22 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"koishi-plugin-yesimbot-computer-use@workspace:plugins/computer-use":
+  version: 0.0.0-use.local
+  resolution: "koishi-plugin-yesimbot-computer-use@workspace:plugins/computer-use"
+  dependencies:
+    "@modelcontextprotocol/sdk": "npm:^1.29.0"
+    "@yesimbot/agent-runtime": "workspace:^"
+    koishi: "npm:^4.18.10"
+    koishi-plugin-yesimbot: "workspace:^"
+    vitest: "npm:^4.0.18"
+  peerDependencies:
+    "@yesimbot/agent-runtime": "workspace:^"
+    koishi: ^4.18.10
+    koishi-plugin-yesimbot: "workspace:^"
+  languageName: unknown
+  linkType: soft
+
 "koishi-plugin-yesimbot-console@workspace:plugins/console":
   version: 0.0.0-use.local
   resolution: "koishi-plugin-yesimbot-console@workspace:plugins/console"

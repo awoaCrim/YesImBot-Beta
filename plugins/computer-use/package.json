@@ -1,0 +1,52 @@
+{
+  "name": "koishi-plugin-yesimbot-computer-use",
+  "version": "0.0.1",
+  "description": "Native OpenAI computer-use delegation for the isolated Anon desktop",
+  "license": "MIT",
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "npx pkgroll --sourcemap=inline",
+    "check-types": "tsc --noEmit",
+    "clean": "rimraf .turbo && rimraf dist && rimraf tsconfig.tsbuildinfo",
+    "fmt": "oxfmt",
+    "lint": "oxlint",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "devDependencies": {
+    "@yesimbot/agent-runtime": "workspace:^",
+    "koishi": "^4.18.10",
+    "koishi-plugin-yesimbot": "workspace:^",
+    "vitest": "^4.0.18"
+  },
+  "peerDependencies": {
+    "@yesimbot/agent-runtime": "workspace:^",
+    "koishi": "^4.18.10",
+    "koishi-plugin-yesimbot": "workspace:^"
+  },
+  "koishi": {
+    "description": {
+      "zh": "通过 OpenAI Responses 原生 computer tool 驱动隔离 Anon 桌面",
+      "en": "Delegate native OpenAI Responses computer-use actions to the isolated Anon desktop"
+    },
+    "service": {
+      "required": [
+        "yesimbot"
+      ]
+    }
+  }
+}

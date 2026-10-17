@@ -386,6 +386,57 @@ describe("tools", () => {
     expect((model as unknown as { observedToolNames: string[][] }).observedToolNames).toEqual([["stable_lookup"], ["stable_lookup"]]);
   });
 
+  it("filters tools at each provider boundary and carries current messages into the execution guard", async () => {
+    const model = createSingleToolCallModel();
+    const execute = vi.fn(async () => "executed");
+    const filterTools = vi.fn((tools: AgentToolSet, context: { stepNumber: number }) =>
+      context.stepNumber === 0 ? tools : tools.filter((tool) => tool.name !== "inspect"),
+    );
+    const beforeToolCall = vi.fn(() => ({ type: "block" as const, reason: "not authorized" }));
+    const agent = createAgent({
+      model,
+      plugins: [
+        {
+          name: "dynamic-access",
+          tools: [{ name: "inspect", inputSchema: z.object({}), execute }],
+          filterTools,
+          beforeToolCall,
+        },
+      ],
+    });
+
+    await Array.fromAsync(agent.run(createUserMessage("hello")));
+
+    expect(model.observedToolNames[0]).toEqual(["inspect"]);
+    expect(model.observedToolNames[1]).toEqual([]);
+    expect(filterTools).toHaveBeenCalled();
+    expect(beforeToolCall).toHaveBeenCalledWith(
+      expect.objectContaining({ toolName: "inspect" }),
+      expect.objectContaining({ messages: [expect.objectContaining({ role: "user", content: "hello" })] }),
+    );
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a per-step tool filter throws", async () => {
+    const model = createToolModel();
+    const agent = createAgent({
+      model,
+      tools: [{ name: "inspect", inputSchema: z.object({}), execute: async () => "executed" }],
+      plugins: [
+        {
+          name: "broken-filter",
+          filterTools: () => {
+            throw new Error("filter failed");
+          },
+        },
+      ],
+    });
+
+    await Array.fromAsync(agent.run(createUserMessage("hello")));
+
+    expect(model.observedToolNames[0]).toEqual([]);
+  });
+
   it("resolves deprecated tool extensions once and reuses the frozen registry", async () => {
     const model = createToolModel();
     const extend = vi.fn((tools) => [...tools, { name: "legacy", inputSchema: z.object({}), execute: async () => "legacy" }] as never);

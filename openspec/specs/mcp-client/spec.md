@@ -112,13 +112,26 @@ The MCP client plugin MUST support resolving `Authorization: Bearer <token>` for
 - **THEN** every log entry MUST contain field names or configured-state only
 - **AND** no log entry, thrown error, or tool result may contain a token value
 
-### Requirement: Configured MCP catalogs do not use a global scope allowlist
-The MCP client plugin MUST expose configured server catalogs to group and direct runtimes without a plugin-global `allowedScopes` gate. Legacy `allowedScopes` configuration MUST NOT filter this catalog. This does not change access control owned by Core or other plugins.
+### Requirement: Sensitive MCP tools use the explicit scope allowlist
+The MCP client plugin MUST expose no server tools to a stable channel runtime unless its configured `allowedScopes` can potentially match that runtime. Rules MUST be ORed and their populated fields MUST be ANDed without a private/group chat-type branch. A concrete `userId` rule MUST be checked against every trusted sender in the current turn; a channel-only rule MAY authorize any sender in the matching channel. The plugin MUST filter its own tools at every provider step and MUST block a hidden tool again before upstream execution.
 
-#### Scenario: Group and direct runtimes receive configured tools
-- **WHEN** an enabled server publishes its catalog
-- **THEN** group and direct runtimes MUST receive its tools regardless of a legacy global scope allowlist
-- **AND** execution MUST follow that server's confirmation setting
+#### Scenario: A channel is outside the allowlist
+- **WHEN** an enabled server publishes its catalog for a runtime whose platform/channel/bot fields match no `allowedScopes` rule
+- **THEN** the runtime MUST receive no MCP tools or MCP guidance
+
+#### Scenario: A user rule authorizes any group
+- **WHEN** a stable group runtime matches a `userId` rule by platform, channel wildcard, and bot fields
+- **THEN** the runtime MAY be admitted provisionally
+- **AND** a provider step containing a trusted sender matching that rule MUST expose the MCP tools
+- **AND** a provider step containing an unauthorized sender MUST hide them
+
+#### Scenario: A joined turn contains multiple senders
+- **WHEN** a current turn contains multiple trusted sender ids
+- **THEN** every sender MUST match at least one applicable rule before MCP tools are exposed
+
+#### Scenario: A hidden tool call is emitted
+- **WHEN** a provider emits a call for an MCP tool hidden by the current-step filter
+- **THEN** the plugin MUST block the call before `client.callTool()`
 
 ### Requirement: Complete MCP catalogs use server-level confirmation
 The MCP client plugin MUST register every tool returned by `listTools()` for a connected server and MUST NOT drop tools through a static allowlist. Each stdio/http/sse server MUST support optional `requireConfirmation`, defaulting to true. When enabled, before calling upstream `client.callTool()`, the plugin MUST classify each tool from its upstream name and description, allow explicitly read-only tools through, and require confirmation for every tool that either has a side-effect signal or cannot be proven read-only. The confirmation requirements below apply to servers with confirmation enabled.

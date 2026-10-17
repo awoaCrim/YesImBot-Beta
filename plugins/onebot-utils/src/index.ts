@@ -1,8 +1,8 @@
 import type { ReadableStream } from "node:stream/web";
 
-import { jsonSchema, type AgentPlugin, type AgentTool } from "@yesimbot/agent-runtime";
+import { jsonSchema, type AgentPlugin, type AgentTool, type ToolFilterContext } from "@yesimbot/agent-runtime";
 import { Context, Logger, Schema, type Bot } from "koishi";
-import { DEFAULT_MANAGEMENT_TOOL_SCOPES, isToolAccessAllowed } from "koishi-plugin-yesimbot";
+import { DEFAULT_MANAGEMENT_TOOL_SCOPES, extractToolAccessActorIds, isToolAccessAllowed, isToolAccessPotentiallyAllowed } from "koishi-plugin-yesimbot";
 import type { ChannelPluginSetupContext, ChannelResources, ChannelContext, ToolAccessRule } from "koishi-plugin-yesimbot";
 
 import { projectAnimatedImages } from "./animated-image.js";
@@ -67,14 +67,16 @@ export default class OnebotUtilsPlugin {
     allowedScopes: Schema.array(
       Schema.object({
         platform: Schema.string().required().description("平台名称；* 匹配任意平台"),
-        channelId: Schema.string().required().description("频道 ID；私聊按 QQ 号授权时填写 *"),
-        userId: Schema.string().description("私聊 QQ 号；群聊/频道规则留空"),
+        channelId: Schema.string().required().description("频道 ID；* 匹配任意频道"),
+        userId: Schema.string().description("可选的用户 ID；群聊按当前消息发送者匹配；留空则仅按平台、频道和机器人账号匹配"),
         selfId: Schema.string().description("可选的机器人账号 ID；留空匹配全部机器人"),
       }),
     )
       .role("table")
       .default(DEFAULT_MANAGEMENT_TOOL_SCOPES.map((scope) => ({ ...scope, selfId: "" })))
-      .description("OneBot 工具白名单；默认授权 QQ 1049700117 的 OneBot 私聊，设置为空数组可拒绝全部工具。私聊按 QQ 号，群聊/频道按 channelId 授权"),
+      .description(
+        "OneBot 工具白名单；规则按 OR 合并、字段按 AND 匹配，不额外区分私聊和群聊；群聊中的 userId 按当前消息发送者匹配。默认授权 OneBot 用户 QQ 1049700117；设置为空数组可拒绝全部工具",
+      ),
     enabledTools: Schema.array(Schema.union(TOOL_SCHEMA)).default([]).role("checkbox").description("启用的工具列表"),
     parseImages: Schema.boolean().default(false).description("解析转发消息中的图片元数据"),
     attachImageSummary: Schema.boolean().default(true).description("动画表情占位符附带图片 summary"),
@@ -101,12 +103,22 @@ export default class OnebotUtilsPlugin {
 
   public async setup(scope: ChannelContext, bot: Bot, runtime?: ChannelPluginSetupContext): Promise<AgentPlugin | null> {
     if (scope.platform !== "onebot") return null;
-    const allowed = isToolAccessAllowed(scope, this.config.allowedScopes);
-    const resources = allowed ? await this.ctx.yesimbot.resource.get(scope) : undefined;
+    const accessScope = scope.selfId === undefined ? { ...scope, selfId: bot.selfId } : scope;
+    const allowed = isToolAccessPotentiallyAllowed(accessScope, this.config.allowedScopes);
+    const resources = allowed ? await this.ctx.yesimbot.resource.get(accessScope) : undefined;
+    const tools = allowed ? createOneBotTools(this.ctx, bot, this.config, accessScope, resources!) : [];
+    const toolNames = new Set(tools.map((tool) => tool.name));
+    const isAllowed = (messages: ToolFilterContext["messages"]) =>
+      isToolAccessAllowed(accessScope, this.config.allowedScopes, extractToolAccessActorIds(messages));
     const disposeChannelOutput = runtime?.channelOutput?.version === 1 ? runtime.channelOutput.registerTools([TOOLS.SEND_FORWARD_MESSAGE]) : undefined;
     return {
       name: "onebot-utils",
-      tools: allowed ? createOneBotTools(this.ctx, bot, this.config, scope, resources!) : [],
+      tools,
+      filterTools: (candidates, filterContext) => (isAllowed(filterContext.messages) ? candidates : candidates.filter((tool) => !toolNames.has(tool.name))),
+      beforeToolCall: (call, hookContext) =>
+        toolNames.has(call.toolName) && !isAllowed(hookContext.messages)
+          ? { type: "block", reason: "当前消息发送者不在 OneBot 工具白名单中" }
+          : { type: "allow" },
       onAppend: (entries) => projectAnimatedImages(entries, { attachImageSummary: this.config.attachImageSummary }),
       transformEntries: (entries) => projectAnimatedImages(entries, { attachImageSummary: this.config.attachImageSummary }),
       stop: () => disposeChannelOutput?.(),

@@ -16,12 +16,12 @@
 
 ```yaml
 allowedScopes:
-  # Direct messages: authorize a QQ user.
+  # Authorize this user in any channel whose platform/channel rule matches.
   - platform: onebot
     channelId: "*"
     userId: "10001"
     selfId: "*"
-  # Group/channel runtime: authorize one exact channel.
+  # Authorize one exact channel, regardless of chat type.
   - platform: onebot
     channelId: "123456789"
     selfId: "3535802886"
@@ -53,4 +53,4 @@ maxTranscriptChars: 20000
 - `locked` 模式只允许 `allowCommands`。
 - `userActor` 默认关闭，开启后仍建议限制命令范围。
 - `crossChannel` 默认关闭。
-- `allowedScopes` 默认授权 OneBot 私聊 QQ `1049700117`；未匹配的私聊或群聊不会收到任何 command bridge 工具。设置为空数组即可拒绝全部工具。私聊用 `userId`（例如 QQ 号）授权，群聊/频道用精确 `channelId` 授权，`selfId` 可选用于限定机器人账号。
+- `allowedScopes` 是唯一的工具暴露白名单：规则按 OR 合并、字段按 AND 匹配，不额外区分私聊和群聊。群聊中的 `userId` 按当前消息发送者匹配；一个用户规则配合 `channelId: "*"` 可让该用户在任意群使用工具，多条当前消息则要求所有发送者都获授权。没有发送者身份时，只有不带 `userId` 的频道规则能授权。设置为空数组即可拒绝全部工具。可用 `userId` 限定用户身份、用精确 `channelId` 限定频道，`selfId` 可选用于限定机器人账号。默认授权 OneBot 用户 QQ `1049700117`。

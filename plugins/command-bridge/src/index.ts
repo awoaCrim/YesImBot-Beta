@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 
-import { jsonSchema, type AgentPlugin, type AgentTool } from "@yesimbot/agent-runtime";
+import { jsonSchema, type AgentPlugin, type AgentTool, type ToolFilterContext } from "@yesimbot/agent-runtime";
 import { Context, Logger, Schema, type Bot, type Element } from "koishi";
-import { DEFAULT_MANAGEMENT_TOOL_SCOPES, isToolAccessAllowed } from "koishi-plugin-yesimbot";
+import { DEFAULT_MANAGEMENT_TOOL_SCOPES, extractToolAccessActorIds, isToolAccessAllowed, isToolAccessPotentiallyAllowed } from "koishi-plugin-yesimbot";
 import type { ChannelContext, ChannelResources } from "koishi-plugin-yesimbot";
 
 import { collectCommandCatalog, filterCommandCatalog, formatCommandCatalog, formatCommandHelp } from "./catalog.js";
@@ -35,14 +35,16 @@ export default class CommandBridgePlugin {
     allowedScopes: Schema.array(
       Schema.object({
         platform: Schema.string().required().description("平台名称；* 匹配任意平台"),
-        channelId: Schema.string().required().description("频道 ID；私聊按 QQ 号授权时填写 *"),
-        userId: Schema.string().description("私聊 QQ 号；群聊/频道规则留空"),
+        channelId: Schema.string().required().description("频道 ID；* 匹配任意频道"),
+        userId: Schema.string().description("可选的用户 ID；群聊按当前消息发送者匹配；留空则仅按平台、频道和机器人账号匹配"),
         selfId: Schema.string().description("可选的机器人账号 ID；留空匹配全部机器人"),
       }),
     )
       .role("table")
       .default(DEFAULT_MANAGEMENT_TOOL_SCOPES.map((scope) => ({ ...scope, selfId: "" })))
-      .description("命令桥工具白名单；默认授权 QQ 1049700117 的 OneBot 私聊，设置为空数组可拒绝全部工具。私聊按 QQ 号，群聊/频道按 channelId 授权"),
+      .description(
+        "命令桥工具白名单；规则按 OR 合并、字段按 AND 匹配，不额外区分私聊和群聊；群聊中的 userId 按当前消息发送者匹配。默认授权 OneBot 用户 QQ 1049700117；设置为空数组可拒绝全部工具",
+      ),
     trustMode: Schema.union(["locked", "full"]).default("locked").description("locked 仅允许 allowCommands，full 允许全部命令"),
     allowCommands: Schema.array(Schema.string()).default([]).role("table").description("locked 模式下允许执行的命令"),
     hardDeny: Schema.array(Schema.string())
@@ -90,9 +92,13 @@ export default class CommandBridgePlugin {
   }
 
   public async setup(context: ChannelContext, bot: Bot): Promise<AgentPlugin> {
-    const allowed = isToolAccessAllowed(context, this.config.allowedScopes);
-    const resources = allowed ? await this.ctx.yesimbot.resource.get(context) : undefined;
-    const tools = allowed ? this.createTools(context, bot, resources!) : [];
+    const accessScope = context.selfId === undefined ? { ...context, selfId: bot.selfId } : context;
+    const allowed = isToolAccessPotentiallyAllowed(accessScope, this.config.allowedScopes);
+    const resources = allowed ? await this.ctx.yesimbot.resource.get(accessScope) : undefined;
+    const tools = allowed ? this.createTools(accessScope, bot, resources!) : [];
+    const toolNames = new Set(tools.map((tool) => tool.name));
+    const isAllowed = (messages: ToolFilterContext["messages"]) =>
+      isToolAccessAllowed(accessScope, this.config.allowedScopes, extractToolAccessActorIds(messages));
     this.logger.debug("command_bridge.tools_ready", {
       channelId: context.channelId,
       allowed,
@@ -103,6 +109,11 @@ export default class CommandBridgePlugin {
       name: "command-bridge",
       tools: (): AgentTool[] => tools,
       ...(allowed ? { appendSystemPrompt: () => COMMAND_TOOL_GUIDANCE } : {}),
+      filterTools: (candidates, filterContext) => (isAllowed(filterContext.messages) ? candidates : candidates.filter((tool) => !toolNames.has(tool.name))),
+      beforeToolCall: (call, hookContext) =>
+        toolNames.has(call.toolName) && !isAllowed(hookContext.messages)
+          ? { type: "block", reason: "当前消息发送者不在命令桥工具白名单中" }
+          : { type: "allow" },
     } satisfies AgentPlugin;
   }
 

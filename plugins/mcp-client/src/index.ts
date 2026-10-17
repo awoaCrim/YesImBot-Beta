@@ -1,7 +1,8 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
-import { jsonSchema, type AgentPlugin, type AgentTool, type AgentToolExecuteContext } from "@yesimbot/agent-runtime";
+import { jsonSchema, type AgentPlugin, type AgentTool, type AgentToolExecuteContext, type ToolFilterContext } from "@yesimbot/agent-runtime";
 import { Context, Logger, Schema, type Bot } from "koishi";
+import { DEFAULT_MANAGEMENT_TOOL_SCOPES, extractToolAccessActorIds, isToolAccessAllowed, isToolAccessPotentiallyAllowed } from "koishi-plugin-yesimbot";
 import type { ArtifactStore, ChannelContext } from "koishi-plugin-yesimbot";
 
 import {
@@ -51,6 +52,19 @@ export default class McpClientPlugin {
   public static usage = "MCP 客户端插件，用于连接 MCP 服务器并注册工具";
   public static inject = ["yesimbot"];
   public static Config: Schema<McpClientConfig> = Schema.object({
+    allowedScopes: Schema.array(
+      Schema.object({
+        platform: Schema.string().required().description("平台名称；* 匹配任意平台"),
+        channelId: Schema.string().required().description("频道 ID；* 匹配任意频道"),
+        userId: Schema.string().description("可选的用户 ID；群聊按当前消息发送者匹配；留空则仅按平台、频道和机器人账号匹配"),
+        selfId: Schema.string().description("可选的机器人账号 ID；留空匹配全部机器人"),
+      }),
+    )
+      .role("table")
+      .default(DEFAULT_MANAGEMENT_TOOL_SCOPES.map((scope) => ({ ...scope, selfId: "" })))
+      .description(
+        "MCP 工具白名单；规则按 OR 合并、字段按 AND 匹配，不额外区分私聊和群聊；群聊中的 userId 按当前消息发送者匹配。默认授权 OneBot 用户 QQ 1049700117；设置为空数组可拒绝全部工具",
+      ),
     mcpServers: Schema.dict(
       Schema.intersect([
         Schema.object({
@@ -113,19 +127,31 @@ export default class McpClientPlugin {
     ctx.on("dispose", this.stop.bind(this));
   }
 
-  public async setup(scope: ChannelContext, _bot: Bot): Promise<AgentPlugin> {
-    const resources = await this.ctx.yesimbot.resource.get(scope);
-    const scopeKey = deriveChannelScopeKey(scope);
+  public async setup(scope: ChannelContext, bot: Bot): Promise<AgentPlugin> {
+    const accessScope = scope.selfId === undefined ? { ...scope, selfId: bot.selfId } : scope;
+    const allowed = isToolAccessPotentiallyAllowed(accessScope, this.config.allowedScopes);
+    if (!allowed) {
+      return { name: "mcp-client", tools: [] };
+    }
+
+    const resources = await this.ctx.yesimbot.resource.get(accessScope);
+    const scopeKey = deriveChannelScopeKey(accessScope);
     const confirmations = new ConfirmationStore(() => Date.now());
     this.confirmationStores.add(confirmations);
     const channelTools = this.registeredTools.map((entry) =>
       wrapToolWithArtifacts(this.withConfirmationGate(entry, scopeKey, confirmations), resources.artifacts),
     );
+    const toolNames = new Set(channelTools.map((tool) => tool.name));
     const hasConfirmationTools = this.registeredTools.some((entry) => entry.requiresConfirmation);
     const appendSystemPrompt = () => (hasConfirmationTools ? `${MCP_ARTIFACT_GUIDANCE}\n${MCP_CONFIRMATION_GUIDANCE}` : MCP_ARTIFACT_GUIDANCE);
+    const isAllowed = (messages: ToolFilterContext["messages"]) =>
+      isToolAccessAllowed(accessScope, this.config.allowedScopes, extractToolAccessActorIds(messages));
     return {
       name: "mcp-client",
       tools: channelTools,
+      filterTools: (tools, context) => (isAllowed(context.messages) ? tools : tools.filter((tool) => !toolNames.has(tool.name))),
+      beforeToolCall: (call, context) =>
+        toolNames.has(call.toolName) && !isAllowed(context.messages) ? { type: "block", reason: "当前消息发送者不在 MCP 工具白名单中" } : { type: "allow" },
       appendSystemPrompt,
       stop: () => {
         confirmations.clear();

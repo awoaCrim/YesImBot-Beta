@@ -309,7 +309,12 @@ export function createAgent(config: AgentConfig): Agent {
         execute: execute
           ? async (input, options) => {
               const run = serial.then(async () => {
-                const hookContext: ToolHookContext = { ...runtimeContext, turnId, signal: options.abortSignal ?? signal };
+                const hookContext: ToolHookContext = {
+                  ...runtimeContext,
+                  turnId,
+                  signal: options.abortSignal ?? signal,
+                  messages: [...currentMessages()],
+                };
                 throwIfAborted(hookContext.signal);
 
                 const originalCall = { toolCallId: options.toolCallId, toolName, args: input };
@@ -580,7 +585,8 @@ export function createAgent(config: AgentConfig): Agent {
         let aborted = false;
         let persistedResponseMessageCount = 0;
         const retry = prepareRetryModel(model, maxRetries);
-        const resolvedTools = toAiToolSet(resolveTools(request.turnId, () => allMessages, abortSignal));
+        const resolvedAgentTools = resolveTools(request.turnId, () => allMessages, abortSignal);
+        const resolvedTools = toAiToolSet(resolvedAgentTools);
         const effectiveTools: ToolSet = isTerminalRecovery
           ? Object.fromEntries(Object.entries(resolvedTools).filter(([name]) => terminalToolNames.has(name)))
           : { ...resolvedTools, ...frozenProviderTools };
@@ -622,10 +628,22 @@ export function createAgent(config: AgentConfig): Agent {
               signal: abortSignal,
             };
             const prepared = prepareRequestMessages(await pluginHost.helpers.prepareStep(messages, prepareContext));
+            const filteredAgentTools = await pluginHost.helpers.filterTools(resolvedAgentTools, {
+              ...runtimeContext,
+              turnId: request.turnId,
+              stepNumber,
+              signal: abortSignal,
+              messages: [...allMessages],
+            });
+            const filteredTools: ToolSet = isTerminalRecovery
+              ? Object.fromEntries(Object.entries(toAiToolSet(filteredAgentTools)).filter(([name]) => terminalToolNames.has(name)))
+              : { ...toAiToolSet(filteredAgentTools), ...frozenProviderTools };
+            const activeToolNames = Object.keys(filteredTools);
             const guard = config.beforeModelRequest;
             if (!guard) {
               return {
                 messages: prepared,
+                activeTools: activeToolNames,
                 ...(requestToolChoice ? { toolChoice: requestToolChoice } : {}),
                 ...(config.maxOutputTokens === undefined ? {} : { maxOutputTokens: outputCap() }),
               };
@@ -635,7 +653,7 @@ export function createAgent(config: AgentConfig): Agent {
               model: retry.model,
               system: frozenSystemPrompt,
               messages: prepared,
-              tools: effectiveTools,
+              tools: filteredTools,
               ...(requestToolChoice ? { toolChoice: requestToolChoice } : {}),
               currentMessageIds: [...liveTurnEntries.keys()],
               ...(config.requestProjection ? { projection: config.requestProjection, historyMode: request.historyMode } : {}),
@@ -657,9 +675,11 @@ export function createAgent(config: AgentConfig): Agent {
             });
             const guardedObject = !Array.isArray(guarded) && guarded ? (guarded as Exclude<AgentModelRequestGuardResult, readonly ModelMessage[]>) : undefined;
             const guardedMessages = guardedObject?.messages ?? (Array.isArray(guarded) ? guarded : prepared);
+            const guardedActiveTools = guardedObject?.activeTools;
+            const activeTools = guardedActiveTools === undefined ? activeToolNames : activeToolNames.filter((name) => guardedActiveTools.includes(name));
             return {
               messages: prepareRequestMessages(guardedMessages),
-              ...(guardedObject?.activeTools === undefined ? {} : { activeTools: [...guardedObject.activeTools] }),
+              activeTools,
               ...(requestToolChoice ? { toolChoice: requestToolChoice } : {}),
               ...(config.maxOutputTokens === undefined ? {} : { maxOutputTokens: outputCap() }),
             };

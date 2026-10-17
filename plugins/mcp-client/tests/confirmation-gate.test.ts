@@ -21,7 +21,10 @@ vi.mock("koishi-plugin-yesimbot", () => ({
   DEFAULT_MANAGEMENT_TOOL_SCOPES: [{ platform: "onebot", channelId: "*", userId: "1049700117" }],
   formatElements: (elements: Array<{ attrs?: { content?: unknown }; type?: unknown }>) =>
     elements.map((element) => (element.type === "text" ? String(element.attrs?.content ?? "") : "")).join(""),
+  extractToolAccessActorIds: () => [],
   isToolAccessAllowed: (scope: { platform: string; channelId: string }, rules: Array<{ platform: string; channelId: string }> | undefined) =>
+    rules?.some((rule) => rule.platform === scope.platform && (rule.channelId === "*" || rule.channelId === scope.channelId)) ?? false,
+  isToolAccessPotentiallyAllowed: (scope: { platform: string; channelId: string }, rules: Array<{ platform: string; channelId: string }> | undefined) =>
     rules?.some((rule) => rule.platform === scope.platform && (rule.channelId === "*" || rule.channelId === scope.channelId)) ?? false,
 }));
 
@@ -113,6 +116,7 @@ async function buildPlugin(tools = DEFAULT_TOOLS, server: McpServer = { type: "h
   const client = createClient(tools);
   mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn(async () => undefined) } });
   const plugin = new McpClientPlugin(ctx as never, {
+    allowedScopes: [{ platform: "qq", channelId: "*" }],
     mcpServers: { luckin: server },
   });
   await plugin.start();
@@ -393,6 +397,7 @@ describe("mcp-client confirmation gate", () => {
       .mockResolvedValueOnce({ client: guarded, transport: { close: vi.fn(async () => undefined) } })
       .mockResolvedValueOnce({ client: unguarded, transport: { close: vi.fn(async () => undefined) } });
     const plugin = new McpClientPlugin(ctx as never, {
+      allowedScopes: [{ platform: "qq", channelId: "*" }],
       mcpServers: {
         guarded: { type: "http", url: "https://example.test/guarded" },
         unguarded: { type: "sse", url: "https://example.test/unguarded", requireConfirmation: false },

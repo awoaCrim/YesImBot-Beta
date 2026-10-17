@@ -184,20 +184,40 @@ describe("onebot-utils plugin", () => {
     const plugin = new OnebotUtilsPlugin(
       ctx as never,
       {
+        allowedScopes: [{ platform: "onebot", channelId: "group" }],
+        enabledTools: ["onebot_set_qq_profile"],
+      } as never,
+    );
+    await plugin.start();
+
+    const denied = await plugins[0]!.setup(createChannelContext({ channelId: "other", guildId: "other" }) as never, {} as never);
+    expect(await getTools(denied!)).toEqual([]);
+
+    const allowed = await plugins[0]!.setup(createChannelContext() as never, {} as never);
+    expect((await getTools(allowed!)).map((tool) => tool.name)).toEqual(["onebot_set_qq_profile"]);
+  });
+
+  it("admits a user rule in any group but filters OneBot tools by current sender", async () => {
+    const { ctx, plugins } = createContext();
+    const plugin = new OnebotUtilsPlugin(
+      ctx as never,
+      {
         allowedScopes: [{ platform: "onebot", channelId: "*", userId: "100" }],
         enabledTools: ["onebot_set_qq_profile"],
       } as never,
     );
     await plugin.start();
 
-    const denied = await plugins[0]!.setup(createChannelContext() as never, {} as never);
-    expect(await getTools(denied!)).toEqual([]);
+    const runtimePlugin = await plugins[0]!.setup(createChannelContext() as never, { selfId: "bot" } as never);
+    if (!runtimePlugin) throw new Error("OneBot runtime plugin was not created");
+    const tools = await getTools(runtimePlugin);
+    const message = (userId: string) => ({ role: "custom", type: "yesimbot.message", data: { user: { id: userId } } });
 
-    const allowed = await plugins[0]!.setup(
-      { type: "direct", platform: "onebot", channelId: "private:100", userId: "100", selfId: "bot" } as never,
-      {} as never,
-    );
-    expect((await getTools(allowed!)).map((tool) => tool.name)).toEqual(["onebot_set_qq_profile"]);
+    expect((await runtimePlugin.filterTools?.(tools, { messages: [message("100")] } as never))?.map((tool) => tool.name)).toEqual(["onebot_set_qq_profile"]);
+    expect(await runtimePlugin.filterTools?.(tools, { messages: [message("101")] } as never)).toEqual([]);
+    expect(
+      await runtimePlugin.beforeToolCall?.({ toolCallId: "call", toolName: "onebot_set_qq_profile", args: {} }, { messages: [message("101")] } as never),
+    ).toEqual({ type: "block", reason: "当前消息发送者不在 OneBot 工具白名单中" });
   });
 
   it("exposes the migrated OneBot tools", async () => {

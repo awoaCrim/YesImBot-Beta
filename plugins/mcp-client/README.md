@@ -4,11 +4,26 @@ Expose tools from configured MCP servers to Athena channel runtimes.
 
 ## Tool Access and Confirmation Configuration
 
-The MCP plugin no longer applies a global `allowedScopes` allowlist; that field in old configurations has no effect. Enabled servers expose their tools to channel runtimes admitted by Core. Core's `allowedChannels` and other plugins' access controls are unchanged. Review which channels can invoke external services before upgrading.
+MCP tools use an explicit allowlist. Rules are ORed and their populated fields are ANDed; private and group chats have no separate access branch. By default, the OneBot user `1049700117` is authorized; an empty `allowedScopes` list denies all MCP tool definitions, including read-only tools. Confirmation is an additional execution safeguard, not a replacement for this allowlist.
+
+```yaml
+allowedScopes:
+  # Authorize this user in any channel whose platform/channel rule matches.
+  - platform: onebot
+    channelId: "*"
+    userId: "10001"
+    selfId: "*"
+  # Authorize one exact channel, regardless of chat type.
+  - platform: onebot
+    channelId: "123456789"
+    selfId: "3535802886"
+```
+
+Use `userId` for an identity rule and `channelId` for a channel rule. In a group turn, the rule is checked against every current message sender; a user rule with `channelId: "*"` therefore authorizes that user in any group. If a turn has no sender identity, only a channel-only rule can authorize it. A scope that cannot match any rule receives no MCP tools.
 
 Every `mcpServers` entry (`stdio`, `http`, or `sse`) supports optional `requireConfirmation`. Omitted or `true` keeps the existing risk classifier and one-time confirmation for side-effect or unknown-risk tools; explicitly read-only tools execute directly. Setting `false` bypasses confirmation for all tools on that server, including orders, payments and deletions. Disable it only when you explicitly accept those external effects; other servers keep their own setting.
 
-The switch does not change server authentication, Token file handling, media artifacts or catalog refresh. Configuration changes use the normal plugin/runtime reload lifecycle.
+The switch does not change server authentication, token file handling, media artifacts or catalog refresh. Configuration changes use the normal plugin/runtime reload lifecycle.
 
 ## Tool Registry
 

@@ -119,7 +119,7 @@ Tool names must be unique after runtime tools, plugin tools, initialization-only
 
 ## Plugins
 
-Plugins are the main extension boundary. New plugins provide stable tools through `AgentPlugin.tools` and stable instructions through `appendSystemPrompt`. They can also transform appended entries, project custom messages to model messages, wrap tool calls, and observe turn completion.
+Plugins are the main extension boundary. New plugins provide stable tools through `AgentPlugin.tools` and stable instructions through `appendSystemPrompt`. They can also filter the provider's active tools per step with `filterTools`, using the raw current-turn `AgentMessage` snapshot, transform appended entries, project custom messages to model messages, wrap tool calls, and observe turn completion.
 
 ```ts
 import { createAgent, type AgentPlugin } from "@yesimbot/agent-runtime";
@@ -143,7 +143,7 @@ const agent = createAgent({ model, plugins: [plugin] });
 ```
 
 Plugin order is `enforce: "pre"` first, then normal plugins, then `enforce: "post"`.
-`extendSystemPrompt` and `extendTools` remain deprecated, initialization-only compatibility hooks. New plugins must use `appendSystemPrompt` and `AgentPlugin.tools`; neither compatibility hook runs per turn.
+`filterTools` only controls provider exposure; sensitive plugins should still enforce the same policy in `beforeToolCall`. A filter failure hides all Agent tools for that provider step. `extendSystemPrompt` and `extendTools` remain deprecated, initialization-only compatibility hooks. New plugins must use `appendSystemPrompt` and `AgentPlugin.tools`; neither compatibility hook runs per turn.
 
 ## Storage
 

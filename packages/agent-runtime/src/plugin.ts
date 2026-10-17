@@ -42,6 +42,8 @@ export interface AgentPlugin {
   appendSystemPrompt?(context: PromptContext): Awaitable<SystemPromptAppend | void>;
   /** @deprecated Declare stable tools through `AgentPlugin.tools`. */
   extendTools?(tools: AgentToolSet, context: ToolExtensionContext): Awaitable<AgentToolSet | void>;
+  /** Filters stable tools at every provider step using the raw current-turn messages. */
+  filterTools?(tools: AgentToolSet, context: ToolFilterContext): Awaitable<AgentToolSet | void>;
   beforeToolCall?(call: ToolCallContext, context: ToolHookContext): Awaitable<ToolDecision | void>;
   afterToolCall?(result: ToolResultContext, context: ToolHookContext): Awaitable<Partial<ToolResultContext> | void>;
   onTurnFinish?(result: TurnResult, context: TurnFinishContext): Awaitable<void>;
@@ -88,8 +90,17 @@ export interface ToolExtensionContext extends HookContextBase {
   readonly turnId?: string;
 }
 
+export interface ToolFilterContext extends HookContextBase {
+  readonly turnId: string;
+  readonly stepNumber: number;
+  /** Raw current-turn AgentMessages, including joined messages and tool continuations. */
+  readonly messages: readonly AgentMessage[];
+}
+
 export interface ToolHookContext extends HookContextBase {
   readonly turnId: string;
+  /** Raw current-turn AgentMessages, including joined messages and tool continuations. */
+  readonly messages: readonly AgentMessage[];
 }
 
 export interface TurnFinishContext extends HookContextBase {
@@ -123,6 +134,7 @@ export interface PluginHostHelpers {
   transformMessages(messages: AgentMessage[], context: MessageTransformContext): Promise<AgentMessage[]>;
   toModelMessages(message: AgentMessage, context: ModelMessageContext): Promise<ModelMessage[]>;
   prepareStep(messages: readonly ModelMessage[], context: PrepareStepContext): Promise<readonly ModelMessage[]>;
+  filterTools(tools: AgentToolSet, context: ToolFilterContext): Promise<AgentToolSet>;
   beforeToolCall(decision: ToolDecision, call: ToolCallContext, context: ToolHookContext): Promise<ToolDecision>;
   afterToolCall(result: ToolResultContext, context: ToolHookContext): Promise<ToolResultContext>;
   onTurnFinish(result: TurnResult, context: TurnFinishContext): Promise<void>;
@@ -288,6 +300,25 @@ export function createPluginHost(options: { plugins: readonly AgentPlugin[]; run
           if (next) current = next;
         } catch (error) {
           emitPluginError(plugin.name, error);
+        }
+      }
+
+      return current;
+    },
+
+    async filterTools(tools, context) {
+      let current = tools;
+
+      for (const plugin of activePlugins) {
+        const hook = plugin?.filterTools;
+        if (!hook) continue;
+
+        try {
+          const next = await hook(current, context);
+          if (next) current = next;
+        } catch (error) {
+          emitPluginError(plugin.name, error);
+          current = [];
         }
       }
 

@@ -59,13 +59,13 @@ describe("CommandBridgePlugin", () => {
         on: vi.fn(),
         yesimbot: { resource: { get: vi.fn(async () => ({})) } },
       } as never,
-      createConfig({ allowedScopes: [{ platform: "test", channelId: "*", userId: "100" }] }) as never,
+      createConfig({ allowedScopes: [{ platform: "test", channelId: "room" }] }) as never,
     );
 
-    const denied = await plugin.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" }, {} as never);
+    const denied = await plugin.setup({ type: "guild", platform: "test", channelId: "other", guildId: "other" }, {} as never);
     expect(typeof denied.tools === "function" ? await denied.tools({} as never) : denied.tools).toEqual([]);
 
-    const allowed = await plugin.setup({ type: "direct", platform: "test", channelId: "private:100", userId: "100", selfId: "bot" }, {} as never);
+    const allowed = await plugin.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" }, {} as never);
     const tools = typeof allowed.tools === "function" ? await allowed.tools({} as never) : allowed.tools;
     expect(tools?.map((tool) => tool.name)).toEqual([
       "koishi_execute_list",
@@ -74,6 +74,29 @@ describe("CommandBridgePlugin", () => {
       "koishi_prompt_answer",
       "koishi_execute_abort",
     ]);
+  });
+
+  it("admits a user rule in any group but filters each current sender", async () => {
+    const plugin = new CommandBridgePlugin(
+      {
+        logger: vi.fn(() => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn() })),
+        on: vi.fn(),
+        yesimbot: { resource: { get: vi.fn(async () => ({})) } },
+      } as never,
+      createConfig({ allowedScopes: [{ platform: "test", channelId: "*", userId: "100" }] }) as never,
+    );
+
+    const runtimePlugin = await plugin.setup({ type: "guild", platform: "test", channelId: "group-1", guildId: "group-1" }, { selfId: "bot" } as never);
+    const tools = (typeof runtimePlugin.tools === "function" ? await runtimePlugin.tools({} as never) : runtimePlugin.tools) ?? [];
+    const message = (userId: string) => ({ role: "custom", type: "yesimbot.message", data: { user: { id: userId } } });
+
+    const allowed = await runtimePlugin.filterTools?.(tools, { messages: [message("100")] } as never);
+    const denied = await runtimePlugin.filterTools?.(tools, { messages: [message("101")] } as never);
+    expect(allowed?.map((tool) => tool.name)).toHaveLength(5);
+    expect(denied).toEqual([]);
+    expect(await runtimePlugin.beforeToolCall?.({ toolCallId: "call", toolName: "koishi_execute", args: {} }, { messages: [message("101")] } as never)).toEqual(
+      { type: "block", reason: "当前消息发送者不在命令桥工具白名单中" },
+    );
   });
 
   it("lists only commands allowed by the locked policy", async () => {

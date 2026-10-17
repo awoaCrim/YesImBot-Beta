@@ -227,6 +227,25 @@ The runtime MUST define deterministic composition rules for tool hooks. Stable t
 - **WHEN** multiple tools use the same name after tool collection
 - **THEN** the runtime MUST fail the turn with a tool conflict instead of silently overwriting a tool
 
+#### Scenario: Per-step tool filtering
+
+- **WHEN** a provider step is prepared
+- **THEN** the runtime MUST invoke each active `filterTools` hook in deterministic plugin order with the raw current-turn `AgentMessage` snapshot
+- **AND** the provider request MUST expose only the returned tool subset, intersected with any `beforeModelRequest` active-tool allowlist
+- **AND** the stable tool registry MUST remain unchanged for later turns
+
+#### Scenario: Tool execution defense in depth
+
+- **WHEN** a tool is hidden by a per-step filter but a provider still emits a call for it
+- **THEN** the runtime MUST still run `beforeToolCall` with the raw current-turn message snapshot
+- **AND** a sensitive plugin MUST be able to block the call before execution
+
+#### Scenario: Tool filter plugin failure
+
+- **WHEN** a `filterTools` hook throws
+- **THEN** the runtime MUST emit a plugin error diagnostic
+- **AND** the current provider step MUST receive no filtered Agent tools
+
 #### Scenario: Before tool block
 
 - **WHEN** a `beforeToolCall` hook returns a block decision
