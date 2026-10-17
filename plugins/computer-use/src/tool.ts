@@ -39,7 +39,7 @@ export function createComputerUseTool(options: ComputerUseToolOptions): AgentToo
     name: "computer_use",
     description: [
       "把需要可见浏览器或 Linux 桌面交互的完整任务委托给隔离 Anon VM 的原生 OpenAI computer tool。",
-      "子模型会看到活动 XRDP/LXQt 桌面截图并执行结构化鼠标、键盘、文本和滚动动作；它不是宿主桌面，也不会回退到 headless Chromium。",
+      "子模型会看到常驻 Anon X11/LXQt 桌面截图并执行结构化鼠标、键盘、文本和滚动动作；它不是宿主桌面，也不会回退到 headless Chromium。RDP 只用于人工查看。",
       "请传入一个具体任务，不要把它拆成单个坐标动作。工具会先实际完成并验证，再返回摘要和最后截图。",
       "若返回 safety_check_required，说明有潜在后果的动作没有执行；必须向用户说明并取得确认，不能声称已完成。",
     ].join("\n"),
@@ -114,7 +114,7 @@ function failure(code: Extract<ComputerUseResult, { ok: false }>["error"]["code"
     aborted: "The native computer task was aborted.",
     timeout: "The native computer task timed out.",
     provider_error: "The native computer model request failed.",
-    driver_unavailable: "The isolated Anon desktop is unavailable. Keep an XRDP session open and try again.",
+    driver_unavailable: "The isolated Anon desktop is unavailable. Check the persistent guest desktop service and try again.",
     action_failed: "The isolated Anon desktop rejected an action.",
     safety_check_required: "The computer model requested a safety confirmation; no consequential action was executed.",
     invalid_response: "The native computer model returned an invalid action response.",

@@ -4,10 +4,10 @@
 
 ## 为什么是一个委托工具
 
-主 Agent 只看到一个 `computer_use` 工具；插件内部的短生命周期子循环才会看到 OpenAI 的结构化 computer call 和来宾截图。来宾执行器通过固定的 MCP SSE 地址连接活动 XRDP/X11 会话，截图和动作都留在来宾边界内。
+主 Agent 只看到一个 `computer_use` 工具；插件内部的短生命周期子循环才会看到 OpenAI 的结构化 computer call 和来宾截图。来宾执行器通过固定的 MCP SSE 地址连接常驻的 Anon X11/LXQt 桌面，截图和动作都留在来宾边界内。RDP 只用于人工查看，不是 Anon 使用桌面的前提。
 
 - 该插件自身只向主 Agent 暴露一个 `computer_use` 委托工具，不注册 `desktop_*` 原始动作工具；其它 MCP 插件是否提供独立工具由各自配置决定。
-- 不使用宿主 `DISPLAY`，没有活动 Anon XRDP 会话时 fail-closed。
+- 不使用宿主 `DISPLAY`；优先连接来宾常驻的 `DISPLAY=:99`，必要时才使用当前 Anon XRDP 会话。
 - 不回退到 headless Chromium、宿主 shell 或其它用户的桌面。
 - 截图只通过 `EphemeralImageProjectionStore` 投影给当前请求，不写入会话历史。
 - OpenAI 返回 `pending_safety_checks` 时不执行该批动作，也不自动确认。
@@ -42,4 +42,4 @@ MCP 服务端需要提供：
 - `desktop_key`
 - `desktop_scroll`
 
-这些工具只接受固定的本地桌面动作；目标显示由来宾 helper 自己发现并校验，不由模型选择。
+这些工具只接受固定的本地桌面动作；目标显示由来宾 helper 自己发现并校验，不由模型选择。来宾 `anon-desktop.service` 开机常驻 `1280x800` 的虚拟 X11/LXQt 桌面，因此没有 RDP 登录时也能截图和操作。
