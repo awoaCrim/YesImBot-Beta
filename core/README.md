@@ -68,6 +68,30 @@ Conversation storage, prompt, model input, output queue, and delivery feedback.
 It holds no live Koishi Session. Model, prompt, tools, and AgentPlugin resources
 are snapshots for the runtime lifetime and take effect on replacement.
 
+### Group requests and sensitive tools
+
+When a debounce batch contains an explicitly bot-addressed triggering message,
+Core submits the last such request as the Agent input; later ambient chatter
+remains context. A later addressed request replaces it regardless of who sent it.
+Without an addressed trigger, Core keeps the latest-input behavior; direct batches
+also keep that behavior. A batch-aware Will candidate instead selects its exact
+raw input ID and author from the same batch. Invalid candidates start no turn and
+release their reservation.
+
+Workspace `hostExec`, MCP and `computer_use` use the shared `createToolAccessHooks`
+for per-step exposure and execution checks. User rules check every current-turn
+actor, not names or people mentioned in history. An actor-less group/event cannot
+use a user grant; explicit channel-wide rules and direct-scope fallback still work.
+Allowlist and confirmation settings are unchanged.
+
+Info logs `runtime.message_batch_request` identify the selected raw input, while
+`tool.access` records the phase, turn/step (when available), input/actor IDs,
+affected/available tool names and decision reason. Lists are capped at 32 entries
+and identifiers at 128 characters, with total counts retained. Bodies, prompts and
+tool arguments are excluded. These describe the allowlist gate; other filters or
+terminal-only repair can narrow tools further. Use the shared input IDs to see
+which request was checked and whether this gate denied it.
+
 ## Model input
 
 Core reads explicit `asset://`, `artifact://`, and registered resource URIs
@@ -223,7 +247,9 @@ Magic is disabled by default and requires `session.compact.mode: compartment`.
 When enabled, matching main-model input usage of at least 100,000 tokens starts
 background history summarization toward a soft target of about 80,000 tokens.
 Near the safe input capacity, or when the next request is estimated to exceed it,
-capacity protection can start earlier. Safe requests continue without waiting.
+capacity protection can start earlier. A local overflow estimate is provisional: Magic may
+wait within one bounded safety episode, then admits the best available request; provider
+usage and errors determine the actual outcome.
 With Magic disabled, the legacy controller triggers above 150,000 input tokens
 and waits for an idle runtime before compacting; the two controllers do not run
 together.

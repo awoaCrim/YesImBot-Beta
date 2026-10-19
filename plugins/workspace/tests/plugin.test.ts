@@ -9,10 +9,10 @@ vi.mock("koishi", async () => {
   return { Context: class {}, Logger: class {}, Schema };
 });
 
-import WorkspacePlugin, { isHostExecAllowed } from "../src/index.js";
+import WorkspacePlugin, { isHostExecAllowed, isHostExecPotentiallyAllowed } from "../src/index.js";
 import type { WorkspacePluginConfig } from "../src/types.js";
 
-async function createWorkspace() {
+async function createWorkspace(config?: WorkspacePluginConfig) {
   const baseDir = await mkdtemp(join(tmpdir(), "yesimbot-workspace-test-"));
   const plugins: WorkspacePlugin[] = [];
   const readers: Array<{ scheme: string; setup: (...args: never[]) => unknown }> = [];
@@ -38,25 +38,23 @@ async function createWorkspace() {
       },
     },
   };
-  const config: WorkspacePluginConfig = { bash: { cwd: baseDir, timeoutMs: 1000, enableNetwork: false, mounts: [] } };
-  const plugin = new WorkspacePlugin(ctx as never, config);
-  return { baseDir, ctx, config, disposeAgent, disposeReader, plugin, plugins, readers };
+  const resolvedConfig = config ?? { bash: { cwd: baseDir, timeoutMs: 1000, enableNetwork: false, mounts: [] } };
+  const plugin = new WorkspacePlugin(ctx as never, resolvedConfig);
+  return { baseDir, ctx, config: resolvedConfig, disposeAgent, disposeReader, plugin, plugins, readers };
 }
 
 describe("WorkspacePlugin", () => {
-  it("matches Host execution only for the exact Anon direct scope", () => {
-    const rule = { platform: "onebot", channelId: "private:1049700117", userId: "1049700117", selfId: "3535802886" };
+  it("matches Host execution by allowlist fields and current group actors", () => {
+    const rule = { platform: "onebot", channelId: "*", userId: "1049700117", selfId: "3535802886" };
+    const group = { type: "guild" as const, platform: "onebot", channelId: "group-1", guildId: "group-1", selfId: "3535802886" };
 
+    expect(isHostExecPotentiallyAllowed(group, [rule])).toBe(true);
+    expect(isHostExecAllowed(group, [rule], ["1049700117"])).toBe(true);
+    expect(isHostExecAllowed(group, [rule], ["other"])).toBe(false);
+    expect(isHostExecAllowed(group, [rule])).toBe(false);
     expect(isHostExecAllowed({ type: "direct", platform: "onebot", channelId: "private:1049700117", selfId: "3535802886", userId: "1049700117" }, [rule])).toBe(
       true,
     );
-    expect(isHostExecAllowed({ type: "direct", platform: "onebot", channelId: "private:other", selfId: "3535802886", userId: "other" }, [rule])).toBe(false);
-    expect(isHostExecAllowed({ type: "direct", platform: "onebot", channelId: "private:1049700117", selfId: "3535802886", userId: "other" }, [rule])).toBe(
-      false,
-    );
-    expect(
-      isHostExecAllowed({ type: "guild", platform: "onebot", channelId: "private:1049700117", guildId: "private:1049700117", selfId: "3535802886" }, [rule]),
-    ).toBe(false);
     expect(isHostExecAllowed({ type: "direct", platform: "other", channelId: "private:1049700117", selfId: "3535802886", userId: "1049700117" }, [rule])).toBe(
       false,
     );
@@ -84,7 +82,7 @@ describe("WorkspacePlugin", () => {
       const agentPlugin = await fixture.plugins[0]!.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" }, { selfId: "bot" } as never);
 
       expect(agentPlugin).toBeTruthy();
-      expect(fixture.ctx.yesimbot.resource.get).toHaveBeenCalledWith({ type: "guild", platform: "test", channelId: "room", guildId: "room" });
+      expect(fixture.ctx.yesimbot.resource.get).toHaveBeenCalledWith({ type: "guild", platform: "test", channelId: "room", guildId: "room", selfId: "bot" });
       const tools = typeof agentPlugin?.tools === "function" ? ((await agentPlugin.tools({} as never)) ?? []) : [];
       expect(tools.map((tool) => tool.name)).toEqual(["bash", "readFile", "writeFile", "editFile"]);
     } finally {
@@ -102,6 +100,42 @@ describe("WorkspacePlugin", () => {
 
       expect(tools).toHaveLength(4);
       expect(tools.map((t) => t.name).sort()).toEqual(["bash", "editFile", "readFile", "writeFile"]);
+    } finally {
+      await fixture.plugin.stop();
+      await rm(fixture.baseDir, { recursive: true, force: true });
+    }
+  });
+
+  it("admits hostExec in an authorized group and filters it by the current sender", async () => {
+    const fixture = await createWorkspace({
+      bash: { cwd: "/home/workspace", timeoutMs: 1000, enableNetwork: false, mounts: [] },
+      hostExec: {
+        enabled: true,
+        allowedChannels: [{ platform: "test", channelId: "*", userId: "allowed", selfId: "bot" }],
+        timeoutMs: 1000,
+      },
+    });
+    try {
+      await fixture.plugin.start();
+      // Exercise real setup/gates on every test host without opening an SSH process.
+      Reflect.set(fixture.plugin, "hostRunner", { run: vi.fn(), stop: vi.fn() });
+      const agentPlugin = await fixture.plugins[0]!.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" }, { selfId: "bot" } as never);
+      if (!agentPlugin) throw new Error("Workspace agent plugin was not created");
+      const tools = typeof agentPlugin.tools === "function" ? ((await agentPlugin.tools({} as never)) ?? []) : (agentPlugin.tools ?? []);
+      const message = (userId: string) => ({ id: "input-id", role: "custom", type: "yesimbot.message", data: { user: { id: userId } } });
+
+      expect(tools.map((tool) => tool.name)).toContain("hostExec");
+      expect((await agentPlugin.filterTools?.(tools, { messages: [message("allowed")] } as never))?.map((tool) => tool.name)).toContain("hostExec");
+      expect((await agentPlugin.filterTools?.(tools, { messages: [message("other")] } as never))?.map((tool) => tool.name)).not.toContain("hostExec");
+      expect(await agentPlugin.beforeToolCall?.({ toolCallId: "call", toolName: "hostExec", args: {} }, { messages: [message("other")] } as never)).toEqual({
+        type: "block",
+        reason: "当前消息发送者不在 Anon 来宾命令工具白名单中",
+      });
+      const logger = fixture.ctx.logger.mock.results[0]!.value;
+      expect(logger.info).toHaveBeenCalledWith(
+        "tool.access",
+        expect.objectContaining({ phase: "execute", actorIds: ["other"], inputIds: ["input-id"], allowed: false }),
+      );
     } finally {
       await fixture.plugin.stop();
       await rm(fixture.baseDir, { recursive: true, force: true });

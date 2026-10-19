@@ -399,7 +399,7 @@ export class ChannelRuntime {
       }
       if (this.options.will.decideBatch) {
         const batchDecision = await this.decideBatch([input]);
-        const result = batchDecision.decision === "wait" ? { kind: "wait" as const, eventId: input.id } : await this.startBatchDecision(input, batchDecision);
+        const result = batchDecision.decision === "wait" ? { kind: "wait" as const, eventId: input.id } : await this.startBatchDecision([input], batchDecision);
         this.logger.debug("runtime.handle", {
           eventId: input.id,
           eventType: isMessage(input) ? "message" : "event",
@@ -620,15 +620,7 @@ export class ChannelRuntime {
           this.logger.debug("runtime.message_batch_flush", { size: pending.length, trigger: false, latestEventId: latest.id });
           return;
         }
-        if (this.stopped) {
-          if (decision.reservationId) {
-            await this.settleReservationWithRetry(decision.reservationId, { kind: "release", reason: "start-failed" }).catch((cause) => {
-              this.logger.warn("runtime.will_reservation_settlement_failed", { reservationId: decision.reservationId, cause });
-            });
-          }
-          return;
-        }
-        const result = await this.startBatchDecision(latest, decision);
+        const result = await this.startBatchDecision(pending, decision);
         this.logger.debug("runtime.message_batch_flush", {
           size: pending.length,
           trigger: true,
@@ -641,7 +633,7 @@ export class ChannelRuntime {
         return;
       }
 
-      let trigger = false;
+      const triggering: MessageBatchInput[] = [];
       for (const input of pending) {
         if (this.stopped) return;
         let decision: "wait" | "trigger";
@@ -652,13 +644,15 @@ export class ChannelRuntime {
           continue;
         }
         if (this.stopped) return;
-        if (decision === "trigger") trigger = true;
+        if (decision === "trigger") triggering.push(input);
       }
-      if (!trigger || this.stopped) {
+      if (triggering.length === 0 || this.stopped) {
         this.logger.debug("runtime.message_batch_flush", { size: pending.length, trigger: false, latestEventId: latest.id });
         return;
       }
-      const result = this.start(latest, true, "defer");
+      const selected = this.selectBatchRequest(pending, triggering);
+      this.logBatchRequest(pending, selected.reason, selected.input);
+      const result = this.start(selected.input, true, "defer");
       this.logger.debug("runtime.message_batch_flush", {
         size: pending.length,
         trigger: true,
@@ -669,9 +663,57 @@ export class ChannelRuntime {
     });
   }
 
-  private async startBatchDecision(input: MessageBatchInput, decision: WillBatchDecision): Promise<RuntimeResult> {
+  /** Select by request direction, never by whether the sender has a tool grant. */
+  private selectBatchRequest(inputs: readonly MessageBatchInput[], triggering = inputs): { input: MessageBatchInput; reason: string } {
+    if (this.context.type !== "direct") {
+      for (let index = triggering.length - 1; index >= 0; index -= 1) {
+        const input = triggering[index]!;
+        if (isEvent(input) || input.data.quote?.author?.id === this.selfId || mentionsBot(input.data.elements, this.selfId)) {
+          return { input, reason: "addressed-trigger" };
+        }
+      }
+    }
+    return { input: inputs.at(-1)!, reason: this.context.type === "direct" ? "direct-latest" : "latest-fallback" };
+  }
+
+  private logBatchRequest(inputs: readonly MessageBatchInput[], reason: string, selected?: MessageBatchInput): void {
+    this.logger.info("runtime.message_batch_request", {
+      platform: this.context.platform.slice(0, 128),
+      channelId: this.context.channelId.slice(0, 128),
+      selfId: this.selfId.slice(0, 128),
+      inputIds: inputs.slice(0, 32).map((input) => input.id.slice(0, 128)),
+      inputCount: inputs.length,
+      selectedInputId: selected?.id.slice(0, 128),
+      reason,
+    });
+  }
+
+  private async startBatchDecision(inputs: readonly MessageBatchInput[], decision: WillBatchDecision): Promise<RuntimeResult> {
+    const candidate = decision.candidate;
+    const selected = candidate
+      ? {
+          input: inputs.find(
+            (input) =>
+              typeof candidate.authorId === "string" &&
+              candidate.authorId.length > 0 &&
+              input.id === candidate.inputId &&
+              batchInputAuthor(input, this.selfId) === candidate.authorId,
+          ),
+          reason: "will-candidate",
+        }
+      : this.selectBatchRequest(inputs);
+    if (!selected.input || this.stopped) {
+      this.logBatchRequest(inputs, this.stopped ? "stopped" : "invalid-candidate");
+      if (decision.reservationId) {
+        await this.settleReservationWithRetry(decision.reservationId, { kind: "release", reason: "start-failed" }).catch((cause) => {
+          this.logger.warn("runtime.will_reservation_settlement_failed", { reservationId: decision.reservationId, cause });
+        });
+      }
+      return { kind: "wait", eventId: inputs.at(-1)!.id };
+    }
+    this.logBatchRequest(inputs, selected.reason, selected.input);
     try {
-      return this.start(input, true, "defer", false, decision.reservationId);
+      return this.start(selected.input, true, "defer", false, decision.reservationId);
     } catch (cause) {
       if (decision.reservationId) {
         await this.settleReservationWithRetry(decision.reservationId, { kind: "release", reason: "start-failed" }).catch(() => undefined);
@@ -1234,7 +1276,7 @@ export class ChannelRuntime {
     };
   }
 
-  /** Silent posts must not reach the channel, so authored and registered output tools are refused. */
+  /** Silent posts must not reach the channel, so `send_message` is refused for their turns. */
   private silentTurnPlugin(): AgentPlugin {
     return {
       name: "core.silent-turn",
@@ -1246,6 +1288,20 @@ export class ChannelRuntime {
       },
     };
   }
+}
+
+function mentionsBot(elements: Message["data"]["elements"], selfId: string): boolean {
+  return elements.some((element) => {
+    if (element.type === "quote" || element.type === "reply") return false;
+    if (element.type === "at" && element.attrs.type !== "all" && element.attrs.type !== "here" && String(element.attrs.id ?? "") === selfId) return true;
+    return mentionsBot(element.children, selfId);
+  });
+}
+
+function batchInputAuthor(input: MessageBatchInput, selfId: string): string | undefined {
+  if (isMessage(input)) return input.data.user.id || undefined;
+  const data = input.data as unknown as { readonly eventType?: string; readonly actorId?: unknown; readonly targetId?: unknown };
+  return data.eventType === "notice.poke" && data.targetId === selfId && typeof data.actorId === "string" && data.actorId.length > 0 ? data.actorId : undefined;
 }
 
 export function createModelInputPlugin(mode: HistoryProjectionMode = "default", deferMerge = false, directImageInput?: DirectImageInputOptions): AgentPlugin {

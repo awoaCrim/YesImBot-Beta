@@ -202,9 +202,10 @@ describe("asynchronous Magic workspace", () => {
     expect(aux.generate).toHaveBeenCalledTimes(2);
     expect(f.workspace.status().historianProgress).toMatchObject({ reason: "retry-exhausted", generationAttempts: 2, attemptedBatches: 1 });
   });
-  it("rejects fixed mandatory overflow without waiting for an impossible summary", async () => {
+  it("admits fixed mandatory overflow without waiting for an impossible summary", async () => {
     const f = await fixture([], { config: { contextWindow: 10000, outputReserveTokens: 1000 } });
-    await expect(f.workspace.guard(context(f, "turn", 0, [{ role: "assistant", content: "x".repeat(100000) }]))).rejects.toThrow("ContextBudgetExceeded");
+    await expect(f.workspace.guard(context(f, "turn", 0, [{ role: "assistant", content: "x".repeat(100000) }]))).resolves.toHaveLength(2);
+    expect(f.workspace.status().estimatedInputTokens).toBeGreaterThan(f.workspace.status().inputBudget);
   });
   it("limits a safety episode to sixty seconds, retains late commits without a late request", async () => {
     const block = latch();
@@ -220,7 +221,7 @@ describe("asynchronous Magic workspace", () => {
     await vi.advanceTimersByTimeAsync(59999);
     expect(f.workspace.status().historian).toBe("generating");
     await vi.advanceTimersByTimeAsync(1);
-    expect(await outcome).toBe("ContextBudgetExceeded");
+    expect(await outcome).toBe("accepted");
     vi.useRealTimers();
     block.release();
     await settled(f);
@@ -276,7 +277,7 @@ describe("asynchronous Magic workspace", () => {
     block.release();
     await readEntered.promise;
     await vi.advanceTimersByTimeAsync(60000);
-    expect(await outcome).toBe("ContextBudgetExceeded");
+    expect(await outcome).toBe("accepted");
     readBlock.release();
     vi.useRealTimers();
     await settled(f);
@@ -459,11 +460,12 @@ describe("provisional tool-result safety", () => {
     expect(f.workspace.status().estimatedInputTokens).toBe(initial);
   });
 
-  it("uses provisional costs in mandatory-only rejection rather than bypassing recovery then failing at the final check", async () => {
+  it("admits provisional costs in mandatory-only requests without starting impossible recovery", async () => {
     const f = await fixture([], { config: { contextWindow: 10000, outputReserveTokens: 1000 } });
     // ~20KB previously fit at0.25 but cannot fit8k safe input at the provisional0.5.
-    await expect(f.workspace.guard(context(f, "turn", 0, toolPair("x".repeat(20000))))).rejects.toThrow("ContextBudgetExceeded");
+    await expect(f.workspace.guard(context(f, "turn", 0, toolPair("x".repeat(20000))))).resolves.toHaveLength(3);
     expect(f.workspace.status().backgroundActive).toBe(false);
+    expect(f.workspace.status().estimatedInputTokens).toBeGreaterThan(f.workspace.status().inputBudget);
   });
 
   it("clamps auxiliary output independently of the main reserve and rejects invalid limits without retries", async () => {

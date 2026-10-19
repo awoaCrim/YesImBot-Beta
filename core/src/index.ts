@@ -45,9 +45,15 @@ export { replyPlatformIds } from "./conversations/reply-receipt.js";
 
 export type { ChannelContext, ChannelKey } from "./channels/index.js";
 
-export { DEFAULT_MANAGEMENT_TOOL_SCOPES, extractToolAccessActorIds, isToolAccessAllowed, isToolAccessPotentiallyAllowed } from "./tool-access.js";
+export {
+  DEFAULT_MANAGEMENT_TOOL_SCOPES,
+  createToolAccessHooks,
+  extractToolAccessActorIds,
+  isToolAccessAllowed,
+  isToolAccessPotentiallyAllowed,
+} from "./tool-access.js";
 
-export type { ToolAccessRule } from "./tool-access.js";
+export type { ToolAccessDecision, ToolAccessRule } from "./tool-access.js";
 
 export type { ConversationReadOptions } from "./conversations/index.js";
 

@@ -1072,11 +1072,11 @@ describe("ChannelRuntime scheduling", () => {
     }
   });
 
-  it("uses one batch-aware Will decision, one reservation, and the latest input as the deferred Agent marker", async () => {
+  it("uses one batch-aware Will decision, one reservation, and the validated candidate as the deferred Agent marker", async () => {
     state.active = "active-turn";
     state.decideBatch.mockResolvedValue({
       decision: "trigger",
-      candidate: { inputId: "candidate", authorId: "user-1", score: 80, probability: 0.8 },
+      candidate: { inputId: "placeholder", authorId: "user-1", score: 80, probability: 0.8 },
       reservationId: "reservation-1",
     });
     state.run.mockReturnValue(
@@ -1097,6 +1097,11 @@ describe("ChannelRuntime scheduling", () => {
       await value.handle(message("candidate", "user-1", 1));
       await value.handle(message("latest", "user-2", 2));
       const queued = batching.controller.enqueue.mock.calls.map(([input]) => input);
+      state.decideBatch.mockResolvedValue({
+        decision: "trigger",
+        candidate: { inputId: queued[0]!.id, authorId: "user-1", score: 80, probability: 0.8 },
+        reservationId: "reservation-1",
+      });
 
       await batching.flush(queued);
       await vi.waitFor(() => expect(state.settleReservation).toHaveBeenCalledOnce());
@@ -1105,7 +1110,7 @@ describe("ChannelRuntime scheduling", () => {
       expect(state.decideBatch.mock.calls[0]?.[0].map((input: MessageBatchInput) => input.data.user.id)).toEqual(["user-1", "user-2"]);
       expect(state.decide).not.toHaveBeenCalled();
       expect(state.run).toHaveBeenCalledOnce();
-      expect(state.run).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ messageId: "latest" }) }), {
+      expect(state.run).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ messageId: "candidate" }) }), {
         ifBusy: "defer",
         historyMode: "conversation",
       });

@@ -8,16 +8,17 @@ function execution(abortSignal?: AbortSignal) {
 }
 
 describe("hostExec tool", () => {
-  it("describes the real-host boundary and failure handling in the prompt", () => {
+  it("describes the real-guest boundary and failure handling in the prompt", () => {
     const prompt = formatHostExecPrompt(60000);
 
-    expect(prompt).toContain("真实 SSH1 宿主机 Bash");
-    expect(prompt).toContain("host 用户 anon");
+    expect(prompt).toContain("真实 Anon 独立 Linux 来宾 Bash");
+    expect(prompt).toContain("以来宾用户 anon 运行");
     expect(prompt).toContain("不要读取、打印或复制 API key");
     expect(prompt).toContain("默认命令超时为 60000 ms");
+    expect(prompt).not.toContain("\\n");
   });
 
-  it("exposes a complete host command schema and forwards cwd, timeout, and abort signal", async () => {
+  it("exposes a complete guest command schema and forwards cwd, timeout, and abort signal", async () => {
     const run = vi.fn(async () => ({ stdout: "uid=1003(anon)\n", stderr: "", exitCode: 0 }));
     const abort = new AbortController();
     const tool = createHostExecTool({ runner: { run, stop: vi.fn() }, defaultTimeoutMs: 60000 });
@@ -41,14 +42,14 @@ describe("hostExec tool", () => {
 
   it("reports runner failures without leaking an exception into the Agent turn", async () => {
     const tool = createHostExecTool({
-      runner: { run: vi.fn(async () => Promise.reject(new Error("namespace unavailable"))), stop: vi.fn() },
+      runner: { run: vi.fn(async () => Promise.reject(new Error("guest unavailable"))), stop: vi.fn() },
       defaultTimeoutMs: 60000,
     });
 
     await expect(tool.execute!({ command: "id" }, execution())).resolves.toEqual({
       ok: false,
       stdout: "",
-      stderr: "namespace unavailable",
+      stderr: "guest unavailable",
       exitCode: 1,
       error: "host_exec_failed",
     });

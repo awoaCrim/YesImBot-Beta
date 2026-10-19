@@ -1,8 +1,8 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
-import { jsonSchema, type AgentPlugin, type AgentTool, type AgentToolExecuteContext, type ToolFilterContext } from "@yesimbot/agent-runtime";
+import { jsonSchema, type AgentPlugin, type AgentTool, type AgentToolExecuteContext } from "@yesimbot/agent-runtime";
 import { Context, Logger, Schema, type Bot } from "koishi";
-import { DEFAULT_MANAGEMENT_TOOL_SCOPES, extractToolAccessActorIds, isToolAccessAllowed, isToolAccessPotentiallyAllowed } from "koishi-plugin-yesimbot";
+import { DEFAULT_MANAGEMENT_TOOL_SCOPES, createToolAccessHooks, isToolAccessPotentiallyAllowed } from "koishi-plugin-yesimbot";
 import type { ArtifactStore, ChannelContext } from "koishi-plugin-yesimbot";
 
 import {
@@ -141,17 +141,20 @@ export default class McpClientPlugin {
     const channelTools = this.registeredTools.map((entry) =>
       wrapToolWithArtifacts(this.withConfirmationGate(entry, scopeKey, confirmations), resources.artifacts),
     );
-    const toolNames = new Set(channelTools.map((tool) => tool.name));
+    const toolNames = channelTools.map((tool) => tool.name);
     const hasConfirmationTools = this.registeredTools.some((entry) => entry.requiresConfirmation);
     const appendSystemPrompt = () => (hasConfirmationTools ? `${MCP_ARTIFACT_GUIDANCE}\n${MCP_CONFIRMATION_GUIDANCE}` : MCP_ARTIFACT_GUIDANCE);
-    const isAllowed = (messages: ToolFilterContext["messages"]) =>
-      isToolAccessAllowed(accessScope, this.config.allowedScopes, extractToolAccessActorIds(messages));
+    const accessHooks = createToolAccessHooks({
+      scope: accessScope,
+      rules: this.config.allowedScopes,
+      toolNames,
+      blockReason: "当前消息发送者不在 MCP 工具白名单中",
+      onDecision: (decision) => this.logger.info("tool.access", decision),
+    });
     return {
       name: "mcp-client",
       tools: channelTools,
-      filterTools: (tools, context) => (isAllowed(context.messages) ? tools : tools.filter((tool) => !toolNames.has(tool.name))),
-      beforeToolCall: (call, context) =>
-        toolNames.has(call.toolName) && !isAllowed(context.messages) ? { type: "block", reason: "当前消息发送者不在 MCP 工具白名单中" } : { type: "allow" },
+      ...accessHooks,
       appendSystemPrompt,
       stop: () => {
         confirmations.clear();

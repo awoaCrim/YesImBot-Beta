@@ -187,6 +187,33 @@ describe("mcp-client tool registry", () => {
     expect(await resolveToolNames(direct!)).toEqual([]);
   });
 
+  it("checks group senders at exposure and execution without bypassing server confirmation", async () => {
+    const { client } = createClient([["createOrder"]]);
+    const { ctx, plugins } = createContext();
+    mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn() } });
+    const plugin = new McpClientPlugin(ctx as never, {
+      allowedScopes: [{ platform: "test", channelId: "*", userId: "operator" }],
+      mcpServers: { docs: { type: "http", url: "https://example.test/mcp" } },
+    });
+    await plugin.start();
+    const runtime = await plugins[0]!.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" } as never, { selfId: "bot" } as never);
+    if (!runtime) throw new Error("MCP runtime missing");
+    const tools = await resolveTools(runtime);
+    const context = (actor: string) =>
+      ({ turnId: "turn", stepNumber: 0, messages: [{ id: "input-id", role: "custom", type: "yesimbot.message", data: { user: { id: actor } } }] }) as never;
+    expect(await runtime.filterTools?.(tools, context("operator"))).toBe(tools);
+    expect(await runtime.filterTools?.(tools, context("other"))).toEqual([]);
+    expect(await runtime.beforeToolCall?.({ toolName: "docs-createOrder", toolCallId: "call", args: { private: "SECRET" } }, context("other"))).toEqual({
+      type: "block",
+      reason: "当前消息发送者不在 MCP 工具白名单中",
+    });
+    expect(ctx.logger().info).toHaveBeenCalledWith("tool.access", expect.objectContaining({ phase: "execute", actorIds: ["other"], reason: "actor-denied" }));
+    const blocked = await tools[0]!.execute({}, context("operator"));
+    expect(outputText(blocked)).toContain("confirmation_required");
+    expect(client.callTool).not.toHaveBeenCalled();
+    await plugin.stop();
+  });
+
   it("updates server-level confirmation for newly published catalog snapshots", async () => {
     const { client, emitToolListChanged } = createClient([["createOrder"], ["createOrder"]]);
     client.callTool.mockResolvedValue({ content: [{ text: "upstream", type: "text" }] });

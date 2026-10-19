@@ -126,7 +126,7 @@ describe("frozen emergency backlog recovery", () => {
     );
     await aux.entered.promise;
     await vi.advanceTimersByTimeAsync(60000);
-    expect(await outcome).toBe("ContextBudgetExceeded");
+    expect(await outcome).toBe("accepted");
     expect(f.workspace.status().estimatedInputTokens).toBeGreaterThan(500000);
     expect(f.workspace.status().backgroundActive).toBe(true);
     f.workspace.finish({ turnId: "first" } as never);
@@ -316,7 +316,8 @@ describe("frozen emergency backlog recovery", () => {
       await vi.waitFor(() => expect(f.conversation.currentSessionId()).not.toBe(session), { timeout: 30000 });
       expect(archive).toHaveBeenCalledOnce();
       expect(aux.generate.mock.calls.length).toBeGreaterThan(8);
-      expect(f.stream).not.toHaveBeenCalled();
+      // Magic no longer blocks the main provider on a local overflow estimate.
+      expect(f.stream).toHaveBeenCalledOnce();
       expect(JSON.stringify(await f.conversation.storage.read())).toContain("late-during-recovery");
     } finally {
       vi.useRealTimers();
@@ -372,10 +373,13 @@ describe("frozen emergency backlog recovery", () => {
     const f = await fixture(100, 6000, { continuityModel: aux.model });
     const freeze = vi.spyOn(f.conversation, "freezeContextRegion");
     vi.useFakeTimers();
-    const outcome = f.workspace.guard(context(f)).catch((cause: Error) => cause.message);
+    const outcome = f.workspace.guard(context(f)).then(
+      () => "accepted",
+      (cause: Error) => cause.message,
+    );
     await entered.promise;
     await vi.advanceTimersByTimeAsync(60000);
-    expect(await outcome).toBe("ContextBudgetExceeded");
+    expect(await outcome).toBe("accepted");
     vi.useRealTimers();
     blocked.release();
     await settled(f);
@@ -425,7 +429,7 @@ describe("frozen emergency backlog recovery", () => {
     if (failure !== "commit") aux.generate.mockRejectedValueOnce(failure === "http" ? error : new Error("PRIVATE unknown failure"));
     const f = await fixture(100, 6000, { continuityModel: aux.model });
     if (failure === "commit") vi.spyOn(f.conversation, "commitContextRegion").mockRejectedValueOnce(error);
-    await expect(f.workspace.guard(context(f))).rejects.toThrow("ContextBudgetExceeded");
+    await expect(f.workspace.guard(context(f))).resolves.toBeDefined();
     await settled(f);
     expect(aux.generate).toHaveBeenCalledOnce();
     expect(await f.conversation.contextRegions()).toHaveLength(0);
@@ -480,9 +484,9 @@ describe("frozen emergency backlog recovery", () => {
       new APICallError({ message: "PRIVATE server error", url: "https://private.invalid", requestBodyValues: {}, statusCode: 503 }),
     );
     const f = await fixture(100, 6000, { continuityModel: aux.model });
-    await expect(f.workspace.guard(context(f))).rejects.toThrow("ContextBudgetExceeded");
+    await expect(f.workspace.guard(context(f))).resolves.toBeDefined();
     await settled(f);
-    await expect(f.workspace.guard(context(f, "immediate-repeat"))).rejects.toThrow("ContextBudgetExceeded");
+    await expect(f.workspace.guard(context(f, "immediate-repeat"))).resolves.toBeDefined();
     expect(aux.generate).toHaveBeenCalledTimes(2);
     expect(f.workspace.status().historianProgress).toMatchObject({
       reason: "retry-exhausted",
@@ -500,9 +504,9 @@ describe("frozen emergency backlog recovery", () => {
   it("backs off systemic generation failures instead of trying every remaining cohort", async () => {
     const aux = historian(undefined, "invalid JSON");
     const f = await fixture(undefined, undefined, { continuityModel: aux.model });
-    await expect(f.workspace.guard(context(f))).rejects.toThrow("ContextBudgetExceeded");
+    await expect(f.workspace.guard(context(f))).resolves.toBeDefined();
     await settled(f);
-    await expect(f.workspace.guard(context(f, "retry"))).rejects.toThrow("ContextBudgetExceeded");
+    await expect(f.workspace.guard(context(f, "retry"))).resolves.toBeDefined();
     expect(aux.generate).toHaveBeenCalledTimes(2);
     expect(f.workspace.status()).toMatchObject({
       historian: "failed",

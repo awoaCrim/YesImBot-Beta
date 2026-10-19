@@ -17,15 +17,10 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("../src/transports", () => ({ connectMcpServer: mocks.connectMcpServer }));
 
-vi.mock("koishi-plugin-yesimbot", () => ({
-  DEFAULT_MANAGEMENT_TOOL_SCOPES: [{ platform: "onebot", channelId: "*", userId: "1049700117" }],
+vi.mock("koishi-plugin-yesimbot", async () => ({
+  ...(await import("../../../core/src/tool-access.js")),
   formatElements: (elements: Array<{ attrs?: { content?: unknown }; type?: unknown }>) =>
     elements.map((element) => (element.type === "text" ? String(element.attrs?.content ?? "") : "")).join(""),
-  extractToolAccessActorIds: () => [],
-  isToolAccessAllowed: (scope: { platform: string; channelId: string }, rules: Array<{ platform: string; channelId: string }> | undefined) =>
-    rules?.some((rule) => rule.platform === scope.platform && (rule.channelId === "*" || rule.channelId === scope.channelId)) ?? false,
-  isToolAccessPotentiallyAllowed: (scope: { platform: string; channelId: string }, rules: Array<{ platform: string; channelId: string }> | undefined) =>
-    rules?.some((rule) => rule.platform === scope.platform && (rule.channelId === "*" || rule.channelId === scope.channelId)) ?? false,
 }));
 
 vi.mock("koishi", () => {

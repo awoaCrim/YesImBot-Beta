@@ -1,4 +1,4 @@
-import type { AgentMessage } from "@yesimbot/agent-runtime";
+import type { AgentMessage, AgentPlugin } from "@yesimbot/agent-runtime";
 
 import type { ChannelContext } from "./channels/context.js";
 
@@ -63,6 +63,94 @@ export function extractToolAccessActorIds(messages: readonly AgentMessage[]): re
     if (userId) actorIds.add(userId);
   }
   return [...actorIds];
+}
+
+export interface ToolAccessDecision {
+  readonly phase: "filter" | "execute";
+  readonly turnId: string;
+  readonly stepNumber?: number;
+  readonly platform: string;
+  readonly channelId: string;
+  readonly selfId?: string;
+  readonly inputIds: readonly string[];
+  readonly inputCount: number;
+  readonly actorIds: readonly string[];
+  readonly actorCount: number;
+  readonly toolNames: readonly string[];
+  readonly toolCount: number;
+  readonly availableToolNames: readonly string[];
+  readonly availableToolCount: number;
+  readonly allowed: boolean;
+  readonly reason: "allowed" | "no-rules" | "scope-mismatch" | "missing-actor" | "actor-denied";
+}
+
+/** Shared per-step exposure and execution gates; diagnostics never include bodies or tool arguments. */
+export function createToolAccessHooks(options: {
+  readonly scope: ToolAccessScope;
+  readonly rules: readonly ToolAccessRule[] | undefined;
+  readonly toolNames: readonly string[];
+  readonly blockReason: string;
+  readonly onDecision?: (decision: ToolAccessDecision) => void;
+}): Pick<AgentPlugin, "filterTools" | "beforeToolCall"> {
+  const names = new Set(options.toolNames);
+  if (names.size === 0) return {};
+  // One hook instance belongs to one Runtime. Retain only the latest filter coordinate.
+  let lastStep: { turnId: string; stepNumber: number } | undefined;
+  const check = (phase: ToolAccessDecision["phase"], messages: readonly AgentMessage[], turnId: string, toolNames: readonly string[]): boolean => {
+    const actors = extractToolAccessActorIds(messages);
+    const allowed = isToolAccessAllowed(options.scope, options.rules, actors);
+    if (options.onDecision) {
+      const inputIds = messages
+        .filter((message) => message.role === "custom" && (message.type === "yesimbot.message" || message.type === "yesimbot.event"))
+        .map((message) => message.id);
+      const reason: ToolAccessDecision["reason"] = allowed
+        ? "allowed"
+        : !options.rules?.length
+          ? "no-rules"
+          : !options.rules.some((rule) => matchesScopeFields(options.scope, rule))
+            ? "scope-mismatch"
+            : actors.length === 0 && options.scope.userId === undefined
+              ? "missing-actor"
+              : "actor-denied";
+      const available = allowed ? toolNames : [];
+      const bounded = (values: readonly string[]) => values.slice(0, 32).map((value) => value.slice(0, 128));
+      try {
+        options.onDecision({
+          phase,
+          turnId: turnId?.slice(0, 128),
+          ...(lastStep?.turnId === turnId ? { stepNumber: lastStep.stepNumber } : {}),
+          platform: options.scope.platform.slice(0, 128),
+          channelId: options.scope.channelId.slice(0, 128),
+          selfId: options.scope.selfId?.slice(0, 128),
+          inputIds: bounded(inputIds),
+          inputCount: inputIds.length,
+          actorIds: bounded(actors),
+          actorCount: actors.length,
+          toolNames: bounded(toolNames),
+          toolCount: toolNames.length,
+          availableToolNames: bounded(available),
+          availableToolCount: available.length,
+          allowed,
+          reason,
+        });
+      } catch {
+        // A broken diagnostic sink must not bypass the authorization gate.
+      }
+    }
+    return allowed;
+  };
+  return {
+    filterTools: (tools, context) => {
+      lastStep = { turnId: context.turnId, stepNumber: context.stepNumber };
+      const affected = tools.filter((tool) => names.has(tool.name)).map((tool) => tool.name);
+      if (affected.length === 0) return tools;
+      return check("filter", context.messages, context.turnId, affected) ? tools : tools.filter((tool) => !names.has(tool.name));
+    },
+    beforeToolCall: (call, context) =>
+      names.has(call.toolName) && !check("execute", context.messages, context.turnId, [call.toolName])
+        ? { type: "block", reason: options.blockReason }
+        : { type: "allow" },
+  };
 }
 
 function matchesRule(scope: ToolAccessScope, rule: ToolAccessRule, actorUserId: string | undefined): boolean {

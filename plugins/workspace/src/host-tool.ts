@@ -26,12 +26,12 @@ export function createHostExecTool(options: HostExecToolOptions): AgentTool<Host
   return {
     name: "hostExec",
     description:
-      "在 SSH1 宿主机上执行一条真实 Bash 命令。命令不是 just-bash 虚拟沙箱；它会以 host 用户 anon 运行，而 anon 可以使用现有 sudo 权限管理整台 SSH1。只在确实需要宿主机状态或维护时使用；先执行 id、pwd、docker ps 等小范围检查，再进行变更。不要把秘密、API key、密码或完整环境变量写入命令或输出。必须检查 ok、exitCode、stdout 和 stderr，不要假设命令成功。",
+      "在 Anon 独立 Linux 来宾中执行一条真实 Bash 命令。命令不是 just-bash 虚拟沙箱；它通过固定 SSH 身份进入来宾，并以来宾用户 anon 运行，只能管理来宾本身。只在确实需要来宾状态或维护时使用；先执行 id、pwd 等小范围检查，再进行变更。不要把秘密、API key、密码或完整环境变量写入命令或输出。必须检查 ok、exitCode、stdout 和 stderr，不要假设命令成功。",
     inputSchema: jsonSchema<HostExecInput>({
       type: "object",
       properties: {
-        command: { type: "string", minLength: 1, description: "要在 SSH1 宿主机执行的完整 Bash 命令；不要拆成多个互相依赖的调用" },
-        cwd: { type: "string", description: "宿主机绝对工作目录；省略时使用 /" },
+        command: { type: "string", minLength: 1, description: "要在 Anon Linux 来宾执行的完整 Bash 命令；不要拆成多个互相依赖的调用" },
+        cwd: { type: "string", description: "来宾绝对工作目录；省略时使用 /" },
         timeoutMs: {
           type: "integer",
           minimum: 1_000,

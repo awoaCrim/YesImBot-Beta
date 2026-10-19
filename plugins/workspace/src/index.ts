@@ -3,7 +3,8 @@ import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { URL } from "node:url";
 
 import type { AgentPlugin } from "@yesimbot/agent-runtime";
-import { Context, Logger, Schema } from "koishi";
+import { Context, Logger, Schema, type Bot } from "koishi";
+import { createToolAccessHooks, isToolAccessAllowed, isToolAccessPotentiallyAllowed } from "koishi-plugin-yesimbot";
 import type { ChannelResources, ChannelContext, ResourceReader } from "koishi-plugin-yesimbot";
 
 import { createBashToolSet } from "./bash-tool";
@@ -50,20 +51,20 @@ export default class WorkspacePlugin {
       enableJavascript: Schema.boolean().default(false).description("启用 JavaScript 执行"),
     }).description("Bash 沙箱配置"),
     hostExec: Schema.object({
-      enabled: Schema.boolean().default(false).description("为精确 allowlist 的 Anon 私聊启用 SSH1 宿主机命令工具"),
+      enabled: Schema.boolean().default(false).description("为命中显式白名单的 Anon 频道启用 Linux 来宾命令工具"),
       allowedChannels: Schema.array(
         Schema.object({
-          platform: Schema.string().min(1).required(),
-          channelId: Schema.string().min(1).required(),
-          userId: Schema.string().min(1).required(),
-          selfId: Schema.string().min(1).required(),
+          platform: Schema.string().min(1).required().description("平台名称；* 匹配任意平台"),
+          channelId: Schema.string().min(1).required().description("频道 ID；* 匹配任意频道"),
+          userId: Schema.string().description("可选的用户 ID；群聊按当前消息发送者匹配，留空则按其它字段授权"),
+          selfId: Schema.string().description("可选的机器人账号 ID；留空匹配所有机器人账号"),
         }),
       )
         .role("table")
         .default([])
-        .description("Host 工具允许的 Anon direct scope；必须精确匹配 platform/channelId/selfId"),
+        .description("Host 工具白名单；规则按 OR 合并、字段按 AND 匹配，不额外区分私聊和群聊"),
       timeoutMs: Schema.number().min(1000).max(300000).default(60000).description("Host 命令默认超时（毫秒）"),
-    }).description("仅 Anon 私聊可用的 SSH1 宿主机命令能力"),
+    }).description("仅显式白名单允许的 Anon Linux 来宾命令能力"),
     skillPaths: Schema.array(Schema.path({ filters: ["directory", "file"], allowCreate: true })),
   });
 
@@ -150,21 +151,29 @@ export default class WorkspacePlugin {
     this.logger.success("Workspace plugin started");
   }
 
-  public async setup(scope: ChannelContext): Promise<AgentPlugin | null> {
+  public async setup(scope: ChannelContext, bot?: Bot): Promise<AgentPlugin | null> {
     const sandbox = this.sandbox;
     if (!sandbox) return null;
-    const resources = await this.ctx.yesimbot.resource.get(scope);
+    const accessScope = scope.selfId === undefined && bot ? { ...scope, selfId: bot.selfId } : scope;
+    const resources = await this.ctx.yesimbot.resource.get(accessScope);
     const runtimeSkills = this.skillCatalog.map((skill) => ({ ...skill }));
     const runtimeMounts = this.normalizedMounts;
     const shared = this.sharedWorkspaceRoot !== undefined;
     const hostExecConfig = this.hostExecConfig;
     const hostRunner = this.hostRunner;
-    const hostExecAllowed = hostRunner !== undefined && isHostExecAllowed(scope, hostExecConfig?.allowedChannels ?? []);
+    const hostExecPotentiallyAllowed = hostRunner !== undefined && isToolAccessPotentiallyAllowed(accessScope, hostExecConfig?.allowedChannels ?? []);
+    const accessHooks = createToolAccessHooks({
+      scope: accessScope,
+      rules: hostExecConfig?.allowedChannels,
+      toolNames: hostExecPotentiallyAllowed ? ["hostExec"] : [],
+      blockReason: "当前消息发送者不在 Anon 来宾命令工具白名单中",
+      onDecision: (decision) => this.logger.info("tool.access", decision),
+    });
     return {
       name: "workspace",
       tools: async () => {
         const tools = await createBashToolSet(await this.getOrCreateWorkspace(resources, sandbox, runtimeMounts));
-        if (hostExecAllowed && hostRunner) {
+        if (hostExecPotentiallyAllowed && hostRunner) {
           tools.push(createHostExecTool({ runner: hostRunner, defaultTimeoutMs: hostExecConfig?.timeoutMs ?? 60000 }));
         }
         return tools;
@@ -173,10 +182,11 @@ export default class WorkspacePlugin {
         const workspace = await this.getOrCreateWorkspace(resources, sandbox, runtimeMounts);
         return [
           formatWorkspacePrompt(workspace, { shared }),
-          ...(hostExecAllowed ? [formatHostExecPrompt(hostExecConfig?.timeoutMs ?? 60000)] : []),
+          ...(hostExecPotentiallyAllowed ? [formatHostExecPrompt(hostExecConfig?.timeoutMs ?? 60000)] : []),
           formatSkillsForPrompt(runtimeSkills),
         ].filter(Boolean);
       },
+      ...accessHooks,
     } satisfies AgentPlugin;
   }
 
@@ -309,11 +319,12 @@ export default class WorkspacePlugin {
   }
 }
 
-export function isHostExecAllowed(scope: ChannelContext, rules: readonly HostExecChannelRule[]): boolean {
-  if (scope.type !== "direct") return false;
-  return rules.some(
-    (rule) => rule.platform === scope.platform && rule.channelId === scope.channelId && rule.userId === scope.userId && rule.selfId === scope.selfId,
-  );
+export function isHostExecPotentiallyAllowed(scope: ChannelContext, rules: readonly HostExecChannelRule[]): boolean {
+  return isToolAccessPotentiallyAllowed(scope, rules);
+}
+
+export function isHostExecAllowed(scope: ChannelContext, rules: readonly HostExecChannelRule[], actorUserIds?: readonly string[]): boolean {
+  return isToolAccessAllowed(scope, rules, actorUserIds);
 }
 
 async function readBoundedFile(filePath: string, options: { signal: AbortSignal; maxBytes: number }): Promise<Uint8Array> {

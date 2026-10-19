@@ -1,20 +1,68 @@
+import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 
-const NSENTER_PATH = "/usr/bin/nsenter";
-const HOST_SUDO_PATH = "/usr/bin/sudo";
-const HOST_BASH_PATH = "/bin/bash";
-const HOST_USER = "anon";
-const HOST_ENTRYPOINT = "yesimbot-host-exec";
+const SSH_PATH = "/usr/bin/ssh";
+const GUEST_HOST = "172.20.0.1";
+const GUEST_PORT = 10022;
+const GUEST_USER = "anon";
+const GUEST_IDENTITY_FILE = "/run/yesimbot/anon-vm/anon_ed25519";
+const GUEST_KNOWN_HOSTS_FILE = "/run/yesimbot/anon-vm/anon_known_hosts";
+const REMOTE_MARKER_PREFIX = "/tmp/yesimbot-guest-exec-";
 const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_TIMEOUT_MS = 300_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 30_000;
 const DEFAULT_KILL_GRACE_MS = 250;
+const REMOTE_CLEANUP_TIMEOUT_MS = 10_000;
 const TIMEOUT_EXIT_CODE = 124;
 const CANCEL_EXIT_CODE = 130;
 
-type TerminationReason = "abort" | "timeout" | "stop";
+const REMOTE_EXEC_SCRIPT = String.raw`set -eu
 
-type SpawnProcess = typeof spawn;
+token=$1
+cwd=$2
+command=$3
+marker=/tmp/yesimbot-guest-exec-$token.pid
+umask 077
+printf '%s\n' "$$" > "$marker"
+
+cleanup() {
+  status=$?
+  trap - EXIT HUP INT TERM
+  if [ -s "$marker" ]; then
+    while IFS= read -r pid; do
+      case "$pid" in
+        ''|*[!0-9]*) continue ;;
+        "$$") continue ;;
+        *) kill -TERM -- "-$pid" 2>/dev/null || true ;;
+      esac
+    done < "$marker"
+  fi
+  rm -f -- "$marker"
+  exit "$status"
+}
+
+trap cleanup EXIT HUP INT TERM
+cd -- "$cwd"
+setsid /bin/bash --noprofile --norc -c "$command" &
+child=$!
+printf '%s\n%s\n' "$$" "$child" > "$marker"
+set +e
+wait "$child"
+status=$?
+set -e
+exit "$status"
+`;
+
+const DEFAULT_GUEST_SSH: GuestSshConfig = {
+  sshPath: SSH_PATH,
+  host: GUEST_HOST,
+  port: GUEST_PORT,
+  user: GUEST_USER,
+  identityFile: GUEST_IDENTITY_FILE,
+  knownHostsFile: GUEST_KNOWN_HOSTS_FILE,
+};
+
+type TerminationReason = "abort" | "timeout" | "stop";
 
 type QueueEntry = {
   input: HostRunnerInput;
@@ -30,8 +78,14 @@ type BoundedBuffer = {
   append(chunk: Buffer | string): void;
   toString(): string;
   get truncated(): boolean;
-  get droppedBytes(): number;
 };
+
+type CleanupResult = {
+  readonly ok: boolean;
+  readonly detail?: string;
+};
+
+type SpawnProcess = typeof spawn;
 
 export interface HostCommandResult {
   readonly stdout: string;
@@ -55,16 +109,27 @@ export interface HostRunner {
   stop(): Promise<void>;
 }
 
+export interface GuestSshConfig {
+  readonly sshPath: string;
+  readonly host: string;
+  readonly port: number;
+  readonly user: string;
+  readonly identityFile: string;
+  readonly knownHostsFile: string;
+}
+
 export interface HostRunnerOptions {
   readonly defaultTimeoutMs?: number;
   readonly maxTimeoutMs?: number;
   readonly maxOutputBytes?: number;
   readonly killGraceMs?: number;
-  readonly nsenterPath?: string;
   readonly environment?: NodeJS.ProcessEnv;
   readonly platform?: NodeJS.Platform;
   readonly spawnProcess?: SpawnProcess;
   readonly killProcess?: (pid: number, signal: NodeJS.Signals) => void;
+  readonly guestSsh?: Partial<GuestSshConfig>;
+  readonly cleanupTimeoutMs?: number;
+  readonly tokenGenerator?: () => string;
 }
 
 class HostRunnerImpl implements HostRunner {
@@ -72,11 +137,13 @@ class HostRunnerImpl implements HostRunner {
   private readonly maxTimeoutMs: number;
   private readonly maxOutputBytes: number;
   private readonly killGraceMs: number;
-  private readonly nsenterPath: string;
   private readonly environment: NodeJS.ProcessEnv;
   private readonly platform: NodeJS.Platform;
   private readonly spawnProcess: SpawnProcess;
   private readonly killProcess: (pid: number, signal: NodeJS.Signals) => void;
+  private readonly guestSsh: GuestSshConfig;
+  private readonly cleanupTimeoutMs: number;
+  private readonly tokenGenerator: () => string;
   private readonly children = new Set<ChildProcess>();
   private readonly queue: QueueEntry[] = [];
   private active?: QueueEntry;
@@ -88,23 +155,28 @@ class HostRunnerImpl implements HostRunner {
     this.maxTimeoutMs = options.maxTimeoutMs ?? MAX_TIMEOUT_MS;
     this.maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
     this.killGraceMs = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
-    this.nsenterPath = options.nsenterPath ?? NSENTER_PATH;
     this.environment = options.environment ?? process.env;
     this.platform = options.platform ?? process.platform;
     this.spawnProcess = options.spawnProcess ?? spawn;
     this.killProcess = options.killProcess ?? ((pid, signal) => process.kill(pid, signal));
+    this.guestSsh = { ...DEFAULT_GUEST_SSH, ...options.guestSsh };
+    this.cleanupTimeoutMs = options.cleanupTimeoutMs ?? REMOTE_CLEANUP_TIMEOUT_MS;
+    this.tokenGenerator = options.tokenGenerator ?? (() => randomBytes(16).toString("hex"));
 
     if (!Number.isSafeInteger(this.defaultTimeoutMs) || this.defaultTimeoutMs <= 0) {
-      throw new Error("Host runner defaultTimeoutMs must be a positive integer");
+      throw new Error("Guest runner defaultTimeoutMs must be a positive integer");
     }
     if (!Number.isSafeInteger(this.maxTimeoutMs) || this.maxTimeoutMs < this.defaultTimeoutMs) {
-      throw new Error("Host runner maxTimeoutMs must be an integer at least defaultTimeoutMs");
+      throw new Error("Guest runner maxTimeoutMs must be an integer at least defaultTimeoutMs");
     }
     if (!Number.isSafeInteger(this.maxOutputBytes) || this.maxOutputBytes <= 0) {
-      throw new Error("Host runner maxOutputBytes must be a positive integer");
+      throw new Error("Guest runner maxOutputBytes must be a positive integer");
     }
     if (!Number.isSafeInteger(this.killGraceMs) || this.killGraceMs < 0) {
-      throw new Error("Host runner killGraceMs must be a non-negative integer");
+      throw new Error("Guest runner killGraceMs must be a non-negative integer");
+    }
+    if (!Number.isSafeInteger(this.cleanupTimeoutMs) || this.cleanupTimeoutMs <= 0) {
+      throw new Error("Guest runner cleanupTimeoutMs must be a positive integer");
     }
   }
 
@@ -114,7 +186,7 @@ class HostRunnerImpl implements HostRunner {
     } catch (error) {
       return Promise.reject(error);
     }
-    if (this.stopped) return Promise.reject(new Error("Host runner is stopped"));
+    if (this.stopped) return Promise.reject(new Error("Guest runner is stopped"));
     if (input.signal?.aborted) return Promise.resolve(cancellationResult("abort", this.resolveTimeout(input.timeoutMs)));
 
     return new Promise<HostCommandResult>((resolve, reject) => {
@@ -203,7 +275,9 @@ class HostRunnerImpl implements HostRunner {
   private async execute(entry: QueueEntry): Promise<HostCommandResult> {
     if (entry.terminationReason) return cancellationResult(entry.terminationReason, this.resolveTimeout(entry.input.timeoutMs));
 
-    const args = buildNsenterArgs(entry.input);
+    const token = this.tokenGenerator();
+    if (!/^[a-f0-9]{32,64}$/.test(token)) throw new Error("Guest runner token generator returned an invalid token");
+    const args = buildGuestSshArgs(entry.input, token, this.guestSsh);
     const spawnOptions: SpawnOptions = {
       cwd: "/",
       env: this.environment,
@@ -216,7 +290,7 @@ class HostRunnerImpl implements HostRunner {
       const stderr = createBoundedBuffer(this.maxOutputBytes);
       let child: ChildProcess;
       try {
-        child = this.spawnProcess(this.nsenterPath, args, spawnOptions);
+        child = this.spawnProcess(this.guestSsh.sshPath, args, spawnOptions);
       } catch (error) {
         reject(error);
         return;
@@ -225,6 +299,7 @@ class HostRunnerImpl implements HostRunner {
       let settled = false;
       let timeoutTimer: NodeJS.Timeout | undefined;
       let graceTimer: NodeJS.Timeout | undefined;
+      let cleanupPromise: Promise<CleanupResult> | undefined;
 
       const clearTimers = (): void => {
         if (timeoutTimer) {
@@ -255,6 +330,7 @@ class HostRunnerImpl implements HostRunner {
       const terminate = (reason: TerminationReason): void => {
         if (settled) return;
         entry.terminationReason ??= reason;
+        cleanupPromise ??= this.cleanupRemote(token);
         signalProcessGroup(child, "SIGTERM", this.platform, this.killProcess);
         if (!graceTimer) {
           graceTimer = setTimeout(() => {
@@ -281,7 +357,9 @@ class HostRunnerImpl implements HostRunner {
           ...(stdout.truncated ? { stdoutTruncated: true } : {}),
           ...(stderr.truncated ? { stderrTruncated: true } : {}),
         };
-        finish(result);
+        void (cleanupPromise ?? Promise.resolve<CleanupResult>({ ok: true }))
+          .then((cleanup) => finish(appendCleanupResult(result, cleanup)))
+          .catch(fail);
       });
 
       if (entry.terminationReason) {
@@ -292,48 +370,162 @@ class HostRunnerImpl implements HostRunner {
       }
     });
   }
+
+  private cleanupRemote(token: string): Promise<CleanupResult> {
+    const args = buildGuestCleanupSshArgs(token, this.guestSsh);
+    const spawnOptions: SpawnOptions = {
+      cwd: "/",
+      env: this.environment,
+      detached: this.platform !== "win32",
+      stdio: ["ignore", "pipe", "pipe"],
+    };
+
+    return new Promise<CleanupResult>((resolve) => {
+      let child: ChildProcess;
+      try {
+        child = this.spawnProcess(this.guestSsh.sshPath, args, spawnOptions);
+      } catch (error) {
+        resolve({ ok: false, detail: error instanceof Error ? error.message : String(error) });
+        return;
+      }
+      this.children.add(child);
+      const stderr = createBoundedBuffer(4_000);
+      let settled = false;
+      let timer: NodeJS.Timeout | undefined;
+      const settle = (result: CleanupResult): void => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        this.children.delete(child);
+        resolve(result);
+      };
+      const killCleanup = (): void => {
+        signalProcessGroup(child, "SIGKILL", this.platform, this.killProcess);
+        settle({ ok: false, detail: "cleanup SSH timed out" });
+      };
+
+      child.stderr?.on("data", (chunk: Buffer | string) => stderr.append(chunk));
+      child.once("error", (error) => settle({ ok: false, detail: error instanceof Error ? error.message : String(error) }));
+      child.once("close", (code) => {
+        settle(code === 0 ? { ok: true } : { ok: false, detail: stderr.toString() || `cleanup SSH exited with ${code ?? 1}` });
+      });
+      timer = setTimeout(killCleanup, this.cleanupTimeoutMs);
+      timer.unref?.();
+    });
+  }
 }
 
 export function createHostRunner(options: HostRunnerOptions = {}): HostRunner {
   return new HostRunnerImpl(options);
 }
 
-export function buildNsenterArgs(input: HostRunnerInput): string[] {
+export function buildGuestSshArgs(input: HostRunnerInput, token: string, config: GuestSshConfig = DEFAULT_GUEST_SSH): string[] {
   return [
-    "-t",
-    "1",
-    "-m",
-    "-u",
-    "-i",
-    "-n",
+    "-T",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectionAttempts=1",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "StrictHostKeyChecking=yes",
+    "-o",
+    `UserKnownHostsFile=${config.knownHostsFile}`,
+    "-o",
+    "IdentitiesOnly=yes",
+    "-o",
+    "PasswordAuthentication=no",
+    "-o",
+    "KbdInteractiveAuthentication=no",
+    "-o",
+    "PubkeyAuthentication=yes",
+    "-o",
+    "ForwardAgent=no",
+    "-o",
+    "ForwardX11=no",
+    "-o",
+    "ClearAllForwardings=yes",
     "-p",
-    "--",
-    HOST_SUDO_PATH,
-    "-n",
-    "-u",
-    HOST_USER,
-    "--",
-    HOST_BASH_PATH,
-    "--noprofile",
-    "--norc",
-    "-c",
-    'cd -- "$1" || exit $?; exec /bin/bash --noprofile --norc -c "$2"',
-    HOST_ENTRYPOINT,
-    input.cwd,
-    input.command,
+    String(config.port),
+    "-i",
+    config.identityFile,
+    `${config.user}@${config.host}`,
+    buildRemoteExecCommand(token, input.cwd, input.command),
   ];
 }
 
+export function buildGuestCleanupSshArgs(token: string, config: GuestSshConfig = DEFAULT_GUEST_SSH): string[] {
+  return [
+    "-T",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectionAttempts=1",
+    "-o",
+    "ConnectTimeout=5",
+    "-o",
+    "StrictHostKeyChecking=yes",
+    "-o",
+    `UserKnownHostsFile=${config.knownHostsFile}`,
+    "-o",
+    "IdentitiesOnly=yes",
+    "-o",
+    "PasswordAuthentication=no",
+    "-o",
+    "KbdInteractiveAuthentication=no",
+    "-o",
+    "PubkeyAuthentication=yes",
+    "-o",
+    "ForwardAgent=no",
+    "-o",
+    "ForwardX11=no",
+    "-o",
+    "ClearAllForwardings=yes",
+    "-p",
+    String(config.port),
+    "-i",
+    config.identityFile,
+    `${config.user}@${config.host}`,
+    buildRemoteCleanupCommand(token),
+  ];
+}
+
+function buildRemoteExecCommand(token: string, cwd: string, command: string): string {
+  return [
+    shellQuote("/usr/bin/setsid"),
+    shellQuote("/bin/bash"),
+    shellQuote("--noprofile"),
+    shellQuote("--norc"),
+    shellQuote("-c"),
+    shellQuote(REMOTE_EXEC_SCRIPT),
+    shellQuote("yesimbot-guest-exec"),
+    shellQuote(token),
+    shellQuote(cwd),
+    shellQuote(command),
+  ].join(" ");
+}
+
+function buildRemoteCleanupCommand(token: string): string {
+  const marker = `${REMOTE_MARKER_PREFIX}${token}.pid`;
+  const script = `set +e\nmarker=${shellQuote(marker)}\nif [ -s "$marker" ]; then\n  while IFS= read -r pid; do\n    case "$pid" in ''|*[!0-9]*) continue ;; *) kill -TERM -- "-$pid" 2>/dev/null || true ;; esac\n  done < "$marker"\n  sleep 0.2\n  while IFS= read -r pid; do\n    case "$pid" in ''|*[!0-9]*) continue ;; *) kill -KILL -- "-$pid" 2>/dev/null || true ;; esac\n  done < "$marker"\n  rm -f -- "$marker"\nfi\nexit 0\n`;
+  return [shellQuote("/bin/bash"), shellQuote("--noprofile"), shellQuote("--norc"), shellQuote("-c"), shellQuote(script)].join(" ");
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
 function validateInput(input: HostRunnerInput, platform: NodeJS.Platform, maxTimeoutMs: number): void {
-  if (platform !== "linux") throw new Error("Host runner requires Linux namespace support");
-  if (typeof input.command !== "string" || input.command.length === 0) throw new Error("Host runner command must be a non-empty string");
-  if (input.command.includes("\u0000")) throw new Error("Host runner command must not contain NUL bytes");
+  if (platform !== "linux") throw new Error("Guest runner requires Linux support");
+  if (typeof input.command !== "string" || input.command.length === 0) throw new Error("Guest command must be a non-empty string");
+  if (input.command.includes("\u0000")) throw new Error("Guest command must not contain NUL bytes");
   if (typeof input.cwd !== "string" || input.cwd.length === 0 || !input.cwd.startsWith("/")) {
-    throw new Error("Host runner cwd must be an absolute POSIX path");
+    throw new Error("Guest command cwd must be an absolute POSIX path");
   }
-  if (input.cwd.includes("\u0000")) throw new Error("Host runner cwd must not contain NUL bytes");
+  if (input.cwd.includes("\u0000")) throw new Error("Guest command cwd must not contain NUL bytes");
   if (input.timeoutMs !== undefined && (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0 || input.timeoutMs > maxTimeoutMs)) {
-    throw new Error(`Host runner timeoutMs must be an integer between 1 and ${maxTimeoutMs}`);
+    throw new Error(`Guest command timeoutMs must be an integer between 1 and ${maxTimeoutMs}`);
   }
 }
 
@@ -382,9 +574,6 @@ function createBoundedBuffer(maxBytes: number): BoundedBuffer {
     get truncated() {
       return droppedBytes > 0;
     },
-    get droppedBytes() {
-      return droppedBytes;
-    },
   };
 }
 
@@ -392,6 +581,12 @@ function appendTerminationMessage(stderr: string, reason: TerminationReason | un
   if (!reason) return stderr;
   const message = reason === "timeout" ? `Command timed out after ${timeoutMs}ms` : "Command cancelled";
   return stderr.length > 0 ? `${stderr}\n${message}` : message;
+}
+
+function appendCleanupResult(result: HostCommandResult, cleanup: CleanupResult): HostCommandResult {
+  if (cleanup.ok) return result;
+  const detail = cleanup.detail ? `: ${cleanup.detail}` : "";
+  return { ...result, stderr: `${result.stderr}${result.stderr.length > 0 ? "\n" : ""}Remote cleanup status unknown${detail}` };
 }
 
 function cancellationResult(reason: TerminationReason, timeoutMs: number): HostCommandResult {

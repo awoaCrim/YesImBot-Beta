@@ -22,8 +22,8 @@ export interface SandboxBashConfig {
 export interface HostExecChannelRule {
   readonly platform: string;
   readonly channelId: string;
-  readonly userId: string;
-  readonly selfId: string;
+  readonly userId?: string;
+  readonly selfId?: string;
 }
 
 export interface HostExecConfig {

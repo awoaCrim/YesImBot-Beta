@@ -220,7 +220,7 @@ describe("request-only self-style reminder", () => {
     }
   });
 
-  it("counts the fixed reminder before Magic admission and preserves mandatory overflow", async () => {
+  it("counts the fixed reminder before provisional Magic admission", async () => {
     const root = await mkdtemp(join(tmpdir(), "yesimbot-self-style-budget-"));
     const conversation = new Conversation(root, { minMessages: 1, maxFailures: 1, mode: "compartment" }, { magicContext: true });
     const projection = new AgentRequestProjection();
@@ -250,7 +250,7 @@ describe("request-only self-style reminder", () => {
       };
       await expect(workspace.guard(request)).resolves.toEqual([current]);
       const messages = await createSelfStyleReminderPlugin().prepareStep!([current], context(projection));
-      await expect(workspace.guard({ ...request, messages: messages!, rebuildMessages: async () => messages! })).rejects.toThrow("ContextBudgetExceeded");
+      await expect(workspace.guard({ ...request, messages: messages!, rebuildMessages: async () => messages! })).resolves.toEqual(messages);
       expect(fake.doGenerate).not.toHaveBeenCalled();
       expect(fake.doStream).not.toHaveBeenCalled();
       expect(await conversation.storage.read()).toEqual([]);

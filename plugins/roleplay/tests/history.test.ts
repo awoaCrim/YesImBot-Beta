@@ -339,7 +339,7 @@ describe("request-only role material lifecycle", () => {
     await agent.stop();
   });
 
-  it("counts fixed seed budget and fails existing mandatory overflow without auxiliary work", async () => {
+  it("counts fixed seed budget and admits mandatory overflow without auxiliary work", async () => {
     const f = await fixture(`<START>\n{{char}}: ${"x".repeat(100000)}`, { enabled: true });
     const h = await host(f);
     const messages = await h.value.helpers.prepareStep([{ role: "user", content: "CURRENT" }], h.context);
@@ -374,7 +374,7 @@ describe("request-only role material lifecycle", () => {
           signal: new AbortController().signal,
           rebuildMessages: async () => messages,
         }),
-      ).rejects.toThrow("ContextBudgetExceeded");
+      ).resolves.toEqual(messages);
       expect(model.doGenerate).not.toHaveBeenCalled();
       expect(model.doStream).not.toHaveBeenCalled();
       expect(await conversation.contextRegions()).toEqual([]);

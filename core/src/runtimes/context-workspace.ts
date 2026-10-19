@@ -15,15 +15,7 @@ import {
 } from "../conversations/historian.js";
 import type { Conversation } from "../conversations/index.js";
 import { replyHistoryContent, resolveReplyHistory } from "../conversations/reply-receipt.js";
-import {
-  ContextBudgetError,
-  estimateContextBase,
-  estimateContextMessage,
-  estimateContextValue,
-  requestUnits,
-  resolveContextBudget,
-  type ContextBudget,
-} from "./context-budget.js";
+import { estimateContextBase, estimateContextMessage, estimateContextValue, requestUnits, resolveContextBudget, type ContextBudget } from "./context-budget.js";
 import { contextCostTokens, measureContextMessages, UNMEASURED_TOOL_TOKEN_RATIO, type ContextCost } from "./context-estimator.js";
 import { contextCandidates, contextPressure, selectContextTiers, CONTEXT_SAFETY_WAIT_MS } from "./context-policy.js";
 
@@ -233,9 +225,12 @@ export class ContextWorkspace {
     this.recordAttempt(context, attemptedEstimate, "prepared");
     if (this.estimate(mandatory, base) > budget.inputTokens) {
       this.recordAttempt(context, attemptedEstimate, "mandatory-overflow");
-      throw new ContextBudgetError("ContextBudgetExceeded");
+      // Nothing the historian can summarize can make mandatory live/request material safe.
+      // Admit it provisionally and let the main provider, not this estimate, decide.
+      return this.recordRequest(context, context.messages, base, true);
     }
     const deadline = Date.now() + CONTEXT_SAFETY_WAIT_MS;
+    let bestMessages: readonly ModelMessage[] = context.messages;
     try {
       for (;;) {
         this.regions = await beforeDeadline(this.conversation.contextRegions(), deadline, context.signal);
@@ -253,6 +248,7 @@ export class ContextWorkspace {
           this.messageTokenCosts(context.messages),
         );
         const messages = this.project(context, base);
+        bestMessages = messages;
         attemptedEstimate = this.estimate(messages, base);
         const pressure = contextPressure(
           this.usageViewVersion === this.viewVersion ? this.providerInputTokens : undefined,
@@ -263,13 +259,22 @@ export class ContextWorkspace {
         if (pressure.ordinary || pressure.emergency) this.scheduleHistorian(pressure.unsafe, attemptedEstimate);
         if (!pressure.unsafe) return this.recordRequest(context, messages, base);
         // Join only for safety, never for the 80k soft target. One deadline for all batches.
-        if (!this.job || Date.now() >= deadline) throw new ContextBudgetError("ContextBudgetExceeded");
+        if (!this.job || Date.now() >= deadline) {
+          this.recordAttempt(context, attemptedEstimate, Date.now() >= deadline ? "safety-deadline" : "unresolved-unsafe");
+          return this.recordRequest(context, bestMessages, base, true);
+        }
         const completed = await joinUntil(Promise.race([this.job.task, this.job.progress]), deadline, context.signal);
         this.checkGeneration(generation);
-        if (!completed) throw new ContextBudgetError("ContextBudgetExceeded");
+        if (!completed) {
+          this.recordAttempt(context, attemptedEstimate, "safety-deadline");
+          return this.recordRequest(context, bestMessages, base, true);
+        }
       }
     } catch (cause) {
-      if (cause instanceof ContextBudgetError) this.recordAttempt(context, attemptedEstimate, Date.now() >= deadline ? "safety-deadline" : "unresolved-unsafe");
+      if (cause instanceof ContextSafetyDeadlineError) {
+        this.recordAttempt(context, attemptedEstimate, "safety-deadline");
+        return this.recordRequest(context, bestMessages, base, true);
+      }
       throw cause;
     }
   }
@@ -646,12 +651,15 @@ export class ContextWorkspace {
     const measured = measureContextMessages(messages, this.measuredToolResults);
     return Math.ceil(contextCostTokens({ bytes: base + measured.bytes, unmeasuredToolBytes: measured.unmeasuredToolBytes }, this.multiplier));
   }
-  private recordRequest(context: AgentModelRequestContext, messages: readonly ModelMessage[], base: number): ModelMessage[] {
+  private recordRequest(context: AgentModelRequestContext, messages: readonly ModelMessage[], base: number, provisional = false): ModelMessage[] {
     const final = this.options.mergeMessages ? this.options.mergeMessages(messages) : [...messages];
     const measured = measureContextMessages(final, this.measuredToolResults);
     const raw = base + measured.bytes;
     this.lastEstimate = Math.ceil(contextCostTokens({ bytes: raw, unmeasuredToolBytes: measured.unmeasuredToolBytes }, this.multiplier));
-    if (this.lastEstimate > this.budget.inputTokens) throw new ContextBudgetError("ContextBudgetExceeded");
+    const admittedProvisionally = provisional || this.lastEstimate > this.budget.inputTokens;
+    // Keep actual-usage correlation on the request just admitted, including raw/provisional fallbacks.
+    this.candidateContext = context;
+    this.candidateBaseTokens = base;
     this.pendingEstimate = {
       turnId: context.turnId,
       step: context.stepNumber,
@@ -667,6 +675,7 @@ export class ContextWorkspace {
       step: context.stepNumber,
       estimatedInputTokens: this.lastEstimate,
       inputBudget: this.budget.inputTokens,
+      admission: admittedProvisionally ? "provisional" : "estimated-safe",
       historian: this.jobState,
     });
     return final;
@@ -866,6 +875,13 @@ export class ContextWorkspace {
   }
 }
 
+class ContextSafetyDeadlineError extends Error {
+  public constructor() {
+    super("ContextBudgetExceeded");
+    this.name = "ContextSafetyDeadline";
+  }
+}
+
 export function formatContextPage(page: ContextBlockPage): ModelMessage {
   return {
     role: "assistant",
@@ -914,7 +930,7 @@ async function joinUntil(job: Promise<void>, deadline: number, signal: AbortSign
     await beforeDeadline(job, deadline, signal);
     return true;
   } catch (cause) {
-    if (cause instanceof ContextBudgetError) return false;
+    if (cause instanceof ContextSafetyDeadlineError) return false;
     throw cause;
   }
 }
@@ -932,7 +948,7 @@ function beforeDeadline<T>(operation: Promise<T>, deadline: number, signal: Abor
     const timer = setTimeout(
       () => {
         cleanup();
-        reject(new ContextBudgetError("ContextBudgetExceeded"));
+        reject(new ContextSafetyDeadlineError());
       },
       Math.max(0, deadline - Date.now()),
     );
@@ -942,7 +958,7 @@ function beforeDeadline<T>(operation: Promise<T>, deadline: number, signal: Abor
     void operation.then(
       (value) => {
         cleanup();
-        if (Date.now() >= deadline) reject(new ContextBudgetError("ContextBudgetExceeded"));
+        if (Date.now() >= deadline) reject(new ContextSafetyDeadlineError());
         else resolve(value);
       },
       (cause: unknown) => {

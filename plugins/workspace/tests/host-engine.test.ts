@@ -3,13 +3,16 @@ import { PassThrough } from "node:stream";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { buildNsenterArgs, createHostRunner } from "../src/host-engine";
+import { buildGuestCleanupSshArgs, buildGuestSshArgs, createHostRunner } from "../src/host-engine";
 
 class FakeChild extends EventEmitter {
-  public readonly pid = 4321;
   public readonly stdout = new PassThrough();
   public readonly stderr = new PassThrough();
   public readonly signals: NodeJS.Signals[] = [];
+
+  public constructor(public readonly pid: number) {
+    super();
+  }
 
   public kill(signal: NodeJS.Signals): boolean {
     this.signals.push(signal);
@@ -20,22 +23,25 @@ class FakeChild extends EventEmitter {
 
 type SpawnFactory = ReturnType<typeof createSpawnFactory>;
 
-function createSpawnFactory(options: { readonly closeImmediately?: boolean; readonly stdout?: string; readonly stderr?: string } = {}) {
-  let child: FakeChild | undefined;
+function createSpawnFactory(options: { readonly closeOnSpawn?: boolean[]; readonly stdout?: string; readonly stderr?: string } = {}) {
+  const children: FakeChild[] = [];
   const spawnProcess = vi.fn(() => {
-    child = new FakeChild();
+    const child = new FakeChild(4321 + children.length);
+    children.push(child);
+    const closeImmediately = options.closeOnSpawn?.[children.length - 1] ?? false;
     queueMicrotask(() => {
-      if (options.stdout) child?.stdout.emit("data", Buffer.from(options.stdout));
-      if (options.stderr) child?.stderr.emit("data", Buffer.from(options.stderr));
-      if (options.closeImmediately) child?.emit("close", 0);
+      if (options.stdout) child.stdout.emit("data", Buffer.from(options.stdout));
+      if (options.stderr) child.stderr.emit("data", Buffer.from(options.stderr));
+      if (closeImmediately) child.emit("close", 0);
     });
     return child as never;
   });
-  const killProcess = vi.fn((_pid: number, signal: NodeJS.Signals) => {
+  const killProcess = vi.fn((pid: number, signal: NodeJS.Signals) => {
+    const child = children.find((candidate) => -candidate.pid === pid);
     child?.signals.push(signal);
     queueMicrotask(() => child?.emit("close", null));
   });
-  return { spawnProcess, killProcess, getChild: () => child };
+  return { spawnProcess, killProcess, children };
 }
 
 function createRunner(factory: SpawnFactory, options: { readonly defaultTimeoutMs?: number; readonly maxOutputBytes?: number } = {}) {
@@ -45,27 +51,39 @@ function createRunner(factory: SpawnFactory, options: { readonly defaultTimeoutM
     maxTimeoutMs: 300,
     maxOutputBytes: options.maxOutputBytes ?? 16,
     killGraceMs: 1,
+    cleanupTimeoutMs: 20,
     spawnProcess: factory.spawnProcess,
     killProcess: factory.killProcess,
+    tokenGenerator: () => "a".repeat(32),
   });
 }
 
-describe("host runner command construction", () => {
-  it("enters the host namespaces and runs as anon without shell interpolation", () => {
-    const args = buildNsenterArgs({ command: "printf '%s' \"$HOME\"", cwd: "/opt/yesimbot" });
+describe("guest runner command construction", () => {
+  it("uses the fixed guest SSH identity and quotes cwd and command", () => {
+    const args = buildGuestSshArgs({ command: "printf '%s' \"$HOME\"", cwd: "/opt/yesimbot" }, "a".repeat(32));
+    const remote = args.at(-1) ?? "";
 
-    expect(args.slice(0, 8)).toEqual(["-t", "1", "-m", "-u", "-i", "-n", "-p", "--"]);
-    expect(args).toContain("/usr/bin/sudo");
-    expect(args).toContain("anon");
-    expect(args.at(-3)).toBe("yesimbot-host-exec");
-    expect(args.at(-2)).toBe("/opt/yesimbot");
-    expect(args.at(-1)).toBe("printf '%s' \"$HOME\"");
+    expect(args).toEqual(expect.arrayContaining(["-T", "StrictHostKeyChecking=yes", "IdentitiesOnly=yes", "-p", "10022"]));
+    expect(args).not.toContain("/usr/bin/nsenter");
+    expect(args).toContain("anon@172.20.0.1");
+    expect(remote).toContain("marker=/tmp/yesimbot-guest-exec-$token.pid");
+    expect(remote).toContain("'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'");
+    expect(remote).toContain("'/opt/yesimbot'");
+    expect(remote).toContain("$HOME");
+    expect(remote).toContain("'printf ");
+  });
+
+  it("builds a separate fixed-target cleanup command", () => {
+    const args = buildGuestCleanupSshArgs("b".repeat(32));
+    expect(args).toContain("anon@172.20.0.1");
+    expect(args.at(-1)).toContain("yesimbot-guest-exec-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.pid");
+    expect(args.at(-1)).toContain("KILL");
   });
 });
 
-describe("host runner lifecycle", () => {
+describe("guest runner lifecycle", () => {
   it("preserves exit/output and bounds each stream", async () => {
-    const factory = createSpawnFactory({ closeImmediately: true, stdout: "12345678901234567890", stderr: "abcdefghijklmnopqrst" });
+    const factory = createSpawnFactory({ closeOnSpawn: [true], stdout: "12345678901234567890", stderr: "abcdefghijklmnopqrst" });
     const runner = createRunner(factory, { maxOutputBytes: 8 });
 
     const result = await runner.run({ command: "id", cwd: "/" });
@@ -74,24 +92,25 @@ describe("host runner lifecycle", () => {
     expect(result.stdout).toContain("[output truncated:");
     expect(result.stderr).toContain("[output truncated:");
     expect(factory.spawnProcess).toHaveBeenCalledWith(
-      "/usr/bin/nsenter",
-      expect.arrayContaining(["-t", "1", "/usr/bin/sudo", "anon"]),
+      "/usr/bin/ssh",
+      expect.arrayContaining(["-T", "anon@172.20.0.1"]),
       expect.objectContaining({ cwd: "/", detached: true, stdio: ["ignore", "pipe", "pipe"] }),
     );
   });
 
-  it("terminates the process group on timeout", async () => {
-    const factory = createSpawnFactory();
+  it("terminates the local process group and cleans the remote group on timeout", async () => {
+    const factory = createSpawnFactory({ closeOnSpawn: [false, true] });
     const runner = createRunner(factory, { defaultTimeoutMs: 10 });
 
     const result = await runner.run({ command: "sleep 10", cwd: "/", timeoutMs: 10 });
 
     expect(result).toMatchObject({ exitCode: 124, timedOut: true, stderr: expect.stringContaining("timed out") });
     expect(factory.killProcess).toHaveBeenCalledWith(-4321, "SIGTERM");
+    expect(factory.spawnProcess).toHaveBeenCalledTimes(2);
   });
 
-  it("terminates the process group on abort and drains queued calls on stop", async () => {
-    const factory = createSpawnFactory({ closeImmediately: true });
+  it("terminates on abort and drains queued calls on stop", async () => {
+    const factory = createSpawnFactory({ closeOnSpawn: [false, true, true] });
     const runner = createRunner(factory);
     const abort = new AbortController();
     const active = runner.run({ command: "sleep 10", cwd: "/", signal: abort.signal });
@@ -108,7 +127,7 @@ describe("host runner lifecycle", () => {
   });
 
   it("cancels queued work when the runner stops", async () => {
-    const factory = createSpawnFactory();
+    const factory = createSpawnFactory({ closeOnSpawn: [false, true] });
     const runner = createRunner(factory);
     const active = runner.run({ command: "sleep 10", cwd: "/" });
     const queued = runner.run({ command: "echo queued", cwd: "/" });
