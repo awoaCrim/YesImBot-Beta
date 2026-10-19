@@ -21,15 +21,15 @@ tool-name-specific prompts to use `bash`, `readFile`, and `writeFile`.
 
 ## Configuration
 
-| Option          | Meaning                                                                                                        |
-| --------------- | -------------------------------------------------------------------------------------------------------------- |
-| `sharedPath`    | Optional host path used as `/home/workspace` by every enabled channel.                                         |
-| `cwd`           | Virtual working directory used by `bash-tool`. Default: `/home/workspace`.                                     |
-| `persistPaths`  | Extra writable host-backed mounts. Changes persist on the host.                                                |
-| `readOnlyPaths` | Read-only host-backed mounts. Reads succeed, writes fail.                                                      |
-| `overlayPaths`  | Copy-on-write host-backed mounts. Reads come from the host path, writes stay in the virtual filesystem.        |
-| `timeoutMs`     | Bash command timeout in milliseconds. Default: `30000`.                                                        |
-| `enableNetwork` | Enables `just-bash` network support. Default: `false`.                                                         |
+| Option          | Meaning                                                                                                                              |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `sharedPath`    | Optional host path used as `/home/workspace` by every enabled channel.                                                               |
+| `cwd`           | Virtual working directory used by `bash-tool`. Default: `/home/workspace`.                                                           |
+| `persistPaths`  | Extra writable host-backed mounts. Changes persist on the host.                                                                      |
+| `readOnlyPaths` | Read-only host-backed mounts. Reads succeed, writes fail.                                                                            |
+| `overlayPaths`  | Copy-on-write host-backed mounts. Reads come from the host path, writes stay in the virtual filesystem.                              |
+| `timeoutMs`     | Bash command timeout in milliseconds. Default: `30000`.                                                                              |
+| `enableNetwork` | Enables `just-bash` network support. Default: `false`.                                                                               |
 | `hostExec`      | Optional allowlist-scoped Anon Linux guest command capability; disabled by default and requires the guest SSH key/known-host mounts. |
 
 Without `sharedPath`, the writable workspace root comes from

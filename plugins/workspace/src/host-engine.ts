@@ -1,5 +1,5 @@
-import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { randomBytes } from "node:crypto";
 
 const SSH_PATH = "/usr/bin/ssh";
 const GUEST_HOST = "172.20.0.1";
@@ -357,9 +357,7 @@ class HostRunnerImpl implements HostRunner {
           ...(stdout.truncated ? { stdoutTruncated: true } : {}),
           ...(stderr.truncated ? { stderrTruncated: true } : {}),
         };
-        void (cleanupPromise ?? Promise.resolve<CleanupResult>({ ok: true }))
-          .then((cleanup) => finish(appendCleanupResult(result, cleanup)))
-          .catch(fail);
+        void (cleanupPromise ?? Promise.resolve<CleanupResult>({ ok: true })).then((cleanup) => finish(appendCleanupResult(result, cleanup))).catch(fail);
       });
 
       if (entry.terminationReason) {

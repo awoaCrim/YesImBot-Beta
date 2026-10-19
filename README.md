@@ -162,15 +162,15 @@ YesImBot 的能力通过插件系统按需加载。
 
 > 当前 v4 插件随 Launcher 源码接入一起提供，不在 npm 或插件市场中逐包安装。
 
-| 插件        | 包名                                    | 能力                                |
-| ----------- | --------------------------------------- | ----------------------------------- |
-| 控制台      | `koishi-plugin-yesimbot-console`        | 自定义 Koishi 首页与 WebUI          |
-| 工作区      | `koishi-plugin-yesimbot-workspace`      | 文件操作、命令执行与 Skill 目录访问 |
-| MCP 客户端  | `koishi-plugin-yesimbot-mcp-client`     | 通过 MCP 协议接入外部工具服务       |
+| 插件        | 包名                                    | 能力                                 |
+| ----------- | --------------------------------------- | ------------------------------------ |
+| 控制台      | `koishi-plugin-yesimbot-console`        | 自定义 Koishi 首页与 WebUI           |
+| 工作区      | `koishi-plugin-yesimbot-workspace`      | 文件操作、命令执行与 Skill 目录访问  |
+| MCP 客户端  | `koishi-plugin-yesimbot-mcp-client`     | 通过 MCP 协议接入外部工具服务        |
 | 原生桌面    | `koishi-plugin-yesimbot-computer-use`   | 通过隔离 Anon VM 驱动可见 Linux 桌面 |
-| 搜索        | `koishi-plugin-yesimbot-search-service` | 网络搜索与信息检索                  |
-| OneBot 工具 | `koishi-plugin-yesimbot-onebot-utils`   | OneBot 平台工具集成                 |
-| 贴纸        | `koishi-plugin-yesimbot-sticker`        | 表情与贴纸处理                      |
+| 搜索        | `koishi-plugin-yesimbot-search-service` | 网络搜索与信息检索                   |
+| OneBot 工具 | `koishi-plugin-yesimbot-onebot-utils`   | OneBot 平台工具集成                  |
+| 贴纸        | `koishi-plugin-yesimbot-sticker`        | 表情与贴纸处理                       |
 
 OneBot Translator 内置于 `koishi-plugin-yesimbot`，通过同一 PlatformTranslator 边界注册，不是可选的平台包。
 
