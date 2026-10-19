@@ -133,6 +133,49 @@ class ContractTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 cli.runtime_fingerprint(root, [{"path": "core"}])
 
+    def test_runtime_compatibility_allows_resolved_optional_peers_and_extra_nodes(self):
+        manifest_runtime = {
+            "nodeMajor": 24, "nodeABI": "137", "platform": "linux", "arch": "x64",
+            "packages": {"core": {"name": "core", "version": "1"}},
+            "roots": {"core": "core@1#0"},
+            "nodes": {
+                "core@1#0": {"identity": "core@1", "edges": {
+                    "required": "required@1#1", "optional": None}},
+                "required@1#1": {"identity": "required@1", "edges": {}}
+            }
+        }
+        actual = {
+            **manifest_runtime,
+            "roots": {"core": "core@1#9"},
+            "nodes": {
+                "core@1#9": {"identity": "core@1", "edges": {
+                    "required": "required@1#10", "optional": "optional@2#11"}},
+                "required@1#10": {"identity": "required@1", "edges": {}},
+                "optional@2#11": {"identity": "optional@2", "edges": {}}
+            }
+        }
+        runner.require_runtime_compatible(manifest_runtime, actual)
+
+    def test_runtime_compatibility_rejects_missing_or_changed_required_graph(self):
+        manifest_runtime = {
+            "nodeMajor": 24, "nodeABI": "137", "platform": "linux", "arch": "x64",
+            "packages": {"core": {"name": "core", "version": "1"}},
+            "roots": {"core": "core@1#0"},
+            "nodes": {
+                "core@1#0": {"identity": "core@1", "edges": {"required": "required@1#1"}},
+                "required@1#1": {"identity": "required@1", "edges": {}}
+            }
+        }
+        cases = [
+            {"core@1#9": {"identity": "core@1", "edges": {"required": "required@2#10"}},
+             "required@2#10": {"identity": "required@2", "edges": {}}},
+            {"core@1#9": {"identity": "core@1", "edges": {"required": "required@1#10"}}},
+        ]
+        for nodes in cases:
+            with self.subTest(nodes=nodes), self.assertRaisesRegex(RuntimeError, "runtime dependency"):
+                runner.require_runtime_compatible(manifest_runtime, {
+                    **manifest_runtime, "roots": {"core": "core@1#9"}, "nodes": nodes})
+
     def test_named_library_direct_class_default_and_apply_exports(self):
         exports = [("library", "exports.createAgent = () => {};"), ("plugin", "module.exports = class Plugin {};"),
                    ("plugin", "exports.default = class Plugin {};"), ("plugin", "exports.apply = () => {};"),

@@ -60,6 +60,13 @@ print(json.dumps({'status':'controls_ready'}))
 """
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Surfaces the 302 so the caller can validate the signed CDN hop itself."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         require(urllib.parse.urlparse(newurl).scheme == "https", "insecure download redirect")
@@ -104,7 +111,30 @@ class GitHub:
             require(len(result) <= MAX_BYTES, "API/download size budget exceeded")
         return result if binary else json.loads(result)
 
-    def download(self, url, limit):
+    def download(self, url, limit, asset_id=None):
+        # github.com release downloads are unavailable on some networks. The API asset endpoint answers
+        # 302 to a signed CDN URL, so resolve that hop explicitly and fetch it without credentials.
+        if asset_id is not None:
+            api = f"{self.base}/releases/assets/{asset_id}"
+            self.credentials()
+            opener = urllib.request.build_opener(_NoRedirect())
+            request = urllib.request.Request(api, headers={
+                "Authorization": "Bearer " + self.token,
+                "Accept": "application/octet-stream",
+                "User-Agent": "yesimbot-release",
+            })
+            try:
+                with opener.open(request, timeout=120) as response:
+                    data = response.read(limit + 1)
+            except urllib.error.HTTPError as error:
+                location = error.headers.get("Location")
+                require(error.code in {301, 302, 303, 307, 308} and location, "asset redirect unavailable")
+                parsed = urllib.parse.urlparse(location)
+                require(parsed.scheme == "https" and parsed.hostname == "release-assets.githubusercontent.com", "unexpected asset redirect host")
+                with urllib.request.urlopen(urllib.request.Request(location, headers={"User-Agent": "yesimbot-release"}), timeout=120) as response:
+                    data = response.read(limit + 1)
+            require(len(data) <= limit, "asset size budget exceeded")
+            return data
         parsed = urllib.parse.urlparse(url)
         require(parsed.scheme == "https" and parsed.hostname == "github.com" and parsed.path.startswith("/" + self.repository + "/releases/download/"), "invalid release asset URL")
         with self.opener.open(urllib.request.Request(url, headers={"User-Agent": "yesimbot-release"}), timeout=120) as response:
@@ -257,10 +287,10 @@ def publish(repository, run_id, output):
 def download(repository, tag, destination):
     require(re.fullmatch(r"beta-\d{8}-[0-9a-f]{12}", tag), "invalid Beta release tag")
     github = GitHub(repository)
-    release = github.request("/releases/tags/" + tag, authenticated=False)
+    release = github.request("/releases/tags/" + tag, authenticated=True)
     require(not release["draft"] and release["prerelease"] and {a["name"] for a in release["assets"]} == ASSETS and len(release["assets"]) == 3, "invalid release assets")
     destination = Path(destination)
-    ref = github.request("/git/ref/tags/" + tag, authenticated=False)
+    ref = github.request("/git/ref/tags/" + tag, authenticated=True)
     require(ref["object"]["type"] == "commit" and tag.endswith(ref["object"]["sha"][:12]), "release tag target mismatch")
     if destination.exists():
         m = verify(destination, repository, ref["object"]["sha"])
@@ -275,7 +305,7 @@ def download(repository, tag, destination):
     try:
         for asset in release["assets"]:
             require(0 < asset["size"] <= MAX_BYTES, "invalid asset size")
-            data = github.download(asset["browser_download_url"], asset["size"])
+            data = github.download(asset["browser_download_url"], asset["size"], asset["id"])
             require(len(data) == asset["size"], "release download size mismatch")
             if asset.get("digest"):
                 require(asset["digest"] == "sha256:" + hashlib.sha256(data).hexdigest(), "GitHub asset digest mismatch")

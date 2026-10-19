@@ -117,6 +117,66 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+RUNTIME_IDENTITY_KEYS = ("nodeMajor", "nodeABI", "platform", "arch")
+
+
+def strip_graph_ids(value):
+    """Drop the semantic-graph numbering from a key like `name@version#42`."""
+    return value.rsplit("#", 1)[0] if isinstance(value, str) and "#" in value else value
+
+
+def require_runtime_compatible(manifest_runtime, actual):
+    """Compare runtime compatibility without demanding an identical dependency graph.
+
+    The manifest is packed from a clean CI install, so optional peer dependencies
+    (`@koishijs/plugin-analytics`, `@koishijs/plugin-status`, ...) are absent there while
+    a long-lived production install has them. Those extras are console-side panels and do
+    not change what the YesImBot workspaces resolve to. Everything that actually decides
+    runtime compatibility is still compared exactly:
+
+    - Node major version, module ABI, platform and architecture;
+    - the declared package metadata of every registered workspace;
+    - each workspace's resolved root identity, ignoring graph numbering;
+    - every dependency node the manifest knows about, as a subset of the live graph;
+    - every declared edge name, while allowing a manifest `null` optional edge to resolve
+      in production.
+
+    A live graph that is missing a manifest node, resolves a required edge to a different
+    package, adds an undeclared edge to an existing node, or reports different workspace
+    metadata still fails closed.
+    """
+    for key in RUNTIME_IDENTITY_KEYS:
+        require(manifest_runtime.get(key) == actual.get(key),
+                "runtime " + key + " mismatch; explicit dependency upgrade required")
+    require(manifest_runtime.get("packages") == actual.get("packages"),
+            "workspace package metadata mismatch; explicit dependency upgrade required")
+    manifest_roots, actual_roots = manifest_runtime.get("roots") or {}, actual.get("roots") or {}
+    require(set(manifest_roots) == set(actual_roots),
+            "workspace set mismatch; explicit dependency upgrade required")
+    for name, identity in manifest_roots.items():
+        require(strip_graph_ids(identity) == strip_graph_ids(actual_roots.get(name)),
+                "workspace " + name + " resolved to a different package; explicit dependency upgrade required")
+
+    def semantic_edges(node):
+        return {edge: strip_graph_ids(target) if target is not None else None
+                for edge, target in (node.get("edges") or {}).items()}
+
+    manifest_nodes, actual_nodes = manifest_runtime.get("nodes") or {}, actual.get("nodes") or {}
+    by_identity = {}
+    for node in actual_nodes.values():
+        by_identity.setdefault(node.get("identity"), []).append(semantic_edges(node))
+    for node in manifest_nodes.values():
+        identity = node.get("identity")
+        expected = semantic_edges(node)
+        candidates = by_identity.get(identity, [])
+        require(candidates,
+                "runtime dependency missing from the live install: " + str(identity))
+        require(any(set(edges) == set(expected) and
+                    all(expected[name] is None or edges[name] == expected[name] for name in expected)
+                    for edges in candidates),
+                "runtime dependency graph changed for " + str(identity) + "; explicit dependency upgrade required")
+
+
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
@@ -398,7 +458,7 @@ class Deployment:
         workspaces = self.manifest["workspaces"]
         actual = json.loads(self.container_node(RUNTIME_PROBE, {"root": self.profile["containerSourceRoot"],
                                                               "workspaces": [w["path"] for w in workspaces]}))
-        require(actual == self.manifest["runtime"], "runtime/workspace/Node ABI mismatch; explicit dependency upgrade required")
+        require_runtime_compatible(self.manifest["runtime"], actual)
         return hashlib.sha256(canonical(actual)).hexdigest()
 
     def inventory(self):
