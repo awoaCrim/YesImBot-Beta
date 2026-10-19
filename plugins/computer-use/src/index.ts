@@ -1,12 +1,6 @@
-import { EphemeralImageProjectionStore, type AgentPlugin, type ToolFilterContext } from "@yesimbot/agent-runtime";
+import { EphemeralImageProjectionStore, type AgentPlugin } from "@yesimbot/agent-runtime";
 import { Context, Schema } from "koishi";
-import {
-  DEFAULT_MANAGEMENT_TOOL_SCOPES,
-  extractToolAccessActorIds,
-  isToolAccessAllowed,
-  isToolAccessPotentiallyAllowed,
-  type ToolAccessRule,
-} from "koishi-plugin-yesimbot";
+import { DEFAULT_MANAGEMENT_TOOL_SCOPES, createToolAccessHooks, isToolAccessPotentiallyAllowed, type ToolAccessRule } from "koishi-plugin-yesimbot";
 
 import { McpDesktopDriver } from "./driver.js";
 import { createResponsesRequester } from "./responses.js";
@@ -14,7 +8,7 @@ import { createComputerUseTool } from "./tool.js";
 
 export const name = "yesimbot-computer-use";
 
-export const usage = "通过 OpenAI Responses 原生 computer tool 驱动隔离 Anon 桌面";
+export const usage = "通过 Responses function-calling 驱动隔离 Anon 桌面";
 
 export const inject = ["yesimbot"];
 
@@ -24,15 +18,15 @@ export const Config: Schema<ComputerUseConfig> = Schema.object({
   enabled: Schema.boolean().default(true).description("是否注册 computer_use 委托工具"),
   apiKey: Schema.string().role("secret").required().description("用于 Responses API 的 API Key"),
   baseURL: Schema.string().default("https://api.openai.com/v1").description("Responses API Base URL"),
-  model: Schema.string().required().description("支持原生 computer tool 的 Responses 模型 ID"),
+  model: Schema.string().required().description("支持图片输入和 function calling 的 Responses 模型 ID"),
   toolType: Schema.union([Schema.const("computer"), Schema.const("computer_use_preview")])
     .default("computer")
-    .description("原生 computer tool 类型；新 GA 模型使用 computer，旧 preview 模型使用 computer_use_preview"),
+    .description("已弃用：仅保留以兼容旧配置，不再影响请求；桌面动作始终通过普通 function tools 表达"),
   environment: Schema.union([Schema.const("computer"), Schema.const("browser")])
     .default("computer")
-    .description("preview computer tool 的环境类型"),
-  displayWidth: Schema.number().min(1).max(16_384).default(1280).description("preview computer tool 的显示宽度"),
-  displayHeight: Schema.number().min(1).max(16_384).default(800).description("preview computer tool 的显示高度"),
+    .description("已弃用：仅保留以兼容旧配置，不再影响请求"),
+  displayWidth: Schema.number().min(1).max(16_384).default(1280).description("桌面截图宽度，用于向模型说明坐标范围"),
+  displayHeight: Schema.number().min(1).max(16_384).default(800).description("桌面截图高度，用于向模型说明坐标范围"),
   mcpEndpoint: Schema.string().default("http://172.20.0.1:18200/sse").description("固定 Anon 来宾桌面 MCP SSE 地址"),
   maxSteps: Schema.number().min(1).max(50).default(20).description("单次原生桌面任务最多执行的模型步骤"),
   timeout: Schema.number().min(10).max(600).default(180).description("单次桌面任务超时（秒）"),
@@ -73,12 +67,11 @@ export function apply(ctx: Context, config: ComputerUseConfig): void {
     apiKey: config.apiKey,
     baseURL: config.baseURL,
     model: requireValue(config.model, "model"),
-    toolType: config.toolType,
-    environment: config.environment,
     displayWidth: config.displayWidth,
     displayHeight: config.displayHeight,
     maxSteps: config.maxSteps ?? 20,
   });
+  const logger = ctx.logger("computer-use");
   const dispose = ctx.yesimbot.agent.use({
     async setup(scope, bot, runtime): Promise<AgentPlugin> {
       const accessScope = scope.selfId === undefined ? { ...scope, selfId: bot.selfId } : scope;
@@ -94,19 +87,19 @@ export function apply(ctx: Context, config: ComputerUseConfig): void {
         maxSteps: config.maxSteps ?? 20,
         timeoutMs: (config.timeout ?? 180) * 1000,
       });
-      const toolNames = new Set([tool.name]);
-      const isAllowed = (messages: ToolFilterContext["messages"]) => isToolAccessAllowed(accessScope, rules, extractToolAccessActorIds(messages));
+      const accessHooks = createToolAccessHooks({
+        scope: accessScope,
+        rules,
+        toolNames: [tool.name],
+        blockReason: "当前消息发送者不在原生桌面工具白名单中",
+        onDecision: (decision) => logger.info("tool.access", decision),
+      });
       return {
         name: "computer-use",
         tools: [tool],
-        filterTools: (candidates, filterContext) =>
-          isAllowed(filterContext.messages) ? candidates : candidates.filter((candidate) => !toolNames.has(candidate.name)),
-        beforeToolCall: (call, hookContext) =>
-          toolNames.has(call.toolName) && !isAllowed(hookContext.messages)
-            ? { type: "block", reason: "当前消息发送者不在原生桌面工具白名单中" }
-            : { type: "allow" },
+        ...accessHooks,
         appendSystemPrompt: () =>
-          "已注册原生 computer_use：需要可见浏览器或 Linux 桌面时，把完整任务委托给它。不要把坐标拆成普通 MCP 调用；必须根据返回截图确认实际结果。若返回 safety_check_required，先向用户确认，不能声称动作完成。",
+          "已注册 computer_use：需要可见浏览器或 Linux 桌面时，把完整任务委托给它。不要把坐标拆成普通 MCP 调用；必须根据返回截图确认实际结果。若返回 safety_check_required，先向用户确认，不能声称动作完成。",
         onTurnFinish: (_result, context) => imageProjection.clearTurn(context.turnId),
         stop: () => imageProjection.clearAll(),
       };

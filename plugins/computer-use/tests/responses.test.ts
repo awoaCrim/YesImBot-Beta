@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { createResponsesRequester, runResponsesComputerUse, type ResponsesRequester } from "../src/responses.js";
+import { createResponsesRequester, runResponsesComputerUse, type ResponseInputItem, type ResponsesRequester } from "../src/responses.js";
 import type { ComputerDriver, ComputerScreenshot } from "../src/types.js";
 
 const SCREENSHOT: ComputerScreenshot = { bytes: new Uint8Array([137, 80, 78, 71, 1]), mediaType: "image/png" };
@@ -10,93 +10,110 @@ function driver(): { driver: ComputerDriver; execute: ReturnType<typeof vi.fn> }
   return { driver: { execute, close: vi.fn(async () => undefined) }, execute };
 }
 
+function call(name: string, args: Record<string, unknown>, callId = "call-1"): unknown {
+  return { type: "function_call", call_id: callId, name, arguments: JSON.stringify(args) };
+}
+
 describe("createResponsesRequester", () => {
-  it("serializes the native computer tool and continuation id without exposing the API key in the body", async () => {
+  it("sends stateless function tools and the replayed history without leaking the API key", async () => {
     const requests: Array<{ body: Record<string, unknown>; headers: Headers }> = [];
     const fetcher = vi.fn<typeof fetch>(async (_input, init) => {
       requests.push({ body: JSON.parse(String(init?.body)), headers: new Headers(init?.headers) });
       return new Response(JSON.stringify({ id: "resp-1", output: [] }), { status: 200, headers: { "content-type": "application/json" } });
     });
-    const requester = createResponsesRequester({ apiKey: "test-secret", baseURL: "https://fixture.invalid/v1", model: "computer-model", maxSteps: 3 }, fetcher);
+    const requester = createResponsesRequester({ apiKey: "test-secret", baseURL: "https://fixture.invalid/v1", model: "vision-model", maxSteps: 3 }, fetcher);
 
-    await requester.request("查看桌面", undefined, new AbortController().signal);
-    await requester.request([], "resp-1", new AbortController().signal);
+    await requester.request([{ role: "user", content: [{ type: "input_text", text: "查看桌面" }] }], new AbortController().signal);
 
-    expect(fetcher).toHaveBeenNthCalledWith(2, "https://fixture.invalid/v1/responses", expect.objectContaining({ method: "POST" }));
-    expect(requests[0]?.body).toMatchObject({
-      model: "computer-model",
-      store: true,
-      input: "查看桌面",
-      tools: [{ type: "computer" }],
-    });
-    expect(requests[0]?.body).not.toHaveProperty("apiKey");
+    expect(fetcher).toHaveBeenCalledWith("https://fixture.invalid/v1/responses", expect.objectContaining({ method: "POST" }));
+    const body = requests[0]?.body as { model: string; store: boolean; tools: Array<{ type: string; name: string }>; input: unknown };
+    expect(body.model).toBe("vision-model");
+    expect(body.store).toBe(false);
+    expect(body.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "查看桌面" }] }]);
+    expect(body).not.toHaveProperty("previous_response_id");
+    expect(body.tools.every((tool) => tool.type === "function")).toBe(true);
+    expect(body.tools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(["desktop_click", "desktop_move", "desktop_type", "desktop_key", "desktop_scroll", "request_confirmation"]),
+    );
+    expect(body).not.toHaveProperty("apiKey");
     expect(requests[0]?.headers.get("authorization")).toBe("Bearer test-secret");
-    expect(requests[0]?.headers.get("content-type")).toBe("application/json");
-    expect(requests[1]?.body).toMatchObject({ previous_response_id: "resp-1", input: [] });
+  });
+
+  it("surfaces the provider status and message while redacting secrets", async () => {
+    const fetcher = vi.fn<typeof fetch>(
+      async () =>
+        new Response(JSON.stringify({ error: { message: "Unsupported tool type: computer (key sk-abcdefgh1234)", code: "bad_request" } }), { status: 400 }),
+    );
+    const requester = createResponsesRequester({ apiKey: "sk-abcdefgh1234", baseURL: "https://fixture.invalid/v1", model: "m", maxSteps: 1 }, fetcher);
+
+    await expect(requester.request([], new AbortController().signal)).rejects.toThrow(/HTTP 400: Unsupported tool type: computer .* \| bad_request/);
+    await expect(requester.request([], new AbortController().signal)).rejects.not.toThrow(/abcdefgh1234/);
   });
 });
 
 describe("runResponsesComputerUse", () => {
-  it("executes structured actions and returns the verified screenshot to the continuation", async () => {
-    const requests: Array<{ input: unknown; previousResponseId: string | undefined }> = [];
+  it("captures a starting screenshot, replays actions and returns the verified summary", async () => {
+    const requests: Array<readonly ResponseInputItem[]> = [];
     const requester: ResponsesRequester = {
-      request: vi.fn(async (input, previousResponseId) => {
-        requests.push({ input, previousResponseId });
+      request: vi.fn(async (input) => {
+        requests.push(input);
         if (requests.length === 1) {
-          return { id: "resp-1", output: [{ type: "computer_call", id: "call-1", action: { type: "click", button: "left", x: 12, y: 30 } }] };
+          return { status: "completed", output: [call("desktop_click", { x: 12, y: 30 })] };
         }
-        return { id: "resp-2", status: "completed", output_text: "打开并确认了页面。", output: [] };
+        return { status: "completed", output: [], output_text: "打开并确认了页面。" };
       }),
     };
     const bound = driver();
     const result = await runResponsesComputerUse({ prompt: "打开页面", requester, driver: bound.driver, maxSteps: 3, signal: new AbortController().signal });
 
-    expect(bound.execute).toHaveBeenCalledWith([{ type: "click", button: "left", x: 12, y: 30 }], expect.any(AbortSignal));
-    expect(requests[0]).toMatchObject({ input: "打开页面", previousResponseId: undefined });
-    expect(requests[1]).toMatchObject({ previousResponseId: "resp-1" });
-    expect(requests[1]?.input).toMatchObject([
-      {
-        type: "computer_call_output",
-        call_id: "call-1",
-        output: { type: "computer_screenshot", detail: "original" },
-      },
-    ]);
-    expect(result.result).toMatchObject({ ok: true, status: "completed", summary: "打开并确认了页面。", steps: 1 });
+    expect(bound.execute).toHaveBeenNthCalledWith(1, [], expect.any(AbortSignal));
+    expect(bound.execute).toHaveBeenNthCalledWith(2, [{ type: "click", button: "left", x: 12, y: 30 }], expect.any(AbortSignal));
+    expect(requests[0]?.[0]).toMatchObject({ role: "user" });
+    expect(requests[1]).toHaveLength(4);
+    expect(requests[1]?.[1]).toMatchObject({ type: "function_call", call_id: "call-1", name: "desktop_click" });
+    expect(requests[1]?.[2]).toMatchObject({ type: "function_call_output", call_id: "call-1" });
+    expect(result.result).toMatchObject({ ok: true, status: "completed", summary: "打开并确认了页面。", steps: 2 });
     expect(result.screenshot).toBe(SCREENSHOT);
   });
 
-  it("does not execute a batch that carries a safety check", async () => {
+  it("stops without executing anything when the model asks for confirmation", async () => {
     const bound = driver();
     const result = await runResponsesComputerUse({
       prompt: "付款",
       requester: {
-        request: vi.fn(async () => ({
-          id: "resp-1",
-          output: [
-            {
-              type: "computer_call",
-              call_id: "call-1",
-              action: { type: "click", button: "left", x: 1, y: 1 },
-              pending_safety_checks: [{ id: "safety-1", code: "financial", message: "payment" }],
-            },
-          ],
-        })),
+        request: vi.fn(async () => ({ status: "completed", output: [call("request_confirmation", { reason: "支付 2399 元" })] })),
       },
       driver: bound.driver,
       maxSteps: 3,
       signal: new AbortController().signal,
     });
 
-    expect(bound.execute).not.toHaveBeenCalled();
-    expect(result.result).toMatchObject({ ok: false, error: { code: "safety_check_required" }, safetyChecks: [{ id: "safety-1" }] });
+    expect(bound.execute).toHaveBeenCalledTimes(1);
+    expect(bound.execute).toHaveBeenCalledWith([], expect.any(AbortSignal));
+    expect(result.result).toMatchObject({
+      ok: false,
+      error: { code: "safety_check_required" },
+      safetyChecks: [{ id: "call-1", code: "confirmation_requested", message: "支付 2399 元" }],
+    });
+  });
+
+  it("rejects an invalid tool call without touching the desktop", async () => {
+    const bound = driver();
+    const result = await runResponsesComputerUse({
+      prompt: "点击",
+      requester: { request: vi.fn(async () => ({ status: "completed", output: [call("desktop_click", { x: -5, y: 10 })] })) },
+      driver: bound.driver,
+      maxSteps: 2,
+      signal: new AbortController().signal,
+    });
+
+    expect(bound.execute).toHaveBeenCalledTimes(1);
+    expect(result.result).toMatchObject({ ok: false, error: { code: "invalid_response" } });
   });
 
   it("stops at the configured step limit without retrying an unknown action result", async () => {
     const bound = driver();
-    const request = vi.fn(async (_input: unknown, previousResponseId: string | undefined) => ({
-      id: previousResponseId ? "resp-next" : "resp-1",
-      output: [{ type: "computer_call", call_id: previousResponseId ? "call-2" : "call-1", action: { type: "wait" } }],
-    }));
+    const request = vi.fn(async () => ({ status: "completed", output: [call("desktop_wait", {}, "call-2")] }));
     const result = await runResponsesComputerUse({
       prompt: "等待",
       requester: { request },
@@ -105,8 +122,25 @@ describe("runResponsesComputerUse", () => {
       signal: new AbortController().signal,
     });
 
-    expect(request).toHaveBeenCalledTimes(3);
-    expect(bound.execute).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(bound.execute).toHaveBeenCalledTimes(3);
     expect(result.result).toMatchObject({ ok: false, error: { code: "step_limit" }, steps: 2 });
+  });
+
+  it("keeps the replayed history bounded to the executed steps", async () => {
+    const requests: Array<readonly ResponseInputItem[]> = [];
+    const requester: ResponsesRequester = {
+      request: vi.fn(async (input) => {
+        requests.push(input);
+        return requests.length < 3
+          ? { status: "completed", output: [call("desktop_screenshot", {}, `call-${requests.length}`)] }
+          : { status: "completed", output: [] };
+      }),
+    };
+    const bound = driver();
+    await runResponsesComputerUse({ prompt: "截图", requester, driver: bound.driver, maxSteps: 4, signal: new AbortController().signal });
+
+    // 1 user turn per step plus a function call and its output per executed step.
+    expect(requests.map((input) => input.length)).toEqual([1, 4, 7]);
   });
 });

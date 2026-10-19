@@ -8,20 +8,21 @@ import { Config, apply } from "../src/index.js";
 afterEach(() => vi.restoreAllMocks());
 
 describe("computer-use configuration", () => {
-  it("defaults to the GA native computer tool and fixed guest MCP endpoint", () => {
-    const configured = Config({ apiKey: "secret", model: "computer-model" } as never);
+  it("keeps the fixed guest MCP endpoint and bounded step budget", () => {
+    const configured = Config({ apiKey: "secret", model: "vision-model" } as never);
     expect(configured).toMatchObject({
       enabled: true,
-      toolType: "computer",
       mcpEndpoint: "http://172.20.0.1:18200/sse",
       maxSteps: 20,
       timeout: 180,
+      displayWidth: 1280,
+      displayHeight: 800,
     });
   });
 
   it("registers one delegated tool only for an allowed scope", async () => {
     const use = vi.fn(() => vi.fn());
-    const ctx = { yesimbot: { agent: { use } }, on: vi.fn() };
+    const ctx = { yesimbot: { agent: { use } }, on: vi.fn(), logger: () => ({ info: vi.fn() }) };
     const config = Config({ apiKey: "secret", model: "computer-model" } as never);
     apply(ctx as never, config as never);
     const plugin = use.mock.calls[0]?.[0] as {
@@ -45,7 +46,8 @@ describe("computer-use configuration", () => {
 
   it("admits a user rule in any group but filters the delegated tool by current sender", async () => {
     const use = vi.fn(() => vi.fn());
-    const ctx = { yesimbot: { agent: { use } }, on: vi.fn() };
+    const info = vi.fn();
+    const ctx = { yesimbot: { agent: { use } }, on: vi.fn(), logger: () => ({ info }) };
     const config = Config({ apiKey: "secret", model: "computer-model", allowedScopes: [{ platform: "onebot", channelId: "*", userId: "100" }] } as never);
     apply(ctx as never, config as never);
     const plugin = use.mock.calls[0]?.[0] as {
@@ -57,7 +59,7 @@ describe("computer-use configuration", () => {
       { imageProjection: new EphemeralImageProjectionStore() },
     );
     const tools = runtimePlugin && Array.isArray(runtimePlugin.tools) ? runtimePlugin.tools : [];
-    const message = (userId: string) => ({ role: "custom", type: "yesimbot.message", data: { user: { id: userId } } });
+    const message = (userId: string) => ({ id: "input-id", role: "custom", type: "yesimbot.message", data: { user: { id: userId } } });
 
     expect((await runtimePlugin?.filterTools?.(tools, { messages: [message("100")] } as never))?.map((tool) => tool.name)).toEqual(["computer_use"]);
     expect(await runtimePlugin?.filterTools?.(tools, { messages: [message("101")] } as never)).toEqual([]);
@@ -65,5 +67,9 @@ describe("computer-use configuration", () => {
       type: "block",
       reason: "当前消息发送者不在原生桌面工具白名单中",
     });
+    expect(info).toHaveBeenCalledWith(
+      "tool.access",
+      expect.objectContaining({ phase: "execute", actorIds: ["101"], inputIds: ["input-id"], reason: "actor-denied" }),
+    );
   });
 });

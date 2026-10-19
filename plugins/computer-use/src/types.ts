@@ -1,5 +1,3 @@
-export type ComputerToolType = "computer" | "computer_use_preview";
-
 export type ComputerAction =
   | {
       readonly type: "click";
