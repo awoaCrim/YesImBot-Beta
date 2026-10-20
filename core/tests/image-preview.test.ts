@@ -21,6 +21,19 @@ describe("Core plugin image preview capability", () => {
     expect(projection.has("call")).toBe(false);
   });
 
+  it("fails closed when the native route excludes the frame MIME", () => {
+    const projection = new EphemeralImageProjectionStore();
+    const capability = createImagePreviewCapability({ policy: { mode: "native", nativeMediaTypes: ["image/png"] }, projection });
+    expect(
+      capability.preview({
+        frames: [{ bytes: new Uint8Array([1, 2, 3]), mediaType: "image/webp", label: "webp frame" }],
+        turnId: "turn",
+        toolCallId: "call",
+      }),
+    ).toMatchObject({ mode: "unavailable", error: "image_input_unavailable" });
+    expect(projection.has("call")).toBe(false);
+  });
+
   it("never stages native bytes for an unavailable/vision-only route", () => {
     for (const mode of ["vision", "unavailable"] as const) {
       const projection = new EphemeralImageProjectionStore();

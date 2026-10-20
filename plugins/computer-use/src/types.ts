@@ -57,7 +57,8 @@ export interface ComputerSafetyCheck {
 
 export interface ComputerScreenshot {
   readonly bytes: Uint8Array;
-  readonly mediaType: "image/png" | "image/jpeg" | "image/webp";
+  /** The Responses route only receives formats validated by the desktop adapter. */
+  readonly mediaType: "image/png" | "image/jpeg";
 }
 
 export interface ComputerDriver {

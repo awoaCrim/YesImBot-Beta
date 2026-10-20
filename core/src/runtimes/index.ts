@@ -477,7 +477,10 @@ export function resolveToolChoice(chat: Pick<ChatModelRef, "entry" | "tools">): 
 export function resolveReadImagePolicy(primary: ChatModelRef, vision: ChatModelRef | undefined, imageInput: boolean): ReadImagePolicy {
   const primaryAcceptsImages = primary.entry.modalities?.input?.includes("image") ?? false;
   if (imageInput && primaryAcceptsImages && primary.capabilities.imageToolResult === "native") {
-    return { mode: "native" };
+    return {
+      mode: "native",
+      ...(primary.capabilities.imageToolResultMediaTypes === undefined ? {} : { nativeMediaTypes: primary.capabilities.imageToolResultMediaTypes }),
+    };
   }
 
   const visionAcceptsImages = vision?.entry.modalities?.input?.includes("image") ?? false;

@@ -141,10 +141,13 @@ export class McpDesktopDriver implements ComputerDriver {
     if (!isRecord(result) || !Array.isArray(result.content)) throw new Error("桌面截图结果格式无效");
     const image = result.content.find((block) => isRecord(block) && block.type === "image");
     if (!isRecord(image) || typeof image.data !== "string") throw new Error("桌面截图未返回图片");
-    const mediaType = image.mimeType === "image/jpeg" || image.mimeType === "image/webp" ? image.mimeType : "image/png";
+    const declaredMediaType = typeof image.mimeType === "string" ? image.mimeType : undefined;
     const bytes = decodeBase64(image.data);
     if (bytes.byteLength === 0 || bytes.byteLength > MAX_SCREENSHOT_BYTES) throw new Error("桌面截图大小无效");
-    return { bytes, mediaType };
+    const detectedMediaType = detectResponsesScreenshotMediaType(bytes);
+    if (!detectedMediaType) throw new Error("桌面截图格式不受 Responses 路由支持");
+    if (declaredMediaType !== undefined && declaredMediaType !== detectedMediaType) throw new Error("桌面截图 MIME 与内容不匹配");
+    return { bytes, mediaType: detectedMediaType };
   }
 
   private async call(name: string, args: Record<string, unknown>, signal: AbortSignal): Promise<unknown> {
@@ -187,6 +190,12 @@ function decodeBase64(value: string): Uint8Array {
   const normalized = value.trim();
   if (normalized.length === 0 || normalized.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(normalized)) throw new Error("截图 Base64 无效");
   return new Uint8Array(Buffer.from(normalized, "base64"));
+}
+
+function detectResponsesScreenshotMediaType(bytes: Uint8Array): ComputerScreenshot["mediaType"] | undefined {
+  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  return undefined;
 }
 
 async function sleep(ms: number, signal: AbortSignal): Promise<void> {

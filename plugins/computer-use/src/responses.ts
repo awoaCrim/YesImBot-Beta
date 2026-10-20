@@ -8,6 +8,8 @@ const MAX_DRAG_POINTS = 128;
 const MAX_COORDINATE = 16_383;
 const MAX_CALLS_PER_STEP = 8;
 const MAX_PROVIDER_MESSAGE = 200;
+const MAX_REPLAY_TURNS = 4;
+const OMITTED_SCREENSHOT_TEXT = "Earlier screenshots were omitted to keep this stateless request bounded; use the latest screenshot as ground truth.";
 const CONFIRMATION_TOOL = "request_confirmation";
 
 const CONTINUE_PROMPT = [
@@ -124,7 +126,7 @@ export async function runResponsesComputerUse(options: {
   for (let step = 0; step < options.maxSteps; step += 1) {
     throwIfAborted(options.signal);
     const turn = userTurn(step === 0 ? options.prompt : CONTINUE_PROMPT, screenshot);
-    const response = await options.requester.request([...history, turn], options.signal);
+    const response = await options.requester.request(compactReplayHistory(history, turn), options.signal);
     steps = step + 1;
 
     const calls = extractFunctionCalls(response.output);
@@ -337,6 +339,36 @@ function userTurn(text: string, screenshot: ComputerScreenshot): ResponseInputIt
       { type: "input_image", image_url: `data:${screenshot.mediaType};base64,${Buffer.from(screenshot.bytes).toString("base64")}` },
     ],
   };
+}
+
+function compactReplayHistory(history: readonly ResponseInputItem[], currentTurn: ResponseInputItem): readonly ResponseInputItem[] {
+  const segments = splitReplaySegments([...history, currentTurn]);
+  const latest = segments[segments.length - 1];
+  const selected = segments.length > MAX_REPLAY_TURNS ? [segments[0]!, ...segments.slice(-MAX_REPLAY_TURNS)] : segments;
+  return selected.flatMap((segment) =>
+    segment.map((item) => {
+      if (!("role" in item) || item.role !== "user" || segment === latest) return item;
+      return {
+        role: "user" as const,
+        content: [...item.content.filter((part) => part.type === "input_text"), { type: "input_text" as const, text: OMITTED_SCREENSHOT_TEXT }],
+      };
+    }),
+  );
+}
+
+function splitReplaySegments(items: readonly ResponseInputItem[]): ResponseInputItem[][] {
+  const segments: ResponseInputItem[][] = [];
+  let current: ResponseInputItem[] = [];
+  for (const item of items) {
+    if ("role" in item && item.role === "user") {
+      if (current.length > 0) segments.push(current);
+      current = [item];
+    } else {
+      current.push(item);
+    }
+  }
+  if (current.length > 0) segments.push(current);
+  return segments;
 }
 
 function buildActions(name: string, rawArguments: string): readonly ComputerAction[] {

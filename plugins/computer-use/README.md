@@ -66,4 +66,4 @@ MCP 服务端需要提供：
 - `desktop_key`
 - `desktop_scroll`
 
-这些工具只接受固定的本地桌面动作；目标显示由来宾 helper 自己发现并校验，不由模型选择。来宾动作实现不得使用 `xdotool mousemove --sync`：指针已位于目标坐标时该标志会永久阻塞，导致点击和滚动超时。
+这些工具只接受固定的本地桌面动作；目标显示由来宾 helper 自己发现并校验，不由模型选择。截图必须返回内容与 MIME 一致的 PNG 或 JPEG；WebP 和错误 MIME 会在适配器边界被拒绝，避免把未验证的媒体送入 Responses 路由。来宾动作实现不得使用 `xdotool mousemove --sync`：指针已位于目标坐标时该标志会永久阻塞，导致点击和滚动超时。

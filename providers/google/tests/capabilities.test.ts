@@ -9,6 +9,7 @@ import { apply } from "../src/index.js";
 type RegisteredProvider = {
   chatCapabilities?(modelId: string): {
     readonly imageToolResult?: "native" | "unsupported" | "unknown";
+    readonly imageToolResultMediaTypes?: readonly string[];
     readonly videoToolResult?: "native" | "unsupported" | "unknown";
     readonly historyProjection?: "default" | "gemini-native";
   };
@@ -69,6 +70,7 @@ describe("Google provider capabilities", () => {
     const provider = registerProvider();
     expect(provider.chatCapabilities?.("gemini-3.7-flash-high")).toEqual({
       imageToolResult: "native",
+      imageToolResultMediaTypes: ["image/png", "image/jpeg"],
       videoToolResult: "unknown",
       historyProjection: "gemini-native",
     });

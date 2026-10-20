@@ -45,7 +45,8 @@ export function createImagePreviewCapability(options: {
     mode: options.policy.mode,
     preview(request) {
       if (request.signal?.aborted) return { mode: "unavailable", error: "resource_read_aborted" };
-      if (options.policy.mode !== "native" || !validFrames(request.frames)) return { mode: "unavailable", error: "image_input_unavailable" };
+      if (options.policy.mode !== "native" || !validFrames(request.frames, options.policy.nativeMediaTypes))
+        return { mode: "unavailable", error: "image_input_unavailable" };
       return options.projection.stageFrames({ ...request }) ? { mode: "native" } : { mode: "unavailable", error: "resource_read_aborted" };
     },
     async describe(request) {
@@ -90,11 +91,13 @@ export function describeImageBytes(options: {
   return describeImageFrames({ ...options, frames: [{ bytes: options.bytes, mediaType: options.mediaType, label: "图片内容" }] });
 }
 
-function validFrames(frames: readonly ImagePreviewFrame[]): boolean {
+function validFrames(frames: readonly ImagePreviewFrame[], nativeMediaTypes?: readonly string[]): boolean {
   return (
     frames.length > 0 &&
     frames.length <= MAX_PREVIEW_FRAMES &&
-    frames.every((frame) => frame.bytes.byteLength > 0 && frame.mediaType.startsWith("image/")) &&
+    frames.every(
+      (frame) => frame.bytes.byteLength > 0 && frame.mediaType.startsWith("image/") && (!nativeMediaTypes || nativeMediaTypes.includes(frame.mediaType)),
+    ) &&
     frames.reduce((total, frame) => total + frame.bytes.byteLength, 0) <= MAX_PREVIEW_BYTES
   );
 }

@@ -17,7 +17,7 @@ const CLIENT = {
   })),
   callTool: vi.fn(async ({ name }: { name: string }) =>
     name === "desktop_get_screenshot"
-      ? { content: [{ type: "image", data: Buffer.from([137, 80, 78, 71]).toString("base64"), mimeType: "image/png" }] }
+      ? { content: [{ type: "image", data: Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).toString("base64"), mimeType: "image/png" }] }
       : { content: [{ type: "text", text: "ok" }] },
   ),
   close: vi.fn(async () => undefined),
@@ -75,6 +75,18 @@ describe("McpDesktopDriver", () => {
       name: "desktop_scroll",
       arguments: { x: 30, y: 40, scrollX: 0, scrollY: 500, keys: undefined },
     });
+    await driver.close();
+  });
+
+  it("rejects WebP screenshots instead of relabeling them as a supported format", async () => {
+    CLIENT.callTool.mockImplementationOnce(async ({ name }: { name: string }) =>
+      name === "desktop_get_screenshot"
+        ? { content: [{ type: "image", data: Buffer.from("RIFF\u0000\u0000\u0000\u0000WEBP", "binary").toString("base64"), mimeType: "image/webp" }] }
+        : { content: [{ type: "text", text: "ok" }] },
+    );
+    const driver = new McpDesktopDriver({ endpoint: "http://guest.invalid/sse" });
+
+    await expect(driver.execute([], new AbortController().signal)).rejects.toThrow("桌面截图格式不受 Responses 路由支持");
     await driver.close();
   });
 });

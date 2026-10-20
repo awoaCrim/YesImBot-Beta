@@ -19,6 +19,17 @@ export const inject = ["yesimbot"];
 export const imageToolResultSupport = "native" as const;
 
 /**
+ * NewAPI/CPA routes must explicitly opt into additional image formats. PNG/JPEG are the
+ * conservative native baseline; WebP is not projected until the route has been verified.
+ */
+export const defaultImageToolResultMediaTypes = ["image/png", "image/jpeg"] as const satisfies readonly (
+  | "image/png"
+  | "image/jpeg"
+  | "image/gif"
+  | "image/webp"
+)[];
+
+/**
  * Native video tool-result transport is opt-in: Google serializes `file-data` into
  * `functionResponse.parts.inlineData`, but only an operator whose route has actually verified
  * video reads should declare it. The unknown default keeps unverified routes failing closed.
@@ -29,6 +40,11 @@ export const Config: Schema<Config> = Schema.object({
   id: Schema.string().default("google").description("提供商标识"),
   apiKey: Schema.string().role("secret").required().description("API Key"),
   baseURL: Schema.string().description("API Base URL"),
+  imageToolResultMediaTypes: Schema.array(
+    Schema.union([Schema.const("image/png"), Schema.const("image/jpeg"), Schema.const("image/gif"), Schema.const("image/webp")]),
+  )
+    .default([...defaultImageToolResultMediaTypes])
+    .description("原生图片工具结果允许的 MIME 类型；未验证的网关线路不要加入 WebP"),
   chatModels: Schema.array(
     Schema.object({
       id: Schema.string().required().description("模型 ID"),
@@ -62,6 +78,7 @@ const GOOGLE_DEFAULT_THINKING_LEVELS: ThinkingLevelMap = { minimal: "minimal", l
 type GoogleNativeThinkingLevel = "minimal" | "low" | "medium" | "high";
 
 interface Config extends BaseProviderConfig {
+  imageToolResultMediaTypes?: ("image/png" | "image/jpeg" | "image/gif" | "image/webp")[];
   videoToolResultSupport?: "native" | "unsupported" | "unknown";
 }
 
@@ -124,6 +141,7 @@ export function apply(ctx: Context, config: Config) {
       },
       chatCapabilities: () => ({
         imageToolResult: imageToolResultSupport,
+        imageToolResultMediaTypes: config.imageToolResultMediaTypes ?? defaultImageToolResultMediaTypes,
         videoToolResult: config.videoToolResultSupport ?? videoToolResultSupport,
         historyProjection: "gemini-native" as const,
       }),

@@ -37,6 +37,8 @@ export type AuxiliaryModelErrorCode = "missing-config" | "invalid-config" | "unr
 
 export type ImageToolResultSupport = "native" | "unsupported" | "unknown";
 
+export type ImageMediaType = "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+
 /** Explicit native video-tool-result transport declaration; absent or invalid normalizes unknown. */
 export type VideoToolResultSupport = "native" | "unsupported" | "unknown";
 
@@ -44,6 +46,8 @@ export type HistoryProjectionMode = "default" | "gemini-native";
 
 export interface ChatModelCapabilities {
   readonly imageToolResult: ImageToolResultSupport;
+  /** Optional route-specific allowlist for native image tool-result media. */
+  readonly imageToolResultMediaTypes?: readonly ImageMediaType[];
   readonly videoToolResult?: VideoToolResultSupport;
   readonly historyProjection?: HistoryProjectionMode;
 }
@@ -206,11 +210,13 @@ export class ModelService {
       : source;
     const tools = provider.tools?.(record.modelId);
     const declaredCapabilities = provider.chatCapabilities?.(record.modelId);
+    const imageToolResultMediaTypes = normalizeImageToolResultMediaTypes(declaredCapabilities?.imageToolResultMediaTypes);
     const capabilities: ChatModelCapabilities = {
       imageToolResult:
         declaredCapabilities?.imageToolResult === "native" || declaredCapabilities?.imageToolResult === "unsupported"
           ? declaredCapabilities.imageToolResult
           : "unknown",
+      ...(imageToolResultMediaTypes === undefined ? {} : { imageToolResultMediaTypes }),
       // Never inferred from names, image support or an OpenAI-compatible label: only an explicit
       // native/unsupported declaration enables or denies video transport.
       videoToolResult:
@@ -585,6 +591,16 @@ function createEmbeddingUsageMiddleware(report: (usage: { inputTokens: number; o
 
 function isModelObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function normalizeImageToolResultMediaTypes(value: readonly ImageMediaType[] | undefined): readonly ImageMediaType[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter(isImageMediaType))];
+}
+
+function isImageMediaType(value: unknown): value is ImageMediaType {
+  return value === "image/png" || value === "image/jpeg" || value === "image/gif" || value === "image/webp";
 }
 
 function cloneChatModelConfig(config: ChatModelConfig): ChatModelConfig {

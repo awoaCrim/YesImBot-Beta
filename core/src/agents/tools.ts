@@ -66,6 +66,8 @@ type ReadExecution = {
 export interface ReadImagePolicy {
   readonly mode: ReadImageMode;
   readonly visionModel?: LanguageModel;
+  /** Optional route-specific allowlist for native image tool-result media. */
+  readonly nativeMediaTypes?: readonly string[];
 }
 
 export interface ReadVideoPolicy {
@@ -360,6 +362,16 @@ export function createReadTool(
 
       const metadata = describeBytes(opened.bytes, detectedImageType);
       if (policy.mode === "native" && resources.imageInput) {
+        if (policy.nativeMediaTypes && !policy.nativeMediaTypes.includes(detectedImageType)) {
+          return {
+            uri,
+            filename: opened.filename,
+            mediaType: detectedImageType,
+            imageMode: "unavailable",
+            error: "image_input_unavailable",
+            text: "模型没有看到图片内容。",
+          };
+        }
         if (execution.abortSignal?.aborted) {
           return {
             uri,

@@ -857,13 +857,19 @@ describe("prepareOutputSegments", () => {
 
 describe("read tool model projection", () => {
   async function createTool(
-    overrides: { mode?: "native" | "vision" | "unavailable"; imageInput?: boolean; visionModel?: unknown } = {},
+    overrides: {
+      mode?: "native" | "vision" | "unavailable";
+      imageInput?: boolean;
+      visionModel?: unknown;
+      nativeMediaTypes?: readonly string[];
+    } = {},
   ): Promise<{ tool: ReadTool; resources: ChannelResources }> {
     const resources = await createResources();
     return {
       tool: createReadTool(new ChannelResources(resources.path, overrides.imageInput ?? false), {
         mode: overrides.mode ?? "unavailable",
         visionModel: overrides.visionModel as never,
+        ...(overrides.nativeMediaTypes === undefined ? {} : { nativeMediaTypes: overrides.nativeMediaTypes }),
       }),
       resources,
     };
@@ -953,6 +959,16 @@ describe("read tool model projection", () => {
     const { result, output } = await readAndProject(tool, `asset://${id}`);
 
     expect(result).toMatchObject({ imageMode: "unavailable", error: "image_input_unavailable" });
+    expect(output.type).toBe("json");
+  });
+
+  it("does not project a format excluded by the native route capability", async () => {
+    const webpBytes = new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50]);
+    const { tool, resources } = await createTool({ mode: "native", imageInput: true, nativeMediaTypes: ["image/png", "image/jpeg"] });
+    const id = await resources.assets.put(webpBytes);
+    const { result, output } = await readAndProject(tool, `asset://${id}`);
+
+    expect(result).toMatchObject({ mediaType: "image/webp", imageMode: "unavailable", error: "image_input_unavailable" });
     expect(output.type).toBe("json");
   });
 

@@ -143,4 +143,25 @@ describe("runResponsesComputerUse", () => {
     // 1 user turn per step plus a function call and its output per executed step.
     expect(requests.map((input) => input.length)).toEqual([1, 4, 7]);
   });
+
+  it("keeps only the latest screenshot after the replay window is full", async () => {
+    const requests: Array<readonly ResponseInputItem[]> = [];
+    const requester: ResponsesRequester = {
+      request: vi.fn(async (input) => {
+        requests.push(input);
+        return requests.length < 8
+          ? { status: "completed", output: [call("desktop_screenshot", {}, `call-${requests.length}`)] }
+          : { status: "completed", output: [] };
+      }),
+    };
+    const bound = driver();
+    await runResponsesComputerUse({ prompt: "截图", requester, driver: bound.driver, maxSteps: 8, signal: new AbortController().signal });
+
+    expect(requests[7]).toHaveLength(13);
+    const screenshots = requests[7]!.flatMap((item) =>
+      "role" in item && item.role === "user" ? item.content.filter((part) => part.type === "input_image") : [],
+    );
+    expect(screenshots).toHaveLength(1);
+    expect(JSON.stringify(requests[7])).toContain("Earlier screenshots were omitted");
+  });
 });

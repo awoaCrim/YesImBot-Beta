@@ -148,10 +148,10 @@ function batchPlugin(options: { acceptEvents?: boolean } = {}) {
 // ---------------------------------------------------------------------------
 
 describe("read image routing", () => {
-  const primary = (imageInput: boolean, imageToolResult: "native" | "unsupported" | "unknown") =>
+  const primary = (imageInput: boolean, imageToolResult: "native" | "unsupported" | "unknown", imageToolResultMediaTypes?: readonly string[]) =>
     ({
       entry: { modalities: imageInput ? { input: ["image"] } : undefined },
-      capabilities: { imageToolResult },
+      capabilities: { imageToolResult, ...(imageToolResultMediaTypes === undefined ? {} : { imageToolResultMediaTypes }) },
       model: { id: "primary" },
     }) as never;
   const vision = () => ({ entry: { modalities: { input: ["image"] } }, model: { id: "vision" } }) as never;
@@ -162,6 +162,13 @@ describe("read image routing", () => {
 
   it.each(["unsupported", "unknown"] as const)("uses vision fallback for %s transports", (capability) => {
     expect(resolveReadImagePolicy(primary(true, capability), vision(), true)).toMatchObject({ mode: "vision", visionModel: { id: "vision" } });
+  });
+
+  it("propagates a native route media allowlist", () => {
+    expect(resolveReadImagePolicy(primary(true, "native", ["image/png", "image/jpeg"]), vision(), true)).toEqual({
+      mode: "native",
+      nativeMediaTypes: ["image/png", "image/jpeg"],
+    });
   });
 
   it("uses vision fallback when direct image input is disabled", () => {
