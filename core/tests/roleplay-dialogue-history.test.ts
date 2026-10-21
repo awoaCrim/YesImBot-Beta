@@ -12,6 +12,7 @@ vi.mock("koishi", async () => import("@koishijs/core"));
 vi.mock("../src/agents/tools.js", async (original) => ({ ...(await original<object>()), pacedDelay: () => 0 }));
 
 import RoleplayPlugin from "../../plugins/roleplay/src/index.js";
+import { VISUAL_REFERENCE_INSTRUCTIONS } from "../../plugins/roleplay/src/visual-reference.js";
 import { apply as applyGoogle } from "../../providers/google/src/index.js";
 import { apply as applyOpenAI } from "../../providers/openai/src/index.js";
 import { Agents } from "../src/agents/index.js";
@@ -27,6 +28,7 @@ type Action = { name: string; args: Record<string, unknown>; signature?: string 
 type WirePart = {
   text?: string;
   thoughtSignature?: string;
+  inlineData?: { mimeType: string; data: string };
   functionCall?: { name: string; args: Record<string, unknown> };
   functionResponse?: { name: string; response: unknown };
 };
@@ -34,7 +36,7 @@ type WirePart = {
 type WireTurn = {
   role: string;
   parts?: WirePart[];
-  content?: string | Array<{ type: string; text?: string }>;
+  content?: string | Array<{ type: string; text?: string; image_url?: { url: string } }>;
   tool_calls?: Array<{ function: { name: string; arguments: string } }>;
 };
 
@@ -52,6 +54,7 @@ const roleplays: RoleplayPlugin[] = [];
 const services: ModelService[] = [];
 const matrix = (["openai", "google"] as const).flatMap((provider) => [false, true].map((magic) => ({ provider, magic })));
 const send = (text: string): Action => ({ name: "send_message", args: { parts: [{ kind: "text", text }] } });
+const visualImage = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=", "base64");
 const reminderHeading = "【本次请求的表达约束；这是运行提醒，不是新增聊天内容】";
 const reminderMatrix = matrix.flatMap((entry) => [false, true].map((reminder) => ({ ...entry, reminder })));
 
@@ -169,7 +172,7 @@ async function fixture(
   enabled: boolean,
   script: Action[],
   examples = exampleText,
-  options: { preventSelfStyleImitation?: boolean; direct?: boolean; lookup?: () => Promise<string> } = {},
+  options: { preventSelfStyleImitation?: boolean; direct?: boolean; lookup?: () => Promise<string>; visualReference?: boolean } = {},
 ) {
   const scope: ChannelContext = options.direct ? { type: "direct", platform: "test", channelId: "room-1", selfId: "bot-1", userId: "user-1" } : testScope;
   const root = await mkdtemp(join(tmpdir(), "yesimbot-role-history-wire-"));
@@ -198,6 +201,7 @@ async function fixture(
       },
     }),
   );
+  if (options.visualReference) await writeFile(join(root, "reference.png"), visualImage);
   const ctx = new Context();
   const service = new ModelService(ctx as never, { basePath: root, logLevel: 0 });
   services.push(service);
@@ -234,7 +238,13 @@ async function fixture(
   const roleContext = { baseDir: root, logger: () => ({}), on: vi.fn(), yesimbot: { agent: agents } } as unknown as ConstructorParameters<
     typeof RoleplayPlugin
   >[0];
-  const roleplay = new RoleplayPlugin(roleContext, { characterCard: "card.png", enableGreeting: false, exampleDialoguesAsHistory: enabled });
+  const roleplay = new RoleplayPlugin(roleContext, {
+    characterCard: "card.png",
+    enableGreeting: false,
+    exampleDialoguesAsHistory: enabled,
+    visualReferenceImage: "reference.png",
+    ...(options.visualReference === undefined ? {} : { enableVisualReference: options.visualReference }),
+  });
   roleplays.push(roleplay);
   await roleplay.start();
   const roleProfile = await agents.resolveRoleProfile(scope);
@@ -317,7 +327,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-function expectSeeds(request: WireRequest, provider: Provider): void {
+function expectSeeds(request: WireRequest, provider: Provider, expectedCurrent = currentQuestion): void {
   const turns = dialogue(request);
   const value = text(request);
   expect(occurrences(value, seedQuestion)).toBe(1);
@@ -328,7 +338,7 @@ function expectSeeds(request: WireRequest, provider: Provider): void {
   expect(turns.find((turn) => body(turn).includes(seedOnlyAnswer))?.role).toBe(provider === "google" ? "model" : "assistant");
   expect(value.indexOf(seedQuestion)).toBeLessThan(value.indexOf(seedAnswer));
   expect(value.indexOf(seedAnswer)).toBeLessThan(value.indexOf(seedOnlyAnswer));
-  expect(value.indexOf(seedOnlyAnswer)).toBeLessThan(value.indexOf(currentQuestion));
+  expect(value.indexOf(seedOnlyAnswer)).toBeLessThan(value.indexOf(expectedCurrent));
   expect(systemText(request)).not.toContain(seedQuestion);
   expect(JSON.stringify(request)).not.toMatch(/example_dialogue|style and behavior examples|sourceEntryIds/);
   for (const marker of [seedQuestion, seedAnswer, seedOnlyAnswer]) {
@@ -338,6 +348,106 @@ function expectSeeds(request: WireRequest, provider: Provider): void {
   }
   expect(turns.some((turn) => turn.role === "system")).toBe(false);
 }
+
+function expectVisualReference(request: WireRequest, enabled: boolean): void {
+  const turns = dialogue(request);
+  const googleImages = turns.flatMap((turn) => turn.parts ?? []).flatMap((part) => (part.inlineData ? [part.inlineData] : []));
+  const openaiImages = turns
+    .flatMap((turn) => (Array.isArray(turn.content) ? turn.content : []))
+    .flatMap((part) => (part.image_url ? [part.image_url.url] : []));
+  expect(googleImages.length + openaiImages.length).toBe(enabled ? 1 : 0);
+  const system = systemText(request);
+  expect(occurrences(system, VISUAL_REFERENCE_INSTRUCTIONS)).toBe(enabled ? 1 : 0);
+  expect(occurrences(text(request), "<role_visual_reference>")).toBe(enabled ? 1 : 0);
+  expect(JSON.stringify(request)).not.toContain("sourceEntryIds");
+  if (!enabled) return;
+  if (request.contents) expect(googleImages).toEqual([{ mimeType: "image/png", data: visualImage.toString("base64") }]);
+  else expect(openaiImages).toEqual([`data:image/png;base64,${visualImage.toString("base64")}`]);
+  expect(body(turns[0]!)).toContain("<role_visual_reference>");
+  expect(system.indexOf(VISUAL_REFERENCE_INSTRUCTIONS)).toBeGreaterThan(system.indexOf("# 角色"));
+  expect(system.indexOf(VISUAL_REFERENCE_INSTRUCTIONS)).toBeLessThan(system.indexOf("# 互动策略"));
+  expect(system).not.toContain(visualImage.toString("base64"));
+}
+
+async function expectReferenceNotStored(f: Awaited<ReturnType<typeof fixture>>): Promise<void> {
+  for (const data of [await f.channel.conversation.storage.read(), await f.channel.conversation.contextSources()]) {
+    const serialized = JSON.stringify(data);
+    expect(serialized).not.toContain("role_visual_reference");
+    expect(serialized).not.toContain(visualImage.toString("base64"));
+    expect(serialized).not.toContain(VISUAL_REFERENCE_INSTRUCTIONS);
+  }
+}
+
+describe("optional visual self-reference (actual Core and provider SDKs; stub HTTP only)", () => {
+  it.each(matrix.flatMap((entry) => [undefined, false, true].map((setting) => ({ ...entry, setting }))))(
+    "gates native image bytes without a tail reminder ($provider, Magic=$magic, setting=$setting)",
+    async ({ provider, magic, setting }) => {
+      const f = await fixture(provider, magic, true, [{ name: "finish", args: {} }], exampleText, { visualReference: setting });
+      await f.handle(currentQuestion);
+      expect(f.fetch).toHaveBeenCalledOnce();
+      expectVisualReference(f.requests[0]!, setting === true);
+      expectSeeds(f.requests[0]!, provider);
+      expectFocus(f.requests[0]!, currentQuestion);
+      expect(body(dialogue(f.requests[0]!).at(-1)!)).toContain(currentQuestion);
+      expect(f.bot.sendMessage).not.toHaveBeenCalled();
+      await expectReferenceNotStored(f);
+    },
+  );
+
+  it.each(matrix.flatMap((entry) => [false, true].map((history) => ({ ...entry, history }))))(
+    "keeps one fixed image across later turns and signed tool continuations ($provider, Magic=$magic, history=$history)",
+    async ({ provider, magic, history }) => {
+      const f = await fixture(
+        provider,
+        magic,
+        history,
+        [send("VISUAL_FIRST_DELIVERED_REPLY"), { name: "lookup", args: {}, signature }, { name: "lookup", args: {}, signature }, { name: "finish", args: {} }],
+        exampleText,
+        { visualReference: true },
+      );
+      await f.handle("VISUAL_FIRST_REAL_INPUT");
+      await f.handle(currentQuestion);
+      expect(f.fetch).toHaveBeenCalledTimes(4);
+      expect(f.bot.sendMessage).toHaveBeenCalledOnce();
+      for (const [index, request] of f.requests.entries()) {
+        expectVisualReference(request, true);
+        expectFocus(request, index === 0 ? "VISUAL_FIRST_REAL_INPUT" : currentQuestion);
+        if (history) expectSeeds(request, provider, index === 0 ? "VISUAL_FIRST_REAL_INPUT" : currentQuestion);
+      }
+      const final = f.requests[3]!;
+      expect(JSON.stringify(final)).toContain("SYNTHETIC_LOOKUP_RESULT");
+      if (provider === "google") {
+        const calls = final.contents?.flatMap((turn) => turn.parts ?? []).filter((part) => part.functionCall?.name === "lookup");
+        expect(calls).toHaveLength(2);
+        expect(calls?.every((call) => call.thoughtSignature === signature)).toBe(true);
+      } else expect(final.messages?.flatMap((turn) => turn.tool_calls ?? []).filter((call) => call.function.name === "lookup")).toHaveLength(2);
+      await expectReferenceNotStored(f);
+    },
+  );
+
+  it.each(matrix)("retains the visual prefix during terminal recovery ($provider, Magic=$magic)", async ({ provider, magic }) => {
+    const f = await fixture(
+      provider,
+      magic,
+      true,
+      [{ name: "lookup", args: {}, signature }, { text: "UNSENT_VISUAL_INTERNAL_TEXT" }, { name: "finish", args: {} }],
+      exampleText,
+      { visualReference: true, preventSelfStyleImitation: true },
+    );
+    await f.handle(currentQuestion);
+    expect(f.fetch).toHaveBeenCalledTimes(3);
+    for (const request of f.requests) {
+      expectVisualReference(request, true);
+      expectSeeds(request, provider);
+      expectFocus(request, currentQuestion);
+      expectReminder(request, true);
+    }
+    expect(JSON.stringify(f.requests[2])).toContain("internal repair step");
+    expect(f.onTurnFinish).toHaveBeenCalledWith(expect.objectContaining({ status: "done" }), expect.any(Object));
+    expect(f.bot.sendMessage).not.toHaveBeenCalled();
+    await expectReferenceNotStored(f);
+  });
+});
 
 describe("optional self-style reminder (actual Core and provider SDKs; stub HTTP only)", () => {
   it.each(matrix.flatMap((entry) => [undefined, false, true].flatMap((setting) => [false, true].map((direct) => ({ ...entry, setting, direct })))))(

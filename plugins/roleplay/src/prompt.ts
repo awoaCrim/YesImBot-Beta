@@ -3,6 +3,7 @@ import type { MainAgentRoleProfile } from "koishi-plugin-yesimbot";
 
 import type { CBSContext } from "./cbs.js";
 import { renderCBS } from "./cbs.js";
+import { VISUAL_REFERENCE_INSTRUCTIONS } from "./visual-reference.js";
 
 export interface RoleplayHistoryMessage {
   readonly role: "user" | "assistant";
@@ -46,11 +47,18 @@ export function assembleRoleProfile(card: CharacterCardV3, context: CBSContext):
   return assembleRoleplayPrompts(card, context).roleProfile;
 }
 
-export function assembleRoleplayPrompts(card: CharacterCardV3, context: CBSContext, examplesAsHistory = false): RoleplayPromptMaterial {
+export function assembleRoleplayPrompts(
+  card: CharacterCardV3,
+  context: CBSContext,
+  examplesAsHistory = false,
+  visualReference = false,
+): RoleplayPromptMaterial {
   const instructionExtension = examplesAsHistory ? render(card.data.system_prompt, context) : assembleInstructionExtension(card, context);
   const dialogueHistory = examplesAsHistory ? parseDialogueHistory(card, context) : [];
   const postHistoryInstructions = assemblePostHistoryInstructions(card, context);
-  const roleInstructions = [instructionExtension, postHistoryInstructions].filter((section) => section.length > 0).join("\n\n");
+  const roleInstructions = [instructionExtension, postHistoryInstructions, visualReference ? VISUAL_REFERENCE_INSTRUCTIONS : ""]
+    .filter((section) => section.length > 0)
+    .join("\n\n");
   const characterDefinition = assembleCharacterDefinition(card, context);
 
   return {
