@@ -33,15 +33,7 @@ export type ComputerUseResult =
   | {
       readonly ok: false;
       readonly error: {
-        readonly code:
-          | "aborted"
-          | "timeout"
-          | "provider_error"
-          | "driver_unavailable"
-          | "action_failed"
-          | "safety_check_required"
-          | "invalid_response"
-          | "step_limit";
+        readonly code: "aborted" | "timeout" | "provider_error" | "driver_unavailable" | "action_failed" | "safety_check_required" | "invalid_response";
         readonly message: string;
         readonly retryable: boolean;
       };

@@ -31,9 +31,10 @@ plugins:
     apiKey: ${OPENAI_API_KEY}
     model: gpt-6-luna
     mcpEndpoint: http://172.20.0.1:18200/sse
-    maxSteps: 20
     timeout: 180
 ```
+
+任务没有固定步数上限；旧的 `maxSteps` 配置已移除，不再限制执行。子循环会持续到模型返回结果、请求安全确认、发生错误、被取消或达到单次任务超时；默认超时仍为 180 秒。
 
 `model` 需要支持图片输入和 function calling。`displayWidth` / `displayHeight` 只用于向模型说明截图坐标范围，默认 `1280x800`。`toolType` 和 `environment` 已弃用，仅为兼容旧配置保留，不再影响请求。API key 只进入请求 header，不会写入工具结果或日志。
 

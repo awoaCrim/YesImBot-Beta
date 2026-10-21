@@ -21,7 +21,7 @@ describe("createResponsesRequester", () => {
       requests.push({ body: JSON.parse(String(init?.body)), headers: new Headers(init?.headers) });
       return new Response(JSON.stringify({ id: "resp-1", output: [] }), { status: 200, headers: { "content-type": "application/json" } });
     });
-    const requester = createResponsesRequester({ apiKey: "test-secret", baseURL: "https://fixture.invalid/v1", model: "vision-model", maxSteps: 3 }, fetcher);
+    const requester = createResponsesRequester({ apiKey: "test-secret", baseURL: "https://fixture.invalid/v1", model: "vision-model" }, fetcher);
 
     await requester.request([{ role: "user", content: [{ type: "input_text", text: "查看桌面" }] }], new AbortController().signal);
 
@@ -44,7 +44,7 @@ describe("createResponsesRequester", () => {
       async () =>
         new Response(JSON.stringify({ error: { message: "Unsupported tool type: computer (key sk-abcdefgh1234)", code: "bad_request" } }), { status: 400 }),
     );
-    const requester = createResponsesRequester({ apiKey: "sk-abcdefgh1234", baseURL: "https://fixture.invalid/v1", model: "m", maxSteps: 1 }, fetcher);
+    const requester = createResponsesRequester({ apiKey: "sk-abcdefgh1234", baseURL: "https://fixture.invalid/v1", model: "m" }, fetcher);
 
     await expect(requester.request([], new AbortController().signal)).rejects.toThrow(/HTTP 400: Unsupported tool type: computer .* \| bad_request/);
     await expect(requester.request([], new AbortController().signal)).rejects.not.toThrow(/abcdefgh1234/);
@@ -64,7 +64,7 @@ describe("runResponsesComputerUse", () => {
       }),
     };
     const bound = driver();
-    const result = await runResponsesComputerUse({ prompt: "打开页面", requester, driver: bound.driver, maxSteps: 3, signal: new AbortController().signal });
+    const result = await runResponsesComputerUse({ prompt: "打开页面", requester, driver: bound.driver, signal: new AbortController().signal });
 
     expect(bound.execute).toHaveBeenNthCalledWith(1, [], expect.any(AbortSignal));
     expect(bound.execute).toHaveBeenNthCalledWith(2, [{ type: "click", button: "left", x: 12, y: 30 }], expect.any(AbortSignal));
@@ -84,7 +84,6 @@ describe("runResponsesComputerUse", () => {
         request: vi.fn(async () => ({ status: "completed", output: [call("request_confirmation", { reason: "支付 2399 元" })] })),
       },
       driver: bound.driver,
-      maxSteps: 3,
       signal: new AbortController().signal,
     });
 
@@ -103,7 +102,6 @@ describe("runResponsesComputerUse", () => {
       prompt: "点击",
       requester: { request: vi.fn(async () => ({ status: "completed", output: [call("desktop_click", { x: -5, y: 10 })] })) },
       driver: bound.driver,
-      maxSteps: 2,
       signal: new AbortController().signal,
     });
 
@@ -111,20 +109,46 @@ describe("runResponsesComputerUse", () => {
     expect(result.result).toMatchObject({ ok: false, error: { code: "invalid_response" } });
   });
 
-  it("stops at the configured step limit without retrying an unknown action result", async () => {
+  it("continues beyond the former 20-step default and 50-step maximum until the model finishes", async () => {
     const bound = driver();
-    const request = vi.fn(async () => ({ status: "completed", output: [call("desktop_wait", {}, "call-2")] }));
+    let requests = 0;
+    const request = vi.fn(async () => {
+      requests += 1;
+      return requests <= 64
+        ? { status: "completed", output: [call("desktop_wait", {}, `call-${requests}`)] }
+        : { status: "completed", output: [], output_text: "完成并确认了任务。" };
+    });
     const result = await runResponsesComputerUse({
-      prompt: "等待",
+      prompt: "完成长任务",
       requester: { request },
       driver: bound.driver,
-      maxSteps: 2,
       signal: new AbortController().signal,
     });
 
-    expect(request).toHaveBeenCalledTimes(2);
-    expect(bound.execute).toHaveBeenCalledTimes(3);
-    expect(result.result).toMatchObject({ ok: false, error: { code: "step_limit" }, steps: 2 });
+    expect(request).toHaveBeenCalledTimes(65);
+    expect(bound.execute).toHaveBeenCalledTimes(65);
+    expect(result.result).toMatchObject({ ok: true, status: "completed", summary: "完成并确认了任务。", steps: 65 });
+    expect(result.screenshot).toBe(SCREENSHOT);
+  });
+
+  it("still honors cancellation between steps after passing the former maximum", async () => {
+    const bound = driver();
+    const controller = new AbortController();
+    bound.execute.mockImplementation(async () => {
+      if (bound.execute.mock.calls.length === 65) controller.abort();
+      return SCREENSHOT;
+    });
+    const request = vi.fn(async () => ({
+      status: "completed",
+      output: [call("desktop_wait", {}, `call-${bound.execute.mock.calls.length}`)],
+    }));
+
+    await expect(
+      runResponsesComputerUse({ prompt: "等待取消", requester: { request }, driver: bound.driver, signal: controller.signal }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+
+    expect(request).toHaveBeenCalledTimes(64);
+    expect(bound.execute).toHaveBeenCalledTimes(65);
   });
 
   it("keeps the replayed history bounded to the executed steps", async () => {
@@ -138,7 +162,7 @@ describe("runResponsesComputerUse", () => {
       }),
     };
     const bound = driver();
-    await runResponsesComputerUse({ prompt: "截图", requester, driver: bound.driver, maxSteps: 4, signal: new AbortController().signal });
+    await runResponsesComputerUse({ prompt: "截图", requester, driver: bound.driver, signal: new AbortController().signal });
 
     // 1 user turn per step plus a function call and its output per executed step.
     expect(requests.map((input) => input.length)).toEqual([1, 4, 7]);
@@ -155,7 +179,7 @@ describe("runResponsesComputerUse", () => {
       }),
     };
     const bound = driver();
-    await runResponsesComputerUse({ prompt: "截图", requester, driver: bound.driver, maxSteps: 8, signal: new AbortController().signal });
+    await runResponsesComputerUse({ prompt: "截图", requester, driver: bound.driver, signal: new AbortController().signal });
 
     expect(requests[7]).toHaveLength(13);
     const screenshots = requests[7]!.flatMap((item) =>

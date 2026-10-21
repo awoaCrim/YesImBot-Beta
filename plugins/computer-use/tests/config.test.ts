@@ -8,16 +8,16 @@ import { Config, apply } from "../src/index.js";
 afterEach(() => vi.restoreAllMocks());
 
 describe("computer-use configuration", () => {
-  it("keeps the fixed guest MCP endpoint and bounded step budget", () => {
+  it("keeps the fixed guest MCP endpoint and timeout without a step budget", () => {
     const configured = Config({ apiKey: "secret", model: "vision-model" } as never);
     expect(configured).toMatchObject({
       enabled: true,
       mcpEndpoint: "http://172.20.0.1:18200/sse",
-      maxSteps: 20,
       timeout: 180,
       displayWidth: 1280,
       displayHeight: 800,
     });
+    expect(configured).not.toHaveProperty("maxSteps");
   });
 
   it("registers one delegated tool only for an allowed scope", async () => {

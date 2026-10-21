@@ -28,7 +28,6 @@ export const Config: Schema<ComputerUseConfig> = Schema.object({
   displayWidth: Schema.number().min(1).max(16_384).default(1280).description("桌面截图宽度，用于向模型说明坐标范围"),
   displayHeight: Schema.number().min(1).max(16_384).default(800).description("桌面截图高度，用于向模型说明坐标范围"),
   mcpEndpoint: Schema.string().default("http://172.20.0.1:18200/sse").description("固定 Anon 来宾桌面 MCP SSE 地址"),
-  maxSteps: Schema.number().min(1).max(50).default(20).description("单次原生桌面任务最多执行的模型步骤"),
   timeout: Schema.number().min(10).max(600).default(180).description("单次桌面任务超时（秒）"),
   allowedScopes: Schema.array(
     Schema.object({
@@ -55,7 +54,6 @@ export interface ComputerUseConfig {
   displayWidth?: number;
   displayHeight?: number;
   mcpEndpoint?: string;
-  maxSteps?: number;
   timeout?: number;
   allowedScopes?: ToolAccessRule[];
 }
@@ -69,7 +67,6 @@ export function apply(ctx: Context, config: ComputerUseConfig): void {
     model: requireValue(config.model, "model"),
     displayWidth: config.displayWidth,
     displayHeight: config.displayHeight,
-    maxSteps: config.maxSteps ?? 20,
   });
   const logger = ctx.logger("computer-use");
   const dispose = ctx.yesimbot.agent.use({
@@ -84,7 +81,6 @@ export function apply(ctx: Context, config: ComputerUseConfig): void {
         imageProjection,
         requester,
         driverFactory: () => new McpDesktopDriver({ endpoint: requireValue(config.mcpEndpoint, "mcpEndpoint") }),
-        maxSteps: config.maxSteps ?? 20,
         timeoutMs: (config.timeout ?? 180) * 1000,
       });
       const accessHooks = createToolAccessHooks({

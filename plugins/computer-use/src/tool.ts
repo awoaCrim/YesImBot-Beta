@@ -31,7 +31,6 @@ export interface ComputerUseToolOptions {
   readonly imageProjection: EphemeralImageProjectionStore;
   readonly requester: ResponsesRequester;
   readonly driverFactory: () => ComputerDriver;
-  readonly maxSteps: number;
   readonly timeoutMs: number;
 }
 
@@ -61,7 +60,6 @@ export function createComputerUseTool(options: ComputerUseToolOptions): AgentToo
           prompt: `${EXECUTION_PROMPT}\n\nTask:\n${input.task.trim()}`,
           requester: options.requester,
           driver,
-          maxSteps: options.maxSteps,
           signal: controller.signal,
         });
         if (result.screenshot) {
@@ -119,7 +117,6 @@ function failure(code: Extract<ComputerUseResult, { ok: false }>["error"]["code"
     action_failed: "The isolated Anon desktop rejected an action.",
     safety_check_required: "The computer model requested a safety confirmation; no consequential action was executed.",
     invalid_response: "The computer model returned an invalid action response.",
-    step_limit: "The computer task reached its step limit before completion.",
   } as const;
   // Provider and driver diagnostics are bounded and key-redacted so the real cause reaches the operator
   // instead of a generic failure code.

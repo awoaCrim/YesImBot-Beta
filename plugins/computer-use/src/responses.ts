@@ -29,7 +29,6 @@ export interface ResponsesComputerConfig {
   readonly apiKey: string;
   readonly baseURL?: string;
   readonly model: string;
-  readonly maxSteps: number;
   readonly displayWidth?: number;
   readonly displayHeight?: number;
 }
@@ -116,18 +115,17 @@ export async function runResponsesComputerUse(options: {
   readonly prompt: string;
   readonly requester: ResponsesRequester;
   readonly driver: ComputerDriver;
-  readonly maxSteps: number;
   readonly signal: AbortSignal;
 }): Promise<ComputerUseRunnerResult> {
   const history: ResponseInputItem[] = [];
   let screenshot = await options.driver.execute([], options.signal);
   let steps = 0;
 
-  for (let step = 0; step < options.maxSteps; step += 1) {
+  for (;;) {
     throwIfAborted(options.signal);
-    const turn = userTurn(step === 0 ? options.prompt : CONTINUE_PROMPT, screenshot);
+    const turn = userTurn(steps === 0 ? options.prompt : CONTINUE_PROMPT, screenshot);
     const response = await options.requester.request(compactReplayHistory(history, turn), options.signal);
-    steps = step + 1;
+    steps += 1;
 
     const calls = extractFunctionCalls(response.output);
     if (calls.length === 0) {
@@ -213,15 +211,6 @@ export async function runResponsesComputerUse(options: {
       ...outputs,
     );
   }
-
-  return {
-    result: {
-      ok: false,
-      error: { code: "step_limit", message: "The computer task reached its step limit before completion.", retryable: false },
-      steps: options.maxSteps,
-    },
-    screenshot,
-  };
 }
 
 function createFunctionTools(config: ResponsesComputerConfig): readonly unknown[] {
