@@ -41,7 +41,6 @@ export const Config: Schema<Config> = Schema.intersect([
       maxTotalDelayMs: Schema.number().min(1).default(60_000).description("单次 send_message 调用的最大累计延迟（毫秒）"),
     }).description("消息发送节奏"),
     customInnerThought: Schema.boolean().default(false).description("为 send_message 提供 inner_thought 字段，记录不发送的简短行为判断；默认关闭"),
-    preventSelfStyleImitation: Schema.boolean().default(false).description("防止沿用历史回复文风：每次主对话请求追加表达提醒，保留事实与上下文；默认关闭"),
   }),
   Schema.object({
     session: Schema.object({
@@ -155,7 +154,6 @@ export interface Config {
   resourceReadTimeout: number;
   pacing: PacingConfig;
   customInnerThought: boolean;
-  preventSelfStyleImitation?: boolean;
   session: SessionConfig;
 }
 

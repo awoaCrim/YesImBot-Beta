@@ -13,7 +13,7 @@ Core builds a stable leading sequence of separate system messages, one per respo
 5. Optional private behavior judgment, only when `customInnerThought` is enabled.
 6. Complete reply authorship and layout.
 
-Nonempty operator `AGENTS.md` and channel runtime metadata follow as separate Core system blocks. Empty files and disabled optional sections do not produce empty messages. Enabled plugins retain their existing capability-specific appenders. The block split preserves relative order and role precedence. The common role boundaries retain their existing wording except for the removed generic emoji/Unicode-emoticon avoidance clause; this removal does not rewrite operator-authored Persona or card material. Providers may combine system messages in their wire format; separate blocks do not imply model-side isolation or stronger priority. Tools are supplied separately, with their input/output contracts. History, recalled memory, continuity cards, skill/catalog data and other per-turn references remain in the existing request pipeline; this change does not globally reorder dynamic plugin hooks or reinterpret provider messages.
+Nonempty operator `AGENTS.md` and channel runtime metadata follow as separate Core system blocks. Empty files and disabled optional sections do not produce empty messages. Enabled plugins retain their existing capability-specific appenders. The block split preserves relative order and role precedence. The common role boundaries retain identity, autonomy and relationship constraints; detailed voice decisions belong to the complete request-level workflow. Operator-authored Persona and card material are not rewritten. Providers may combine system messages in their wire format; separate blocks do not imply model-side isolation or stronger priority. Tools are supplied separately, with their input/output contracts. History, recalled memory, continuity cards, skill/catalog data and other per-turn references remain in the existing request pipeline; this change does not globally reorder dynamic plugin hooks or reinterpret provider messages.
 
 A continuous role section keeps stable card identity/instruction fields adjacent to the Persona in the actual request, not merely in adjacent source files. Default-mode examples stay there too; the optional historical-dialogue mode described below moves only `mes_example` to ordinary request turns. Roleplay must not prepend a duplicate character definition on every `prepareStep`.
 
@@ -29,10 +29,19 @@ A continuous role section keeps stable card identity/instruction fields adjacent
 | Sending, message splitting, `continue`, destination, raw/element syntax, partial failure | `send_message` description/schema |
 | Optional internal judgment field | Conditional `send_message.inner_thought` contract; never a second visible output format |
 | Sandbox/host permissions, memory privacy, sticker send restrictions | Owning capability/tool; do not weaken real safety constraints for brevity |
-| Learned styles and reflections | Bounded historical reference, subordinate to identity, evidence and the current request |
+| Role decision order, response voice and pre-send checks | Mandatory complete request workflow; prior generated replies are not style examples |
+| Learned facts and reflections | Bounded historical reference, subordinate to identity, evidence and the current request |
 | Compaction/continuity generation | Separate auxiliary-model prompts, not the main Agent's persona |
 
 A brief tool-specific reminder is acceptable when needed for correct invocation. Removing every repeated word is not the objective. Avoid repeating complete personality or behavioral paragraphs across Persona, card fields, Core policy and tools.
+
+## Complete per-request role workflow
+
+Core appends one complete six-step workflow to every main-Agent request, including tool continuations, terminal recovery and context-guard rebuilds: identify the current interaction; select relevant persona grounds; decide behavior and purpose; verify facts and use necessary tools; compose the response; check before sending. Persona grounds precede response composition, rather than decorating a generic assistant answer afterwards. The six steps do not prescribe visible headings, require an extra analysis record or model call, or force speech after a tool result.
+
+The workflow incorporates the former self-style reminder. Generated history cannot establish wording, emotional intensity or joke templates, but valid facts, relationships, current emotions and unfinished tasks remain continuous. Tool results update only affected judgments. Explicit role examples retain their existing meaning and priority. Detailed voice instructions live here once instead of being duplicated in the leading role block.
+
+The request-only user-role block is registered as mandatory material without canonical source IDs; only the plugin-owned object is deduplicated, never genuine speech with identical text. It is not persisted as chat or compaction input. Its full cost is counted by the context guard. The former `preventSelfStyleImitation` setting is removed and old saved values cannot disable the workflow. Auxiliary-model prompts and tool/delivery contracts are unchanged. Structural checks prove injection and protocol preservation, not internal model compliance.
 
 ## Persona and card precedence
 
@@ -85,7 +94,7 @@ Local proof writes have bounded deadlines. Write failure stops later output; a t
 
 Core interaction policy owns comparison of subjects, conditions and time, and updating a judgment after clarification or correction. An inquiry is not a decision; additional information is not automatically disagreement. Core evidence policy owns conditional judgments when important facts are missing, general risk versus a specific finding, and the distinction between delivery proof and verified claims. Repeated prior assistant speculation, including memory or summary versions, is not independent support.
 
-These are main-Agent instructions, not a historical claim classifier or post-send filter. Delivered text, request roles, signed tool continuations and canonical history remain unchanged. The existing information-first voice, natural disagreement and confidence in supported knowledge remain available. Do not repeat these detailed rules in Persona/card fields or neutralize stored speech to enforce them.
+These are main-Agent instructions, not a historical claim classifier or post-send filter. Delivered text, request roles, signed tool continuations and canonical history remain unchanged. Role-informed factual responses, natural disagreement and confidence in supported knowledge remain available. Do not repeat these detailed rules in Persona/card fields or neutralize stored speech to enforce them.
 
 ### Behavioral replay checklist
 

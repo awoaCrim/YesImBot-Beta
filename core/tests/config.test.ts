@@ -42,21 +42,10 @@ describe("Config schema", () => {
     expect(enabled.session.magicContext).toMatchObject({ enabled: true, contextWindow: 50_000 });
   });
 
-  it.each([undefined, false, true])("keeps self-style prevention opt-in (setting=%s)", (setting) => {
-    const resolved = Config({ chatModel: "test:model", ...(setting === undefined ? {} : { preventSelfStyleImitation: setting }) } as never) as {
-      preventSelfStyleImitation?: boolean;
-    };
-    expect(resolved.preventSelfStyleImitation).toBe(setting === true);
-  });
-
-  it("exposes self-style prevention as a visible default-off boolean in the configuration UI", () => {
-    type SchemaNode = { type?: string; meta?: { default?: unknown; hidden?: boolean; description?: string }; dict?: Record<string, string | number> };
-    const json = Config.toJSON() as { refs: Record<string, SchemaNode> };
-    const group = Object.values(json.refs).find((ref) => ref.dict?.preventSelfStyleImitation !== undefined);
-    const setting = json.refs[String(group?.dict?.preventSelfStyleImitation)];
-    expect(setting).toMatchObject({ type: "boolean", meta: { default: false } });
-    expect(setting?.meta?.hidden).not.toBe(true);
-    expect(setting?.meta?.description).toContain("防止沿用历史回复文风");
+  it("does not expose an optional switch for the mandatory role workflow", () => {
+    const json = Config.toJSON() as { refs: Record<string, { dict?: Record<string, string | number> }> };
+    expect(Object.values(json.refs).some((ref) => ref.dict?.preventSelfStyleImitation !== undefined)).toBe(false);
+    expect(Config({ chatModel: "test:model" } as never)).not.toHaveProperty("preventSelfStyleImitation");
   });
 
   it("defaults custom inner thought to disabled", () => {

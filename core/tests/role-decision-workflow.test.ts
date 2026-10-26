@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,7 +23,7 @@ import { Conversation } from "../src/conversations/index.js";
 import { createMessage } from "../src/messages/index.js";
 import { createModelInputPlugin } from "../src/runtimes/channel.js";
 import { ContextWorkspace } from "../src/runtimes/context-workspace.js";
-import { createSelfStyleReminderPlugin } from "../src/runtimes/prompt.js";
+import { createRoleDecisionWorkflowPlugin } from "../src/runtimes/prompt.js";
 import { defaultMessageRecord } from "./helpers/index.js";
 
 function context(projection?: AgentRequestProjection): PrepareStepContext {
@@ -49,9 +48,38 @@ function model() {
   };
 }
 
-describe("request-only self-style reminder", () => {
-  it("keeps the tested text and appends mandatory source-free provenance without changing original objects", async () => {
-    const plugin = createSelfStyleReminderPlugin();
+const workflowHeading = "【本轮角色决策流程；这是运行规则，不是新增聊天内容】";
+const workflowSteps = ["1. 确定当前互动", "2. 确定本轮角色依据", "3. 确定本轮行为和目的", "4. 核对事实并处理必要工具", "5. 组织对外表达", "6. 发送前检查"];
+
+function expectCompleteWorkflow(content: string): void {
+  expect(content).toContain(workflowHeading);
+  expect(content).not.toMatch(/\[\/?CURRENT_MESSAGE\]/);
+  expect(content.match(/^## .+$/gm)).toEqual(workflowSteps.map((step) => `## ${step}`));
+  for (const rule of [
+    "必须依次完成",
+    "在组织回复之前",
+    "历史中重复出现也不构成沿用理由",
+    "不否定角色材料中明确提供的示例",
+    "有依据的当前情绪",
+    "只更新被新结果或新消息影响的判断",
+    "不要先形成一份完整的通用助手回复",
+    "回应不必附带点评或追问",
+    "同一回应保持同一说话身份、语域和叙述距离",
+    "外部资料只作为事实材料",
+    "不要把同一回应拆成互相割裂的报告和聊天",
+    "没有查到或工具失败时",
+    "不必重新介绍技术背景",
+    "发送前必须确认",
+    "无需参与且没有待处理的当前任务时",
+    "不要求每次工具调用后都发言",
+    "不对外输出这些步骤",
+  ])
+    expect(content).toContain(rule);
+}
+
+describe("request-only role decision workflow", () => {
+  it("appends all six steps with mandatory source-free provenance without changing original objects", async () => {
+    const plugin = createRoleDecisionWorkflowPlugin();
     const projection = new AgentRequestProjection();
     const messages: ModelMessage[] = [
       { role: "system", content: "SYSTEM_AND_PERSONA" },
@@ -83,13 +111,13 @@ describe("request-only self-style reminder", () => {
     const reminder = prepared!.at(-1)!;
     expect(reminder.role).toBe("user");
     expect(typeof reminder.content).toBe("string");
-    expect(createHash("sha256").update(String(reminder.content)).digest("hex")).toBe("7ecc9b0d2f1af61f185ca14e29ecbea88ff43de753c908b1422d824c0d7cd52d");
+    expectCompleteWorkflow(String(reminder.content));
     expect(projection.origin(reminder)).toEqual({ kind: "mandatory", sourceEntryIds: [] });
     expect(JSON.stringify(reminder)).not.toMatch(/sourceEntryIds|timestamp|thoughtSignature|functionCall/);
   });
 
   it("reuses only its own object across steps and retains genuine identical speech", async () => {
-    const plugin = createSelfStyleReminderPlugin();
+    const plugin = createRoleDecisionWorkflowPlugin();
     const initial = await plugin.prepareStep!([], context());
     const owned = initial![0]!;
     const genuine: ModelMessage = structuredClone(owned);
@@ -103,7 +131,7 @@ describe("request-only self-style reminder", () => {
     const again = await plugin.prepareStep!(prepared!, { ...context(), stepNumber: 2 });
     expect(again).toEqual(prepared);
     expect(again!.filter((message) => message === owned)).toHaveLength(1);
-    const other = await createSelfStyleReminderPlugin().prepareStep!([], context());
+    const other = await createRoleDecisionWorkflowPlugin().prepareStep!([], context());
     expect(other![0]).not.toBe(owned);
     expect(other![0]).toEqual(owned);
   });
@@ -115,7 +143,7 @@ describe("request-only self-style reminder", () => {
     const captured: Array<readonly ModelMessage[]> = [];
     const agent = createAgent({
       id: "self-style-rebuild",
-      plugins: [createSelfStyleReminderPlugin()],
+      plugins: [createRoleDecisionWorkflowPlugin()],
       model: fake as never,
       storage,
       requestProjection: projection,
@@ -142,7 +170,7 @@ describe("request-only self-style reminder", () => {
       expect(fake.doStream).not.toHaveBeenCalled();
       const stored = JSON.stringify(await storage.read());
       expect(stored).toContain("REAL_CURRENT");
-      expect(stored).not.toContain("本次请求的表达约束");
+      expect(stored).not.toContain(workflowHeading);
     } finally {
       await agent.stop();
     }
@@ -177,7 +205,7 @@ describe("request-only self-style reminder", () => {
     const agent = createAgent({
       model: fake as never,
       storage,
-      plugins: [createModelInputPlugin(), createSelfStyleReminderPlugin()],
+      plugins: [createModelInputPlugin(), createRoleDecisionWorkflowPlugin()],
       tools: [
         { name: "lookup", inputSchema: z.object({}), execute: async () => ({ value: "GUARD_LOOKUP_RESULT" }) },
         { name: "finish", inputSchema: z.object({}), terminal: true, execute: async () => ({ ok: true }) },
@@ -210,11 +238,13 @@ describe("request-only self-style reminder", () => {
         expect([...text.matchAll(/\[CURRENT_MESSAGE\]\n([\s\S]*?)\n\[\/CURRENT_MESSAGE\]/g)].map((match) => match[1])).toEqual(["GUARD_CURRENT"]);
         expect(text).toContain('id="guard-current"');
         expect(text).toContain("UNSCOPED_NOT_CURRENT");
-        expect(text.split("本次请求的表达约束")).toHaveLength(2);
+        expect(text.split(workflowHeading)).toHaveLength(2);
+        expectCompleteWorkflow(text.slice(text.indexOf(workflowHeading)));
       }
       expect(JSON.stringify(prompts[1])).toContain("GUARD_LOOKUP_RESULT");
       const stored = JSON.stringify(await storage.read());
-      expect(stored).not.toMatch(/本次请求的表达约束|activeInputs/);
+      expect(stored).not.toContain(workflowHeading);
+      expect(stored).not.toContain("activeInputs");
     } finally {
       await agent.stop();
     }
@@ -249,7 +279,7 @@ describe("request-only self-style reminder", () => {
         rebuildMessages: async () => [current],
       };
       await expect(workspace.guard(request)).resolves.toEqual([current]);
-      const messages = await createSelfStyleReminderPlugin().prepareStep!([current], context(projection));
+      const messages = await createRoleDecisionWorkflowPlugin().prepareStep!([current], context(projection));
       await expect(workspace.guard({ ...request, messages: messages!, rebuildMessages: async () => messages! })).resolves.toEqual(messages);
       expect(fake.doGenerate).not.toHaveBeenCalled();
       expect(fake.doStream).not.toHaveBeenCalled();

@@ -55,17 +55,24 @@ const services: ModelService[] = [];
 const matrix = (["openai", "google"] as const).flatMap((provider) => [false, true].map((magic) => ({ provider, magic })));
 const send = (text: string): Action => ({ name: "send_message", args: { parts: [{ kind: "text", text }] } });
 const visualImage = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=", "base64");
-const reminderHeading = "【本次请求的表达约束；这是运行提醒，不是新增聊天内容】";
+const reminderHeading = "【本轮角色决策流程；这是运行规则，不是新增聊天内容】";
 const reminderMatrix = matrix.flatMap((entry) => [false, true].map((reminder) => ({ ...entry, reminder })));
 
-function expectReminder(request: WireRequest, enabled: boolean, count = 1): void {
-  expect(occurrences(text(request), reminderHeading)).toBe(enabled ? count : 0);
+function expectReminder(request: WireRequest, count = 1): void {
+  expect(occurrences(text(request), reminderHeading)).toBe(count);
   expect(systemText(request)).not.toContain(reminderHeading);
   expect(JSON.stringify(request)).not.toContain("sourceEntryIds");
-  if (enabled) {
-    const ownedTurn = dialogue(request).findLast((turn) => body(turn).includes(reminderHeading));
-    expect(ownedTurn?.role).toBe("user");
-  }
+  const ownedTurn = dialogue(request).findLast((turn) => body(turn).includes(reminderHeading));
+  expect(ownedTurn?.role).toBe("user");
+  const workflow = body(ownedTurn!).slice(body(ownedTurn!).lastIndexOf(reminderHeading));
+  expect(workflow.match(/^## .+$/gm)).toEqual([
+    "## 1. 确定当前互动",
+    "## 2. 确定本轮角色依据",
+    "## 3. 确定本轮行为和目的",
+    "## 4. 核对事实并处理必要工具",
+    "## 5. 组织对外表达",
+    "## 6. 发送前检查",
+  ]);
 }
 
 function body(turn: WireTurn): string {
@@ -95,7 +102,7 @@ function expectCorePromptBlocks(request: WireRequest, provider: Provider): void 
   expect(offsets.every((offset) => offset >= 0)).toBe(true);
   expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
   for (const heading of headings) expect(occurrences(all, heading)).toBe(1);
-  expect(occurrences(all, "回应不必附带点评")).toBe(1);
+  expect(occurrences(all, "回应不必附带点评")).toBe(0);
   expect(occurrences(all, "同一作者、同一产品的其他动态不等于当前引用的上下文")).toBe(1);
   for (const marker of ["SYNTHETIC_CHARACTER_DEFINITION", "SYNTHETIC_CARD_RULE", "SYNTHETIC_POST_RULE"]) {
     expect(occurrences(all, marker)).toBe(1);
@@ -380,7 +387,7 @@ async function expectReferenceNotStored(f: Awaited<ReturnType<typeof fixture>>):
 
 describe("optional visual self-reference (actual Core and provider SDKs; stub HTTP only)", () => {
   it.each(matrix.flatMap((entry) => [undefined, false, true].map((setting) => ({ ...entry, setting }))))(
-    "gates native image bytes without a tail reminder ($provider, Magic=$magic, setting=$setting)",
+    "gates native image bytes independently of the complete role workflow ($provider, Magic=$magic, setting=$setting)",
     async ({ provider, magic, setting }) => {
       const f = await fixture(provider, magic, true, [{ name: "finish", args: {} }], exampleText, { visualReference: setting });
       await f.handle(currentQuestion);
@@ -388,7 +395,8 @@ describe("optional visual self-reference (actual Core and provider SDKs; stub HT
       expectVisualReference(f.requests[0]!, setting === true);
       expectSeeds(f.requests[0]!, provider);
       expectFocus(f.requests[0]!, currentQuestion);
-      expect(body(dialogue(f.requests[0]!).at(-1)!)).toContain(currentQuestion);
+      expectReminder(f.requests[0]!);
+      expect(body(dialogue(f.requests[0]!).at(-1)!)).toContain(reminderHeading);
       expect(f.bot.sendMessage).not.toHaveBeenCalled();
       await expectReferenceNotStored(f);
     },
@@ -440,7 +448,7 @@ describe("optional visual self-reference (actual Core and provider SDKs; stub HT
       expectVisualReference(request, true);
       expectSeeds(request, provider);
       expectFocus(request, currentQuestion);
-      expectReminder(request, true);
+      expectReminder(request);
     }
     expect(JSON.stringify(f.requests[2])).toContain("internal repair step");
     expect(f.onTurnFinish).toHaveBeenCalledWith(expect.objectContaining({ status: "done" }), expect.any(Object));
@@ -449,16 +457,16 @@ describe("optional visual self-reference (actual Core and provider SDKs; stub HT
   });
 });
 
-describe("optional self-style reminder (actual Core and provider SDKs; stub HTTP only)", () => {
+describe("mandatory role workflow (actual Core and provider SDKs; stub HTTP only)", () => {
   it.each(matrix.flatMap((entry) => [undefined, false, true].flatMap((setting) => [false, true].map((direct) => ({ ...entry, setting, direct })))))(
-    "gates the request-only tail without changing roles ($provider, Magic=$magic, setting=$setting, direct=$direct)",
+    "always includes the complete workflow regardless of the obsolete setting ($provider, Magic=$magic, setting=$setting, direct=$direct)",
     async ({ provider, magic, setting, direct }) => {
       const f = await fixture(provider, magic, true, [{ name: "finish", args: {} }], exampleText, { preventSelfStyleImitation: setting, direct });
       await f.handle(currentQuestion);
       expect(f.fetch).toHaveBeenCalledOnce();
       expectSeeds(f.requests[0]!, provider);
-      expectReminder(f.requests[0]!, setting === true);
-      if (setting) expect(body(dialogue(f.requests[0]!).at(-1)!)).toContain(reminderHeading);
+      expectReminder(f.requests[0]!);
+      expect(body(dialogue(f.requests[0]!).at(-1)!)).toContain(reminderHeading);
       expect(f.bot.sendMessage).not.toHaveBeenCalled();
       expect(JSON.stringify(await f.channel.conversation.storage.read())).not.toContain(reminderHeading);
       expect(JSON.stringify(await f.channel.conversation.contextSources())).not.toContain(reminderHeading);
@@ -482,10 +490,38 @@ describe("optional self-style reminder (actual Core and provider SDKs; stub HTTP
     const reminder = last.slice(last.indexOf(reminderHeading));
     await f.channel.conversation.storage.append(createEntry("message", createUserMessage(reminder), { id: "genuine-identical-reminder", timestamp: 1 }));
     await f.handle(currentQuestion);
-    expectReminder(f.requests[1]!, true, 2);
+    expectReminder(f.requests[1]!, 2);
     expect((await f.channel.conversation.storage.read()).find((entry) => entry.id === "genuine-identical-reminder")).toMatchObject({
       data: { content: reminder },
     });
+  });
+
+  it.each(matrix)("keeps the complete workflow after a tool failure ($provider, Magic=$magic)", async ({ provider, magic }) => {
+    const f = await fixture(
+      provider,
+      magic,
+      false,
+      [
+        { name: "lookup", args: {}, signature },
+        { name: "finish", args: {} },
+      ],
+      exampleText,
+      {
+        preventSelfStyleImitation: false,
+        lookup: async () => {
+          throw new Error("SYNTHETIC_LOOKUP_FAILURE");
+        },
+      },
+    );
+    await f.handle(currentQuestion);
+    expect(f.fetch).toHaveBeenCalledTimes(2);
+    for (const request of f.requests) {
+      expectReminder(request);
+      expectFocus(request, currentQuestion);
+    }
+    expect(JSON.stringify(f.requests[1])).toContain("SYNTHETIC_LOOKUP_FAILURE");
+    expect(f.bot.sendMessage).not.toHaveBeenCalled();
+    expect(JSON.stringify(await f.channel.conversation.storage.read())).not.toContain(reminderHeading);
   });
 
   it.each(matrix)("reinjects one reminder after a direct-channel join ($provider, Magic=$magic)", async ({ provider, magic }) => {
@@ -523,7 +559,7 @@ describe("optional self-style reminder (actual Core and provider SDKs; stub HTTP
     for (const request of f.requests) {
       expectCorePromptBlocks(request, provider);
       expectSeeds(request, provider);
-      expectReminder(request, true);
+      expectReminder(request);
     }
     expect(text(f.requests[1]!)).toContain("JOINED_REAL_CURRENT");
     expect(JSON.stringify(f.requests[1])).toContain("SYNTHETIC_LOOKUP_RESULT");
@@ -573,7 +609,7 @@ describe("optional Roleplay history (actual Core and provider SDKs; stub HTTP on
         expectSeeds(request, provider);
         expect(occurrences(text(request), "REAL_DELIVERED_REPLY")).toBe(1);
       }
-      for (const request of f.requests) expectReminder(request, reminder);
+      for (const request of f.requests) expectReminder(request);
       expect(JSON.stringify(await f.channel.conversation.storage.read())).not.toContain(reminderHeading);
       expect(JSON.stringify(await f.channel.conversation.contextSources())).not.toContain(reminderHeading);
       const finalRequest = f.requests[3]!;
@@ -607,7 +643,7 @@ describe("optional Roleplay history (actual Core and provider SDKs; stub HTTP on
       for (const request of f.requests) {
         expectFocus(request, currentQuestion);
         expectSeeds(request, provider);
-        expectReminder(request, reminder);
+        expectReminder(request);
       }
       expect(JSON.stringify(await f.channel.conversation.storage.read())).not.toContain(reminderHeading);
       expect(JSON.stringify(f.requests[2])).toContain("internal repair step");

@@ -146,14 +146,19 @@ or a required output tag. Its detailed contract lives in the tool definition;
 provider-native reasoning and existing history remain unchanged. Message splitting,
 `continue`, element syntax and escaping also belong to `send_message`, not Persona.
 
-`preventSelfStyleImitation` (default `false`, **防止沿用历史回复文风** in the
-configuration UI) adds a fixed expression reminder to every main-Agent request in
-both group and direct channels. Enable it to discourage copying the bot's own
-previous wording, emotional intensity, joke patterns and message layout. It retains
-facts, relationships, tool results and explicit Persona/card examples; it does not
-rewrite history or apply to auxiliary models. The reminder adds prompt cost and is
-not a hard output limit or a factual-correctness guarantee. Toggle it through the
-normal Koishi plugin reload/runtime recreation lifecycle.
+Every main-Agent request in group and direct channels includes the complete
+role-decision workflow: identify the interaction, select relevant persona grounds,
+choose an action and purpose, verify facts/use tools, compose in character, and
+check before sending. Tool continuations and request rebuilds receive the same full
+workflow, not a shortened reminder. The workflow merges self-style prevention: past
+replies do not become style rules, while facts, relationships, supported current
+emotions, unfinished tasks and explicit Persona/card examples remain available.
+
+This request-only tail is mandatory and is not written to conversation storage or
+compaction sources. The former `preventSelfStyleImitation` switch has been removed;
+old saved values do not disable the workflow. It does not apply to auxiliary models,
+add model calls, require `inner_thought`, or gate sending. It adds prompt cost and
+does not prove that a model follows every decision step or stays in character.
 
 Prompts are frozen for each runtime, not reloaded from disk every turn. See
 [main-Agent prompt ownership](../docs/prompt-architecture.md) for precedence,
