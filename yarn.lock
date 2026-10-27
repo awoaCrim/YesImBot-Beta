@@ -3265,76 +3265,6 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@yesimbot/koishi-plugin-provider-anthropic@workspace:providers/anthropic":
-  version: 0.0.0-use.local
-  resolution: "@yesimbot/koishi-plugin-provider-anthropic@workspace:providers/anthropic"
-  dependencies:
-    "@ai-sdk/anthropic": "npm:^3.0.0"
-    ai: "npm:^6.0.0"
-    koishi: "npm:^4.18.10"
-    koishi-plugin-yesimbot: "workspace:^"
-    zod: "npm:^3.25.76"
-  peerDependencies:
-    koishi: ^4.18.10
-    koishi-plugin-yesimbot: "workspace:^"
-    zod: ^3.25.76
-  languageName: unknown
-  linkType: soft
-
-"@yesimbot/koishi-plugin-provider-deepseek@workspace:providers/deepseek":
-  version: 0.0.0-use.local
-  resolution: "@yesimbot/koishi-plugin-provider-deepseek@workspace:providers/deepseek"
-  dependencies:
-    "@ai-sdk/deepseek": "npm:^2.0.0"
-    "@yesimbot/agent-runtime": "workspace:^"
-    ai: "npm:^6.0.0"
-    koishi: "npm:^4.18.10"
-    koishi-plugin-yesimbot: "workspace:^"
-    zod: "npm:^3.25.76"
-  peerDependencies:
-    "@yesimbot/agent-runtime": "workspace:^"
-    koishi: ^4.18.10
-    koishi-plugin-yesimbot: "workspace:^"
-    zod: ^3.25.76
-  languageName: unknown
-  linkType: soft
-
-"@yesimbot/koishi-plugin-provider-google@workspace:providers/google":
-  version: 0.0.0-use.local
-  resolution: "@yesimbot/koishi-plugin-provider-google@workspace:providers/google"
-  dependencies:
-    "@ai-sdk/google": "npm:^3.0.0"
-    "@yesimbot/agent-runtime": "workspace:^"
-    ai: "npm:^6.0.0"
-    koishi: "npm:^4.18.10"
-    koishi-plugin-yesimbot: "workspace:^"
-    zod: "npm:^3.25.76"
-  peerDependencies:
-    "@yesimbot/agent-runtime": "workspace:^"
-    koishi: ^4.18.10
-    koishi-plugin-yesimbot: "workspace:^"
-    zod: ^3.25.76
-  languageName: unknown
-  linkType: soft
-
-"@yesimbot/koishi-plugin-provider-openai@workspace:providers/openai":
-  version: 0.0.0-use.local
-  resolution: "@yesimbot/koishi-plugin-provider-openai@workspace:providers/openai"
-  dependencies:
-    "@ai-sdk/openai": "npm:^3.0.0"
-    "@yesimbot/agent-runtime": "workspace:^"
-    ai: "npm:^6.0.0"
-    koishi: "npm:^4.18.10"
-    koishi-plugin-yesimbot: "workspace:^"
-    zod: "npm:^3.25.76"
-  peerDependencies:
-    "@yesimbot/agent-runtime": "workspace:^"
-    koishi: ^4.18.10
-    koishi-plugin-yesimbot: "workspace:^"
-    zod: ^3.25.76
-  languageName: unknown
-  linkType: soft
-
 "abbrev@npm:^5.0.0":
   version: 5.0.0
   resolution: "abbrev@npm:5.0.0"
@@ -5417,6 +5347,15 @@ __metadata:
   languageName: node
   linkType: hard
 
+"image-size@npm:^2.0.2":
+  version: 2.0.4
+  resolution: "image-size@npm:2.0.4"
+  bin:
+    image-size: bin/image-size.js
+  checksum: 10c0/af01b8c2b7c536df1b866fc6daaa7e58ee909cde42fcae27562612ea77181f473445bc8acf0dfb5b9e8590e966a7a1f3f0fbf4c87ec6d1d4d60d68d87d529d76
+  languageName: node
+  linkType: hard
+
 "immutable@npm:^5.1.5":
   version: 5.1.9
   resolution: "immutable@npm:5.1.9"
@@ -5484,6 +5423,13 @@ __metadata:
   version: 1.9.1
   resolution: "ipaddr.js@npm:1.9.1"
   checksum: 10c0/0486e775047971d3fdb5fb4f063829bac45af299ae0b82dcf3afa2145338e08290563a2a70f34b732d795ecc8311902e541a8530eeb30d75860a78ff4e94ce2a
+  languageName: node
+  linkType: hard
+
+"ipaddr.js@npm:^2.2.0":
+  version: 2.5.0
+  resolution: "ipaddr.js@npm:2.5.0"
+  checksum: 10c0/5cef50d91a14f6388c3b5df3568ee7f8b18e07fa18896debc84d3393b78c1096e1b8e3a4f9fa9020c5ca5b556efc28550432f92a34d23c0cd643bd3194eb439d
   languageName: node
   linkType: hard
 
@@ -5879,6 +5825,18 @@ __metadata:
   languageName: node
   linkType: hard
 
+"koishi-plugin-adapter-wechat-local@workspace:plugins/wechat-local":
+  version: 0.0.0-use.local
+  resolution: "koishi-plugin-adapter-wechat-local@workspace:plugins/wechat-local"
+  dependencies:
+    koishi: "npm:^4.18.10"
+    vitest: "npm:^4.0.18"
+  peerDependencies:
+    "@satorijs/core": ^4.6.0
+    koishi: ^4.18.10
+  languageName: unknown
+  linkType: soft
+
 "koishi-plugin-yesimbot-chat-learning@workspace:plugins/chat-learning":
   version: 0.0.0-use.local
   resolution: "koishi-plugin-yesimbot-chat-learning@workspace:plugins/chat-learning"
@@ -5967,6 +5925,7 @@ __metadata:
     "@ai-sdk/openai": "npm:^3.0.0"
     "@yesimbot/agent-runtime": "workspace:^"
     ai: "npm:^6.0.0"
+    image-size: "npm:^2.0.2"
     koishi: "npm:^4.18.10"
     koishi-plugin-yesimbot: "workspace:^"
     vitest: "npm:^4.0.18"
@@ -5979,7 +5938,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"koishi-plugin-yesimbot-mcp-client@workspace:plugins/mcp-client":
+"koishi-plugin-yesimbot-mcp-client@workspace:^, koishi-plugin-yesimbot-mcp-client@workspace:plugins/mcp-client":
   version: 0.0.0-use.local
   resolution: "koishi-plugin-yesimbot-mcp-client@workspace:plugins/mcp-client"
   dependencies:
@@ -6022,6 +5981,28 @@ __metadata:
   peerDependencies:
     koishi: ^4.18.10
     koishi-plugin-yesimbot: "workspace:^"
+  languageName: unknown
+  linkType: soft
+
+"koishi-plugin-yesimbot-model-provider@workspace:providers/model-provider":
+  version: 0.0.0-use.local
+  resolution: "koishi-plugin-yesimbot-model-provider@workspace:providers/model-provider"
+  dependencies:
+    "@ai-sdk/anthropic": "npm:^3.0.0"
+    "@ai-sdk/deepseek": "npm:^2.0.0"
+    "@ai-sdk/google": "npm:^3.0.0"
+    "@ai-sdk/openai": "npm:^3.0.0"
+    "@yesimbot/agent-runtime": "workspace:^"
+    ai: "npm:^6.0.0"
+    koishi: "npm:^4.18.10"
+    koishi-plugin-yesimbot: "workspace:^"
+    vitest: "npm:^4.0.18"
+    zod: "npm:^3.25.76"
+  peerDependencies:
+    "@yesimbot/agent-runtime": "workspace:^"
+    koishi: ^4.18.10
+    koishi-plugin-yesimbot: "workspace:^"
+    zod: ^3.25.76
   languageName: unknown
   linkType: soft
 
@@ -6092,6 +6073,8 @@ __metadata:
   resolution: "koishi-plugin-yesimbot-search-service@workspace:plugins/search-service"
   dependencies:
     "@yesimbot/agent-runtime": "workspace:^"
+    image-size: "npm:^2.0.2"
+    ipaddr.js: "npm:^2.2.0"
     koishi: "npm:^4.18.10"
     koishi-plugin-yesimbot: "workspace:^"
     vitest: "npm:^4.0.18"
@@ -6150,19 +6133,6 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"koishi-plugin-yesimbot-will-policy@workspace:plugins/will-policy":
-  version: 0.0.0-use.local
-  resolution: "koishi-plugin-yesimbot-will-policy@workspace:plugins/will-policy"
-  dependencies:
-    koishi: "npm:^4.18.10"
-    koishi-plugin-yesimbot: "workspace:^"
-    vitest: "npm:^4.0.18"
-  peerDependencies:
-    koishi: ^4.18.10
-    koishi-plugin-yesimbot: "workspace:^"
-  languageName: unknown
-  linkType: soft
-
 "koishi-plugin-yesimbot-workspace@workspace:plugins/workspace":
   version: 0.0.0-use.local
   resolution: "koishi-plugin-yesimbot-workspace@workspace:plugins/workspace"
@@ -6181,6 +6151,25 @@ __metadata:
     "@yesimbot/agent-runtime": "workspace:^"
     ai: ^6.0.0
     koishi: ^4.18.10
+    koishi-plugin-yesimbot: "workspace:^"
+  languageName: unknown
+  linkType: soft
+
+"koishi-plugin-yesimbot-xiaoheihe@workspace:plugins/xiaoheihe":
+  version: 0.0.0-use.local
+  resolution: "koishi-plugin-yesimbot-xiaoheihe@workspace:plugins/xiaoheihe"
+  dependencies:
+    "@modelcontextprotocol/sdk": "npm:^1.29.0"
+    "@yesimbot/agent-runtime": "workspace:^"
+    koishi: "npm:^4.18.11"
+    koishi-plugin-yesimbot: "workspace:^"
+    koishi-plugin-yesimbot-mcp-client: "workspace:^"
+    vitest: "npm:^4.0.18"
+    zod: "npm:^3.25.76"
+  peerDependencies:
+    "@satorijs/core": ^4.6.0
+    "@yesimbot/agent-runtime": "workspace:^"
+    koishi: ^4.18.11
     koishi-plugin-yesimbot: "workspace:^"
   languageName: unknown
   linkType: soft

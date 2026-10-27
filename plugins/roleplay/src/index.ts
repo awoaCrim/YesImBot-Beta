@@ -10,28 +10,23 @@ import type { CBSContext } from "./cbs.js";
 import { selectGreeting } from "./greeting.js";
 import { assembleRoleplayPrompts, type RoleplayPromptMaterial } from "./prompt.js";
 import { createRoleplayPlugin } from "./roleplay.js";
-import { loadVisualReference, type VisualReference } from "./visual-reference.js";
 
 export interface RoleplayPluginConfig {
   characterCard: string;
   useRandomGreeting?: boolean;
   enableGreeting?: boolean;
   exampleDialoguesAsHistory?: boolean;
-  enableVisualReference?: boolean;
-  visualReferenceImage?: string;
 }
 
 export default class RoleplayPlugin {
   public static readonly name = "yesimbot-roleplay";
-  public static readonly usage = "从 PNG 角色卡加载角色扮演提示词，可选附加视觉自我参照。";
+  public static readonly usage = "从 PNG 角色卡加载角色扮演提示词。";
   public static readonly inject = ["yesimbot"];
   public static readonly Config: Schema<RoleplayPluginConfig> = Schema.object({
     characterCard: Schema.path({ filters: ["file"] }).description("PNG 角色卡文件路径"),
     useRandomGreeting: Schema.boolean().default(false).description("随机选择角色卡开场白"),
     enableGreeting: Schema.boolean().default(true).description("新建空会话时注入角色卡开场白"),
     exampleDialoguesAsHistory: Schema.boolean().default(false).description("将示例对话作为角色的过去对话提供给模型，可能引入虚构经历"),
-    enableVisualReference: Schema.boolean().default(false).description("启用角色视觉自我参照；需要可原生识图的主模型，会增加视觉 token 开销"),
-    visualReferenceImage: Schema.path({ filters: ["file"] }).description("视觉自我参照图片路径（PNG/JPEG/WebP，最多 5 MiB，相对 Koishi 工作目录；开启后必填）"),
   });
 
   public readonly ctx: Context;
@@ -43,7 +38,6 @@ export default class RoleplayPlugin {
   private loadGeneration = 0;
   private card?: CharacterCardV3;
   private greeting?: string;
-  private visualReference?: VisualReference;
   private disposeAgentPlugin: (() => void) | undefined;
   private readonly promptContexts = new Map<string, CBSContext>();
   private readonly promptProfiles = new Map<string, RoleplayPromptMaterial>();
@@ -61,18 +55,11 @@ export default class RoleplayPlugin {
     this.disposeAgentPlugin?.();
     this.disposeAgentPlugin = undefined;
 
-    const visualPath = this.config.enableVisualReference === true ? this.config.visualReferenceImage?.trim() : undefined;
-    if (this.config.enableVisualReference === true && !visualPath)
-      throw new TypeError("visualReferenceImage is required when visual self-reference is enabled");
-    const [card, visualReference] = await Promise.all([
-      loadCharacterCard(resolve(this.ctx.baseDir, this.config.characterCard)),
-      visualPath ? loadVisualReference(resolve(this.ctx.baseDir, visualPath)) : undefined,
-    ]);
+    const card = await loadCharacterCard(resolve(this.ctx.baseDir, this.config.characterCard));
     if (generation !== this.loadGeneration) return;
     const greeting = selectGreeting(card, this.config.useRandomGreeting ?? false);
     this.card = card;
     this.greeting = greeting;
-    this.visualReference = visualReference;
     this.promptContexts.clear();
     this.promptProfiles.clear();
     this.disposeAgentPlugin = this.ctx.yesimbot.agent.use(this);
@@ -92,7 +79,6 @@ export default class RoleplayPlugin {
       context: this.promptContext(scope),
       managedPrompts: runtime?.rolePromptsManaged === true,
       material: this.promptMaterial(scope),
-      visualReference: this.visualReference,
     });
   }
 
@@ -100,7 +86,6 @@ export default class RoleplayPlugin {
     this.loadGeneration += 1;
     this.disposeAgentPlugin?.();
     this.disposeAgentPlugin = undefined;
-    this.visualReference = undefined;
     this.promptContexts.clear();
     this.promptProfiles.clear();
   }
@@ -112,12 +97,7 @@ export default class RoleplayPlugin {
     const cached = this.promptProfiles.get(key);
     if (cached) return cached;
     // Freeze role instructions and optional history together; setup never rerolls resolved fields.
-    const material = assembleRoleplayPrompts(
-      card,
-      this.promptContext(scope),
-      this.config.exampleDialoguesAsHistory === true,
-      this.visualReference !== undefined,
-    );
+    const material = assembleRoleplayPrompts(card, this.promptContext(scope), this.config.exampleDialoguesAsHistory === true);
     this.promptProfiles.set(key, material);
     return material;
   }

@@ -5,6 +5,7 @@ import { Context } from "koishi";
 
 import { ConversationsProvider } from "./conversations.js";
 import { PanelProvider } from "./panel.js";
+import { XiaoheiheProvider } from "./xiaoheihe.js";
 
 export const name = "yesimbot-console";
 
@@ -14,6 +15,7 @@ export function apply(ctx: Context): void {
   ctx.inject(["console", "yesimbot", "loader"], (ctx) => {
     ctx.plugin(PanelProvider);
     ctx.plugin(ConversationsProvider);
+    ctx.plugin(XiaoheiheProvider);
     ctx.console.addEntry({ dev: resolve(__dirname, "../client/index.ts"), prod: resolve(ctx.baseDir, "node_modules", PACKAGE_NAME, "dist") });
   });
 }

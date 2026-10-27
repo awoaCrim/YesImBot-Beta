@@ -11,10 +11,7 @@ const REFRESH_INTERVAL = 5_000;
 
 const PLUGIN_LABELS: Record<string, string> = {
   yesimbot: "核心",
-  "@yesimbot/provider-openai": "OpenAI",
-  "@yesimbot/provider-anthropic": "Anthropic",
-  "@yesimbot/provider-deepseek": "DeepSeek",
-  "@yesimbot/provider-google": "Google",
+  "yesimbot-model-provider": "模型接入",
   "yesimbot-command-bridge": "命令桥接",
   "yesimbot-console": "控制台",
   "yesimbot-chat-learning": "聊天学习",
@@ -26,16 +23,12 @@ const PLUGIN_LABELS: Record<string, string> = {
   "yesimbot-search-service": "搜索服务",
   "yesimbot-sticker-manager": "表情包",
   "yesimbot-usage": "用量统计",
-  "yesimbot-will-policy": "Will 策略",
   "yesimbot-workspace": "工作区",
 };
 
 const PLUGIN_ORDER = [
   "yesimbot",
-  "@yesimbot/provider-openai",
-  "@yesimbot/provider-anthropic",
-  "@yesimbot/provider-deepseek",
-  "@yesimbot/provider-google",
+  "yesimbot-model-provider",
   "yesimbot-workspace",
   "yesimbot-mcp-client",
   "yesimbot-search-service",
@@ -46,7 +39,6 @@ const PLUGIN_ORDER = [
   "yesimbot-onebot-utils",
   "yesimbot-command-bridge",
   "yesimbot-roleplay",
-  "yesimbot-will-policy",
   "yesimbot-usage",
   "yesimbot-console",
 ];
@@ -213,7 +205,7 @@ export class PanelProvider extends DataService<PanelPayload> {
   }
 }
 
-function buildPanelPayload(ctx: Context, registry: Map<string, YesImBotPackageMeta>, recent: PanelRecent[]): PanelPayload {
+export function buildPanelPayload(ctx: Context, registry: Map<string, YesImBotPackageMeta>, recent: PanelRecent[]): PanelPayload {
   const issues: PanelIssue[] = [];
   const plugins = collectPlugins(ctx, registry);
   const coreConfig = readCoreConfig(ctx);
@@ -266,6 +258,8 @@ function buildOnboarding(ctx: Context, coreConfig: ReturnType<typeof readCoreCon
       : !adapters.some((adapter) => adapter.enabled)
         ? "启用下方已安装的适配器。"
         : "配置连接并等待 Bot 在线。";
+  const providerKeys = Object.keys(flattenPluginConfig(ctx.loader.config.plugins ?? {})).filter((key) => normalizePluginKey(key) === "yesimbot-model-provider");
+  const providerKey = providerKeys.find((key) => !key.startsWith("~")) ?? providerKeys[0];
   const steps: PanelOnboardingStep[] = [
     {
       id: "adapter",
@@ -278,7 +272,7 @@ function buildOnboarding(ctx: Context, coreConfig: ReturnType<typeof readCoreCon
       id: "model",
       title: "配置模型 Provider 与 Chat 模型",
       description: "启用模型服务并指定默认 chatModel。",
-      target: hasProvider ? `/plugins/${coreConfig.configPath}` : "/plugins/provider",
+      target: hasProvider ? `/plugins/${coreConfig.configPath}` : `/plugins/${providerKey ? instancePath(providerKey) : "yesimbot-model-provider"}`,
       done: hasProvider && Boolean(coreConfig.chatModel),
     },
     {
@@ -404,38 +398,59 @@ function readModelState(ctx: Context, config: ReturnType<typeof readCoreConfig>,
 
 function collectPlugins(ctx: Context, registry: Map<string, YesImBotPackageMeta>): PanelPlugin[] {
   const plugins = flattenPluginConfig(ctx.loader.config.plugins ?? {});
+  const providerCounts = new Map<string, number>();
+  for (const [key, value] of Object.entries(plugins)) {
+    if (key.startsWith("~")) continue;
+    const base = normalizePluginKey(key);
+    const id = providerIdFor(base, value, registry.get(base));
+    if (id !== undefined) providerCounts.set(id, (providerCounts.get(id) ?? 0) + 1);
+  }
   const result = Object.entries(plugins)
     .filter(([key]) => {
       const base = normalizePluginKey(key);
       const legacy = base === "yesimbot" || (base.startsWith("yesimbot-") && base !== "yesimbot-world") || base.startsWith("@yesimbot/");
       return registry.has(base) || legacy;
     })
-    .map(([rawKey, value]) => toPanelPlugin(rawKey, value, ctx, registry.get(normalizePluginKey(rawKey))));
+    .map(([rawKey, value]) => toPanelPlugin(rawKey, value, ctx, registry.get(normalizePluginKey(rawKey)), providerCounts));
 
   const order = new Map(PLUGIN_ORDER.map((key, index) => [key, index]));
   return result.sort((left, right) => {
-    const leftOrder = order.get(left.key) ?? Number.MAX_SAFE_INTEGER;
-    const rightOrder = order.get(right.key) ?? Number.MAX_SAFE_INTEGER;
+    const leftOrder = order.get(normalizePluginKey(left.key)) ?? Number.MAX_SAFE_INTEGER;
+    const rightOrder = order.get(normalizePluginKey(right.key)) ?? Number.MAX_SAFE_INTEGER;
     return leftOrder - rightOrder || left.key.localeCompare(right.key);
   });
 }
 
-function toPanelPlugin(rawKey: string, _value: unknown, ctx: Context, meta?: YesImBotPackageMeta): PanelPlugin {
+function providerIdFor(key: string, value: unknown, meta?: YesImBotPackageMeta): string | undefined {
+  if (key !== "yesimbot-model-provider" && meta?.kind !== "provider") return undefined;
+  const config = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  return typeof config["id"] === "string" ? config["id"] : (meta?.providerId ?? (typeof config["type"] === "string" ? config["type"] : "openai"));
+}
+
+function toPanelPlugin(
+  rawKey: string,
+  _value: unknown,
+  ctx: Context,
+  meta: YesImBotPackageMeta | undefined,
+  providerCounts: ReadonlyMap<string, number>,
+): PanelPlugin {
   const enabled = !rawKey.startsWith("~");
   const raw = enabled ? rawKey : rawKey.slice(1);
   const key = normalizePluginKey(raw);
   const value = _value && typeof _value === "object" ? (_value as Record<string, unknown>) : {};
   const label = meta?.label ?? (typeof value["$label"] === "string" ? value["$label"] : (PLUGIN_LABELS[key] ?? key));
+  const providerId = providerIdFor(key, value, meta);
   let status: PanelPlugin["status"] = enabled ? "enabled" : "disabled";
   let detail = enabled ? "已启用" : "未启用";
 
   if (key === "yesimbot") {
     detail = "核心服务";
-  } else if (key.startsWith("@yesimbot/provider-")) {
-    const packageId = key.slice("@yesimbot/provider-".length);
-    const providerId = meta?.providerId ?? (typeof value["id"] === "string" ? value["id"] : packageId);
+  } else if (providerId !== undefined) {
     if (!enabled) {
       status = "disabled";
+    } else if ((providerCounts.get(providerId) ?? 0) > 1) {
+      status = "attention";
+      detail = `重复的 provider 标识：${providerId}`;
     } else if (!ctx.yesimbot.model.listProviders().includes(providerId)) {
       status = "attention";
       detail = `已启用但 provider 未注册：${providerId}`;
@@ -444,7 +459,7 @@ function toPanelPlugin(rawKey: string, _value: unknown, ctx: Context, meta?: Yes
     }
   }
 
-  return { key, label, enabled, status, detail, configPath: instancePath(raw) };
+  return { key: rawKey, label, enabled, status, detail, configPath: instancePath(raw) };
 }
 
 function instancePath(key: string): string {

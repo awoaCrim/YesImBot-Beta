@@ -11,7 +11,11 @@ const logger = { error: vi.fn() };
 
 async function promptFor(provider: "tavily" | "searxng"): Promise<string> {
   const serviceLogger = { error: vi.fn(), info: vi.fn() };
-  const ctx = { logger: vi.fn(() => serviceLogger), on: vi.fn(), yesimbot: { agent: { use: vi.fn(() => () => undefined) } } };
+  const ctx = {
+    logger: vi.fn(() => serviceLogger),
+    on: vi.fn(),
+    yesimbot: { agent: { use: vi.fn(() => () => undefined) }, resource: { get: vi.fn(async () => ({ artifacts: { forTool: () => ({ put: vi.fn() }) } })) } },
+  };
   const config =
     provider === "tavily"
       ? { provider, tavily: { apiKey: "test", searchEndpoint: "https://example.com/search", extractEndpoint: "https://example.com/extract" } }
@@ -20,8 +24,9 @@ async function promptFor(provider: "tavily" | "searxng"): Promise<string> {
 
   await service.start();
   try {
-    const plugin = service.setup({} as never, {} as never);
-    return (plugin?.appendSystemPrompt as () => string)();
+    const plugin = await service.setup({} as never, {} as never);
+    if (!plugin) throw new Error("Expected search plugin");
+    return (plugin.appendSystemPrompt as () => string)();
   } finally {
     await service.stop();
   }

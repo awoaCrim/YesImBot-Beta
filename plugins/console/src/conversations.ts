@@ -39,12 +39,6 @@ export interface ConversationChannelSummary {
   readonly sessions: ConversationSessionSummary[];
   readonly totalSizeBytes: number;
   readonly lastActivityAt: number | null;
-  readonly will: ConversationChannelWill;
-}
-
-export interface ConversationChannelWill {
-  readonly matched: ConversationWillPolicy | null;
-  readonly candidates: readonly ConversationWillPolicy[];
 }
 
 export interface ConversationSessionSummary {
@@ -61,21 +55,6 @@ export interface ConversationIndex {
   readonly totalChannels: number;
   readonly totalSessions: number;
   readonly totalSizeBytes: number;
-  readonly will: ConversationWillSummary;
-}
-
-export interface ConversationWillPolicy {
-  readonly id: string;
-  readonly enabled: boolean;
-  readonly engine: "routing" | "willingness";
-  readonly priority?: number;
-  readonly config?: Record<string, unknown>;
-}
-
-export interface ConversationWillSummary {
-  readonly installed: boolean;
-  readonly defaultLabel: string;
-  readonly policies: ConversationWillPolicy[];
 }
 
 export interface ConversationEntryView {
@@ -137,16 +116,6 @@ interface ChannelManifest {
   readonly createdAt: string;
 }
 
-interface ChannelMatchContext {
-  readonly platform: string;
-  readonly channelId: string;
-  readonly guildId?: string;
-  readonly selfId?: string;
-  readonly userId?: string;
-  readonly type: "channel" | "guild" | "direct";
-  readonly isDirect: boolean;
-}
-
 interface RawEntry {
   readonly id?: unknown;
   readonly timestamp?: unknown;
@@ -187,8 +156,8 @@ export class ConversationsProvider extends DataService<ConversationIndex> {
   private timer: (() => void) | undefined;
 
   public constructor(public readonly ctx: Context) {
-    super(ctx, "yesimbotConversations");
-    ctx.console.addListener("yesimbot/conversation", (input) => readConversationDetail(ctx, input));
+    super(ctx, "yesimbotConversations", { authority: 4 });
+    ctx.console.addListener("yesimbot/conversation", (input) => readConversationDetail(ctx, input), { authority: 4 });
     ctx.on("ready", () => {
       this.refresh();
       this.timer = ctx.setInterval(() => this.refresh(), REFRESH_INTERVAL);
@@ -242,132 +211,37 @@ export async function readConversationPage(
   return readSessionEntries(filePath, session, channelRoot, request, info.size);
 }
 
-export async function buildConversationIndex(ctx: Context): Promise<ConversationIndex> {
+export async function buildConversationIndex(ctx: Context, filter?: (manifest: ChannelManifest) => boolean): Promise<ConversationIndex> {
   const channelsPath = resolveChannelsPath(ctx);
-  const will = collectWillPolicies(ctx);
-  const channels = await scanChannelSummaries(ctx, channelsPath, will.policies);
+  const channels = await scanChannelSummaries(channelsPath, filter);
   return {
     generatedAt: new Date().toISOString(),
     channels,
     totalChannels: channels.length,
     totalSessions: channels.reduce((sum, channel) => sum + channel.sessions.length, 0),
     totalSizeBytes: channels.reduce((sum, channel) => sum + channel.totalSizeBytes, 0),
-    will,
   };
 }
 
-function collectWillPolicies(ctx: Context): ConversationWillSummary {
-  const plugins = flattenPluginConfig(ctx.loader.config.plugins ?? {});
-  const policies: ConversationWillPolicy[] = [];
-  for (const [rawKey, value] of Object.entries(plugins)) {
-    if (normalizePluginKey(rawKey) !== "yesimbot-will-policy") continue;
-    const config = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
-    policies.push({
-      id: rawKey,
-      enabled: !rawKey.startsWith("~"),
-      engine: config.engine === "willingness" ? "willingness" : "routing",
-      priority: typeof config.priority === "number" ? config.priority : undefined,
-      config,
-    });
-  }
-  return {
-    installed: policies.some((policy) => policy.enabled),
-    defaultLabel: "默认策略：私聊与 @ 触发，普通群聊等待",
-    policies,
-  };
-}
-
-function matchChannelWill(context: ChannelMatchContext, policies: readonly ConversationWillPolicy[]): ConversationChannelWill {
-  const enabled = policies.filter((policy) => policy.enabled);
-  const sorted = [...enabled].sort((left, right) => (left.priority ?? Number.MAX_SAFE_INTEGER) - (right.priority ?? Number.MAX_SAFE_INTEGER));
-  const matched = sorted.find((policy) => matchesFilter(policy.config?.["$filter"], context)) ?? null;
-  return { matched, candidates: enabled };
-}
-
-function matchesFilter(filter: unknown, context: ChannelMatchContext): boolean {
-  if (filter === undefined || filter === null) return true;
-  if (Array.isArray(filter)) return filter.some((item) => matchesFilter(item, context));
-  if (typeof filter !== "object") return true;
-  for (const [key, raw] of Object.entries(filter as Record<string, unknown>)) {
-    if (key === "$or") {
-      if (!Array.isArray(raw) || !raw.some((item) => matchesFilter(item, context))) return false;
-      continue;
-    }
-    if (key === "$and") {
-      if (!Array.isArray(raw) || !raw.every((item) => matchesFilter(item, context))) return false;
-      continue;
-    }
-    if (key === "$not") {
-      if (matchesFilter(raw, context)) return false;
-      continue;
-    }
-    if (key.startsWith("$")) continue;
-    if (!matchesValue(channelField(context, key), raw)) return false;
-  }
-  return true;
-}
-
-function matchesValue(actual: string | boolean | undefined, expected: unknown): boolean {
-  if (expected === undefined || expected === null) return actual === undefined;
-  if (Array.isArray(expected)) return expected.some((item) => String(item) === String(actual));
-  if (typeof expected === "object" && expected !== null) {
-    const expression = expected as Record<string, unknown>;
-    if ("$in" in expression) return Array.isArray(expression.$in) && expression.$in.some((item) => String(item) === String(actual));
-    if ("$nin" in expression) return !(Array.isArray(expression.$nin) && expression.$nin.some((item) => String(item) === String(actual)));
-    if ("$ne" in expression) return String(expression.$ne) !== String(actual);
-    if ("$eq" in expression) return String(expression.$eq) === String(actual);
-  }
-  return String(expected) === String(actual);
-}
-
-function channelField(context: ChannelMatchContext, key: string): string | boolean | undefined {
-  switch (key) {
-    case "platform":
-      return context.platform;
-    case "channelId":
-      return context.channelId;
-    case "guildId":
-      return context.guildId;
-    case "selfId":
-      return context.selfId;
-    case "userId":
-      return context.userId;
-    case "type":
-      return context.type;
-    case "subtype":
-      return context.isDirect ? "private" : "group";
-    case "isDirect":
-      return context.isDirect;
-    default:
-      return undefined;
-  }
-}
-
-async function scanChannelSummaries(ctx: Context, channelsPath: string, policies: readonly ConversationWillPolicy[]): Promise<ConversationChannelSummary[]> {
-  const entries = await readdir(channelsPath, { withFileTypes: true }).catch(() => []);
+async function scanChannelSummaries(channelsPath: string, filter?: (manifest: ChannelManifest) => boolean): Promise<ConversationChannelSummary[]> {
+  const entries = await readdir(channelsPath, { withFileTypes: true }).catch((cause: NodeJS.ErrnoException) => {
+    if (filter && cause.code !== "ENOENT") throw new Error("Conversation index unavailable");
+    return [];
+  });
   const channels: ConversationChannelSummary[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
     const root = join(channelsPath, entry.name);
-    const manifest = await readChannelManifest(join(root, "channel.json"));
-    if (!manifest) continue;
+    const manifest = await readChannelManifest(join(root, "channel.json"), Boolean(filter));
+    if (!manifest || (filter && !filter(manifest))) continue;
     const sessionsPath = join(root, "sessions");
-    const sessions = await scanSessionSummaries(sessionsPath);
+    const sessions = await scanSessionSummaries(sessionsPath, Boolean(filter));
     const activeSession = sessions.find((session) => session.isActive)?.filename ?? null;
-    const matchContext: ChannelMatchContext = {
-      platform: manifest.platform,
-      channelId: manifest.channelId ?? manifest.guildId ?? "",
-      guildId: manifest.guildId,
-      selfId: manifest.selfId,
-      userId: manifest.userId,
-      type: manifest.type,
-      isDirect: manifest.type === "direct",
-    };
     channels.push({
       key: entry.name,
       type: manifest.type,
       platform: manifest.platform,
-      channelId: matchContext.channelId,
+      channelId: manifest.channelId ?? manifest.guildId ?? "",
       guildId: manifest.guildId,
       userId: manifest.userId,
       selfId: manifest.selfId,
@@ -379,13 +253,12 @@ async function scanChannelSummaries(ctx: Context, channelsPath: string, policies
         if (latest === null || session.lastActivityAt > latest) return session.lastActivityAt;
         return latest;
       }, null),
-      will: matchChannelWill(matchContext, policies),
     });
   }
   return channels.sort((left, right) => (right.lastActivityAt ?? 0) - (left.lastActivityAt ?? 0));
 }
 
-async function readChannelManifest(filePath: string): Promise<ChannelManifest | undefined> {
+async function readChannelManifest(filePath: string, strict = false): Promise<ChannelManifest | undefined> {
   try {
     const raw = JSON.parse(await readFile(filePath, "utf8")) as unknown;
     if (typeof raw !== "object" || raw === null) return undefined;
@@ -401,13 +274,21 @@ async function readChannelManifest(filePath: string): Promise<ChannelManifest | 
       selfId: typeof value.selfId === "string" ? value.selfId : undefined,
       createdAt: value.createdAt,
     };
-  } catch {
+  } catch (cause) {
+    if (strict && (cause as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("Channel manifest unavailable");
     return undefined;
   }
 }
 
-async function scanSessionSummaries(sessionsPath: string): Promise<ConversationSessionSummary[]> {
-  const filenames = (await readdir(sessionsPath).catch(() => [])).filter((name) => SESSION_FILE.test(name)).sort();
+async function scanSessionSummaries(sessionsPath: string, strict = false): Promise<ConversationSessionSummary[]> {
+  const filenames = (
+    await readdir(sessionsPath).catch((cause: NodeJS.ErrnoException) => {
+      if (strict && cause.code !== "ENOENT") throw new Error("Session index unavailable");
+      return [];
+    })
+  )
+    .filter((name) => SESSION_FILE.test(name))
+    .sort();
   const sessions: ConversationSessionSummary[] = [];
   for (const filename of filenames) {
     try {
@@ -419,7 +300,8 @@ async function scanSessionSummaries(sessionsPath: string): Promise<ConversationS
         createdAt: basename(filename, ".jsonl"),
         lastActivityAt: info.mtimeMs,
       });
-    } catch {
+    } catch (cause) {
+      if (strict && (cause as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("Session index unavailable");
       continue;
     }
   }

@@ -11,7 +11,7 @@ import { z } from "zod";
 vi.mock("koishi", async () => import("@koishijs/core"));
 vi.mock("../src/agents/tools.js", async (original) => ({ ...(await original<object>()), pacedDelay: () => 0 }));
 
-import { apply as applyGoogle } from "../../providers/google/src/index.js";
+import { apply as applyGoogle } from "../../providers/model-provider/src/google.js";
 import { Channel } from "../src/channels/index.js";
 import { createDeliveredTranscriptMessage } from "../src/conversations/delivered-transcript.js";
 import { isReplyDeliveryProof, replyToolValue } from "../src/conversations/reply-receipt.js";

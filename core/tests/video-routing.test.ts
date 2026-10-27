@@ -6,12 +6,12 @@ const primary = (video: boolean, transport: "native" | "unsupported" | "unknown"
   ({
     fullId: "fixture:gemini-3.8-flash-high",
     entry: { modalities: { input: video ? ["text", "image", "video"] : ["text", "image"] } },
-    capabilities: { imageToolResult: "native", videoToolResult: transport },
+    capabilities: { imageToolResult: "native", videoInput: transport },
     model: { id: "main" },
   }) as never;
 
 describe("native video main-route admission", () => {
-  it("requires explicit Core flag, primary video modality and native transport together", () => {
+  it("uses one Core flag with primary video modality and adapter-declared native input", () => {
     expect(resolveReadVideoPolicy(primary(true, "native"), true)).toMatchObject({ mode: "native" });
     expect(resolveReadVideoPolicy(primary(true, "native"), false)).toMatchObject({ mode: "unavailable" });
     expect(resolveReadVideoPolicy(primary(false, "native"), true)).toMatchObject({ mode: "unavailable" });

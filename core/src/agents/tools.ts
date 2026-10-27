@@ -12,8 +12,10 @@ import {
   prepareOutputSegments,
   ResourceReadError,
   VIDEO_MAX_BYTES,
+  VIDEO_SOURCE_MAX_BYTES,
   type ChannelResources,
 } from "../resources/index.js";
+import { prepareVideoForModel, VideoCompressionError } from "../resources/video-compression.js";
 import { ContextBudgetError } from "../runtimes/context-budget.js";
 import type { ContextWorkspace, ContextBlocksInput, ContextLoadInput } from "../runtimes/context-workspace.js";
 import { describeImageBytes } from "./image-preview.js";
@@ -33,6 +35,8 @@ export type ResourceReadResult = {
   text?: string;
   imageMode?: ReadImageMode;
   videoMode?: VideoReadMode;
+  videoCompressed?: boolean;
+  sourceBytes?: number;
   error?: string;
 };
 
@@ -218,12 +222,12 @@ export function createReadTool(
    * One successful native video read per turn. The synchronous reservation happens before any
    * projection work, so repeated call ids, retries or a stale TTL can never grant a second payload.
    */
-  const readVideo = (uri: string, opened: { bytes: Uint8Array; mediaType?: string }, execution: ReadExecution): ResourceReadResult => {
+  const readVideo = async (uri: string, opened: { bytes: Uint8Array; mediaType?: string }, execution: ReadExecution): Promise<ResourceReadResult> => {
     const abortSignal = execution.abortSignal;
     if (videoPolicy?.mode !== "native" || !resources.videoInput || !videoProjection) {
       return { uri, mediaType: opened.mediaType, videoMode: "unavailable", error: "video_input_unavailable", text: "模型没有看到视频内容。" };
     }
-    if (opened.bytes.byteLength > VIDEO_MAX_BYTES) {
+    if (opened.bytes.byteLength > VIDEO_SOURCE_MAX_BYTES) {
       return { uri, mediaType: opened.mediaType, videoMode: "unavailable", error: "resource_too_large", text: "模型没有看到视频内容。" };
     }
     if (abortSignal?.aborted) {
@@ -238,12 +242,24 @@ export function createReadTool(
         text: "本回合已经成功读取过一个视频；本轮不会再次提供视频内容。",
       };
     }
+    let bytes: Uint8Array;
+    try {
+      bytes = await prepareVideoForModel(opened.bytes, { signal: abortSignal });
+    } catch (cause) {
+      videoPolicy.release?.(execution.turnId, execution.toolCallId);
+      return {
+        uri,
+        videoMode: "unavailable",
+        error: cause instanceof VideoCompressionError ? cause.code : "video_compression_failed",
+        text: "视频未能准备完成，模型没有看到视频内容。",
+      };
+    }
     const owner = {};
     if (
       !videoProjection.stage({
         toolCallId: execution.toolCallId,
         turnId: execution.turnId,
-        bytes: opened.bytes,
+        bytes,
         mediaType: "video/mp4",
         owner,
         ...(abortSignal === undefined ? {} : { signal: abortSignal }),
@@ -260,8 +276,12 @@ export function createReadTool(
     const result: ResourceReadResult = {
       uri,
       mediaType: "video/mp4",
-      text: `[视频资源，video/mp4，${formatBytes(opened.bytes.byteLength)}]`,
+      text:
+        opened.bytes.byteLength > VIDEO_MAX_BYTES
+          ? `[视频资源，压缩版，video/mp4，${formatBytes(bytes.byteLength)}；原件 ${formatBytes(opened.bytes.byteLength)}，画质或音质可能降低]`
+          : `[视频资源，video/mp4，${formatBytes(bytes.byteLength)}]`,
       videoMode: "native",
+      ...(opened.bytes.byteLength > VIDEO_MAX_BYTES ? { videoCompressed: true, sourceBytes: opened.bytes.byteLength } : {}),
     };
     videoOwners.set(result, owner);
     return result;
@@ -280,7 +300,7 @@ export function createReadTool(
   }
   lines.push(
     "",
-    "返回 {uri, filename?, mediaType?, text?, imageMode?, videoMode?, error?}。",
+    "返回 {uri, filename?, mediaType?, text?, imageMode?, videoMode?, videoCompressed?, sourceBytes?, error?}。",
     "- 文本资源在 text 中直接给出内容，过长会被截断并以 [内容已截断] 结尾。",
   );
   if (policy.mode === "native") {
@@ -292,14 +312,14 @@ export function createReadTool(
   }
   if (videoPolicy?.mode === "native" && videoProjection && resources.videoInput) {
     lines.push(
-      "- 视频资源：仅支持不超过 10 MiB 的 MP4 频道资产。原文件随工具结果交给当前主模型，不调用其他模型或抽帧；本轮最多成功读取一个视频。声音识别不作保证，不可用时返回 videoMode=unavailable 与 error。",
+      "- 视频资源：支持原件不超过 200 MiB 的 MP4 频道资产，超过 50 MiB 时自动压缩后再提供，原件保留。压缩不截短视频时长并保留主音轨，但可能降低画质或音质；videoCompressed=true 表示你看到的是压缩版。读取成功后视频作为本轮用户输入交给当前主模型，不调用其他模型或抽帧；本轮最多成功读取一个视频。声音识别不作保证，不可用时返回 videoMode=unavailable 与 error。",
     );
   } else {
     lines.push("- 视频资源只返回明确的不可用结果，当前无法查看视频内容；不要根据文件名或上下文猜测画面。");
   }
   lines.push(
     "- 其他二进制只给出类型与大小，无法查看内容。",
-    "- error 可能为：invalid_resource_uri、resource_not_found、resource_unavailable、resource_too_large、resource_not_video、timeout、resource_read_aborted、resource_read_failed、invalid_image_data、vision_call_failed、video_input_unavailable、video_turn_limit 或 image_input_unavailable。",
+    "- error 可能为：invalid_resource_uri、resource_not_found、resource_unavailable、resource_too_large、resource_not_video、timeout、resource_read_aborted、resource_read_failed、invalid_image_data、vision_call_failed、video_input_unavailable、video_turn_limit、video_compression_unavailable、video_compression_failed 或 image_input_unavailable。",
   );
 
   return {

@@ -1,10 +1,10 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { parseConversationJsonl, readConversationPage } from "../src/conversations.js";
+import { buildConversationIndex, parseConversationJsonl, readConversationPage } from "../src/conversations.js";
 
 vi.mock("@koishijs/loader", () => ({}));
 
@@ -22,6 +22,37 @@ describe("parseConversationJsonl", () => {
     expect(entries.find((entry) => entry.kind === "user")?.assets?.[0]).toMatchObject({
       kind: "file",
       title: "notes.txt",
+    });
+  });
+});
+
+describe("conversation index without retired policy configuration", () => {
+  it("preserves configured storage/history while omitting plugin-specific policy payloads", async () => {
+    await withTempContent("", async (_file, root) => {
+      const channel = join(root, "channels", "shared-test-room");
+      await mkdir(join(channel, "sessions"), { recursive: true });
+      await writeFile(
+        join(channel, "channel.json"),
+        JSON.stringify({ type: "guild", platform: "test", channelId: "room", createdAt: "2026-10-23T00:00:00.000Z" }),
+      );
+      const index = await buildConversationIndex({
+        baseDir: root,
+        loader: {
+          config: {
+            plugins: {
+              "group:yesimbot": {
+                yesimbot: { basePath: "." },
+                "yesimbot-will-policy:old": { engine: "willingness", privateOption: "must-not-leak" },
+              },
+            },
+          },
+        },
+      } as never);
+      expect(index.totalChannels).toBe(1);
+      expect(index.channels[0]).toMatchObject({ platform: "test", channelId: "room", sessions: [] });
+      expect(index).not.toHaveProperty("will");
+      expect(index.channels[0]).not.toHaveProperty("will");
+      expect(JSON.stringify(index)).not.toContain("must-not-leak");
     });
   });
 });

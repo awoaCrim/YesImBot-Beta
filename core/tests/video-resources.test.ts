@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("koishi", async () => import("@koishijs/core"));
 import { h } from "koishi";
 
-import { ChannelResources, detectVideoMediaType, RESOURCE_MAX_BYTES, VIDEO_MAX_BYTES } from "../src/resources/index.js";
+import { ChannelResources, detectVideoMediaType, RESOURCE_MAX_BYTES, VIDEO_MAX_BYTES, VIDEO_SOURCE_MAX_BYTES } from "../src/resources/index.js";
 import { PNG_BYTES } from "./helpers/index.js";
 import { VIDEO_BYTES, paddedVideo } from "./helpers/video.js";
 
@@ -62,7 +62,8 @@ afterEach(async () => {
 
 describe("native MP4 validation and bounded input", () => {
   it("accepts real video, rejects ftyp-only/audio-only files and keeps canonical limits separate", () => {
-    expect(VIDEO_MAX_BYTES).toBe(10 * 1024 * 1024);
+    expect(VIDEO_MAX_BYTES).toBe(50 * 1024 * 1024);
+    expect(VIDEO_SOURCE_MAX_BYTES).toBe(200 * 1024 * 1024);
     expect(RESOURCE_MAX_BYTES).toBe(5 * 1024 * 1024);
     expect(detectVideoMediaType(VIDEO_BYTES)).toBe("video/mp4");
     const ftypLength = new DataView(VIDEO_BYTES.buffer, VIDEO_BYTES.byteOffset).getUint32(0);
@@ -108,7 +109,7 @@ describe("native MP4 validation and bounded input", () => {
     expect(ctx.http.mock.calls[0]).toEqual([expect.any(String), expect.objectContaining({ timeout: 1000, responseType: "stream" })]);
   });
 
-  it("accepts exact 10 MiB without lending the allowance to normal reads/non-video assets", async () => {
+  it("accepts exact 50 MiB without lending the allowance to normal reads/non-video assets", async () => {
     const owner = await resources();
     const bytes = paddedVideo(VIDEO_MAX_BYTES);
     const [element] = await owner.persistElements(context(bytes) as never, [video()]);
@@ -125,9 +126,19 @@ describe("native MP4 validation and bounded input", () => {
     await expect(owner.openVideoAssetStrict("asset://" + imageId)).rejects.toThrow();
   });
 
+  it("persists an oversized original unchanged for on-demand compression without widening normal reads", async () => {
+    const owner = await resources();
+    const bytes = paddedVideo(VIDEO_MAX_BYTES + 1);
+    const [element] = await owner.persistElements(context(bytes) as never, [video()]);
+    const id = createHash("sha256").update(bytes).digest("hex").slice(0, 32);
+    expect(element!.attrs.id).toBe(id);
+    await expect(owner.openStrict("asset://" + id)).rejects.toMatchObject({ code: "resource_too_large" });
+    const original = await owner.openVideoAssetStrict("asset://" + id);
+    expect(createHash("sha256").update(original.bytes).digest("hex")).toBe(createHash("sha256").update(bytes).digest("hex"));
+  });
+
   it.each([
-    { bytes: paddedVideo(VIDEO_MAX_BYTES + 1), headers: {} },
-    { bytes: VIDEO_BYTES, headers: { "content-length": String(VIDEO_MAX_BYTES + 1) } },
+    { bytes: VIDEO_BYTES, headers: { "content-length": String(VIDEO_SOURCE_MAX_BYTES + 1) } },
     { bytes: VIDEO_BYTES, headers: { "content-type": "text/html" } },
     { bytes: VIDEO_BYTES, headers: { "content-type": "video/webm" } },
     { bytes: PNG_BYTES, headers: { "content-type": "video/mp4" } },
@@ -177,7 +188,7 @@ describe("native MP4 validation and bounded input", () => {
     expect(ctx.http).not.toHaveBeenCalled();
   });
 
-  it.each(["data:video/mp4;base64,", "base64://"])("accepts exact 10 MiB from %s with padded base64", async (prefix) => {
+  it.each(["data:video/mp4;base64,", "base64://"])("accepts exact 50 MiB from %s with padded base64", async (prefix) => {
     const owner = await resources();
     const bytes = paddedVideo(VIDEO_MAX_BYTES);
     const ctx = context();

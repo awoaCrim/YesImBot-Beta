@@ -91,6 +91,22 @@ describe("WorkspacePlugin", () => {
     }
   });
 
+  it("exposes HTML rendering to scheduled turns without granting host execution", async () => {
+    const fixture = await createWorkspace({ htmlRendererUrl: "http://renderer.internal/render", bash: { cwd: "/home/workspace", mounts: [] } });
+    try {
+      await fixture.plugin.start();
+      const plugin = await fixture.plugin.setup({ type: "guild", platform: "test", channelId: "room", guildId: "room" });
+      if (!plugin || typeof plugin.tools !== "function") throw new Error("Workspace tools missing");
+      const tools = (await plugin.tools({} as never)) ?? [];
+      const filtered = (await plugin.filterTools?.(tools, { messages: [] } as never)) ?? tools;
+      expect(filtered.map((tool) => tool.name)).toContain("render_html");
+      expect(filtered.map((tool) => tool.name)).not.toContain("hostExec");
+    } finally {
+      await fixture.plugin.stop();
+      await rm(fixture.baseDir, { recursive: true, force: true });
+    }
+  });
+
   it("only provides the sandbox virtual filesystem backend", async () => {
     const fixture = await createWorkspace();
     try {

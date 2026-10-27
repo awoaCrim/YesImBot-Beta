@@ -8,7 +8,7 @@ import type { AssetStore } from "./asset.js";
 import { isImageFailureCode, type ImageFailureCode } from "./image-failure.js";
 import type { ChannelResources } from "./index.js";
 import { isVideoFailureCode, type VideoFailureCode } from "./video-failure.js";
-import { detectVideoMediaType, VIDEO_MAX_BYTES } from "./video-media.js";
+import { detectVideoMediaType, VIDEO_SOURCE_MAX_BYTES } from "./video-media.js";
 
 const DATA_URL = /^data:([^;,]+)(;base64)?,([\s\S]*)$/;
 const BASE64_URL = /^base64:\/\/([\s\S]*)$/;
@@ -133,16 +133,17 @@ async function storeVideo(ctx: Context, element: Element, store: AssetStore, bud
   if (typeof source !== "string" || source.trim().length === 0) return failedVideo("missing_source");
   if (budget.videos >= MAX_VIDEOS) return failedVideo("video_limit");
   budget.videos += 1;
-  const remaining = VIDEO_MAX_BYTES - budget.videoBytes;
+  const remaining = VIDEO_SOURCE_MAX_BYTES - budget.videoBytes;
   if (remaining <= 0) return failedVideo("total_size_limit");
 
   let data: Uint8Array;
   try {
-    data = await loadResource(ctx, source, "video", Math.min(VIDEO_MAX_BYTES, remaining), budget.timeoutMs);
+    data = await loadResource(ctx, source, "video", Math.min(VIDEO_SOURCE_MAX_BYTES, remaining), budget.timeoutMs);
   } catch (cause) {
     return failedVideo(cause instanceof InputResourceError && isVideoFailureCode(cause.code) ? cause.code : "download_failed");
   }
-  if (budget.videoBytes + data.byteLength > VIDEO_MAX_BYTES || !detectVideoMediaType(data)) return failedVideo("not_video");
+  if (budget.videoBytes + data.byteLength > VIDEO_SOURCE_MAX_BYTES) return failedVideo("too_large");
+  if (!detectVideoMediaType(data)) return failedVideo("not_video");
 
   // Reserve the bytes before awaiting the store so concurrent elements cannot exceed the pool.
   budget.videoBytes += data.byteLength;

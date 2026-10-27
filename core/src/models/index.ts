@@ -39,8 +39,8 @@ export type ImageToolResultSupport = "native" | "unsupported" | "unknown";
 
 export type ImageMediaType = "image/png" | "image/jpeg" | "image/gif" | "image/webp";
 
-/** Explicit native video-tool-result transport declaration; absent or invalid normalizes unknown. */
-export type VideoToolResultSupport = "native" | "unsupported" | "unknown";
+/** Native user-video transport; absent or invalid declarations fail closed. */
+export type VideoInputSupport = "native" | "unsupported" | "unknown";
 
 export type HistoryProjectionMode = "default" | "gemini-native";
 
@@ -48,7 +48,7 @@ export interface ChatModelCapabilities {
   readonly imageToolResult: ImageToolResultSupport;
   /** Optional route-specific allowlist for native image tool-result media. */
   readonly imageToolResultMediaTypes?: readonly ImageMediaType[];
-  readonly videoToolResult?: VideoToolResultSupport;
+  readonly videoInput?: VideoInputSupport;
   readonly historyProjection?: HistoryProjectionMode;
 }
 
@@ -217,12 +217,8 @@ export class ModelService {
           ? declaredCapabilities.imageToolResult
           : "unknown",
       ...(imageToolResultMediaTypes === undefined ? {} : { imageToolResultMediaTypes }),
-      // Never inferred from names, image support or an OpenAI-compatible label: only an explicit
-      // native/unsupported declaration enables or denies video transport.
-      videoToolResult:
-        declaredCapabilities?.videoToolResult === "native" || declaredCapabilities?.videoToolResult === "unsupported"
-          ? declaredCapabilities.videoToolResult
-          : "unknown",
+      videoInput:
+        declaredCapabilities?.videoInput === "native" || declaredCapabilities?.videoInput === "unsupported" ? declaredCapabilities.videoInput : "unknown",
       historyProjection: declaredCapabilities?.historyProjection === "gemini-native" ? "gemini-native" : "default",
     };
     return {

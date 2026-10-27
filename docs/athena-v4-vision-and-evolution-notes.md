@@ -175,7 +175,7 @@ World state、主动行为、学习型 WillEngine、跨频道资源中心和额�
 
 | 方向 | 当前态度 | 重新启动的条件 |
 | --- | --- | --- |
-| 群聊 willingness | 基础 routing/willingness 已实现；学习型或评分型版本延后 | 有可解释输入、离线样本和评估方法 |
+| 群聊 willingness | 捆绑的 will-policy 已移除；Core 保留私聊/@ 默认触发和通用 Will 扩展，学习型或评分型版本延后 | 有可解释输入、离线样本和评估方法 |
 | 标准事件消费者 | 候选 Slice | 明确事件到 agent context 的路由与幂等 |
 | World state | 非当前需求 | 出现独立于聊天历史的具体状态查询需求 |
 | 主动行动 | 长期愿景 | 具备权限、预算、审计和停止机制 |

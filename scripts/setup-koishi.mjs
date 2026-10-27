@@ -14,6 +14,14 @@ const MIN_NODE_MAJOR = 18;
 const MIN_YARN_MAJOR = 4;
 const CREATE_KOISHI_VERSION = "6.4.0";
 const TURBO_CONCURRENCY = process.env.YESIMBOT_TURBO_CONCURRENCY ?? "2";
+const RETIRED_PLUGIN_PACKAGES = new Set([
+  "@yesimbot/koishi-plugin-provider-openai",
+  "@yesimbot/koishi-plugin-provider-anthropic",
+  "@yesimbot/koishi-plugin-provider-google",
+  "@yesimbot/koishi-plugin-provider-deepseek",
+  "koishi-plugin-yesimbot-will-policy",
+]);
+const RETIRED_PLUGIN_KEYS = new Set([...RETIRED_PLUGIN_PACKAGES].map(configKey));
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const yesimbotRoot = path.resolve(scriptDir, "..");
@@ -24,21 +32,23 @@ const setupLogPath = path.join(yesimbotRoot, "yesimbot-setup.log");
 const parsed = parseArgs();
 let appRoot;
 let requireApp;
-try {
-  if (!parsed.help) {
-    ensureNode();
-    ensureGit();
-    ensureYarn({ prepare: !parsed.check });
+function bootstrap() {
+  try {
+    if (!parsed.help) {
+      ensureNode();
+      ensureGit();
+      ensureYarn({ prepare: !parsed.check });
+      appRoot = resolveAppRoot();
+      requireApp = createRequire(path.join(appRoot, "package.json"));
+    }
+    main();
+  } catch (error) {
+    const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
+    writeSetupLog(detail);
+    console.error(`[yesimbot-setup] setup failed; log written to ${setupLogPath}`);
+    console.error(detail);
+    process.exit(1);
   }
-  appRoot = resolveAppRoot();
-  requireApp = createRequire(path.join(appRoot, "package.json"));
-  if (!parsed.help) main();
-} catch (error) {
-  const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
-  writeSetupLog(detail);
-  console.error(`[yesimbot-setup] setup failed; log written to ${setupLogPath}`);
-  console.error(detail);
-  process.exit(1);
 }
 
 function parseArgs() {
@@ -395,22 +405,20 @@ function saveAppPath() {
   fs.writeFileSync(stateFile, `${appRoot}\n`);
 }
 
-function collectPluginPackages() {
+function collectPluginPackages(root = yesimbotRoot) {
   const files = [];
-
-  function walk(directory) {
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      if ([".git", ".yarn", "node_modules", "dist", "references"].includes(entry.name)) continue;
-      const fullPath = path.join(directory, entry.name);
-      if (entry.isDirectory()) {
-        walk(fullPath);
-      } else if (entry.name === "package.json") {
-        files.push(fullPath);
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  for (const workspace of manifest.workspaces) {
+    if (workspace.endsWith("/*")) {
+      const parent = path.join(root, workspace.slice(0, -2));
+      if (!fs.existsSync(parent)) continue;
+      for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
+        if (entry.isDirectory()) files.push(path.join(parent, entry.name, "package.json"));
       }
+    } else {
+      files.push(path.join(root, workspace, "package.json"));
     }
   }
-
-  walk(yesimbotRoot);
 
   const plugins = [];
   for (const file of files) {
@@ -468,6 +476,7 @@ function belongsToYesImBotRoot(name) {
 
 function packagePathInYesImBot(name) {
   if (name === "koishi-plugin-yesimbot") return "core";
+  if (name === "koishi-plugin-yesimbot-model-provider") return "providers/model-provider";
   if (name.startsWith("@yesimbot/koishi-plugin-provider-")) {
     return `providers/${name.slice("@yesimbot/koishi-plugin-provider-".length)}`;
   }
@@ -539,6 +548,41 @@ function configKey(name) {
   }
   if (name.startsWith("koishi-plugin-")) return name.slice("koishi-plugin-".length);
   return name;
+}
+
+function assertSetupMigrationSafe(directory) {
+  const migrationRequired = () => {
+    throw new Error(
+      "Retired YesImBot plugins detected; migrate Provider and will-policy configuration/dependencies using docs/setup-koishi.md before setup. No application files were changed.",
+    );
+  };
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(path.join(directory, "package.json"), "utf8"));
+  } catch {
+    throw new Error("Cannot parse application package.json; fix its JSON before setup. No application files were changed.");
+  }
+  for (const section of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+    if (Object.keys(manifest[section] ?? {}).some((name) => RETIRED_PLUGIN_PACKAGES.has(name))) migrationRequired();
+  }
+  let config;
+  try {
+    const yaml = createRequire(path.join(directory, "package.json"))("js-yaml");
+    config = yaml.load(fs.readFileSync(path.join(directory, "koishi.yml"), "utf8"));
+  } catch {
+    throw new Error("Cannot parse koishi.yml; ensure valid YAML and js-yaml are available before setup. No application files were changed.");
+  }
+  const seen = new Set();
+  function inspect(plugins) {
+    if (!plugins || typeof plugins !== "object" || Array.isArray(plugins) || seen.has(plugins)) return;
+    seen.add(plugins);
+    for (const [rawKey, value] of Object.entries(plugins)) {
+      const base = rawKey.replace(/^~/, "").split(":")[0];
+      if (RETIRED_PLUGIN_KEYS.has(configKey(base))) migrationRequired();
+      if (base === "group") inspect(value);
+    }
+  }
+  inspect(config?.plugins);
 }
 
 function updateKoishi(plugins) {
@@ -631,6 +675,8 @@ function main() {
     return;
   }
 
+  assertSetupMigrationSafe(appRoot);
+
   if (parsed.pull) {
     ensureMainBranch();
   } else if (!parsed.noPull) {
@@ -679,4 +725,6 @@ function main() {
   }
 }
 
-main();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) bootstrap();
+
+export { collectPluginPackages, packagePathInYesImBot, assertSetupMigrationSafe };

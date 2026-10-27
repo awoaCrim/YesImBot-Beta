@@ -3,6 +3,7 @@ import { Context, icons, redirectTo } from "@koishijs/client";
 import Channels from "./Channels.vue";
 import ConversationDetail from "./ConversationDetail.vue";
 import Home from "./Home.vue";
+import Xiaoheihe from "./Xiaoheihe.vue";
 import YesImBotIcon from "./YesImBotIcon.vue";
 
 icons.register("yesimbot", YesImBotIcon);
@@ -28,7 +29,17 @@ export default function (ctx: Context): void {
     name: "会话浏览",
     icon: "paper-plane",
     order: 950,
+    authority: 4,
     component: Channels,
+  });
+  ctx.page({
+    id: "yesimbot-xiaoheihe",
+    path: "/yesimbot/xiaoheihe",
+    name: "小黑盒活动",
+    icon: "paper-plane",
+    order: 940,
+    authority: 4,
+    component: Xiaoheihe,
   });
   ctx.page({
     id: "yesimbot-conversation",
@@ -37,6 +48,7 @@ export default function (ctx: Context): void {
     icon: "paper-plane",
     order: 950,
     disabled: () => true,
+    authority: 4,
     component: ConversationDetail,
   });
 }

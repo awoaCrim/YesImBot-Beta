@@ -30,6 +30,20 @@ export interface WebSearchOutput {
   error?: SearchToolError;
 }
 
+export interface ImageSearchCandidate {
+  imageUrl: string;
+  sourcePageUrl?: string;
+  title?: string;
+  description?: string;
+}
+
+export interface ImageSearchOutput {
+  provider: string;
+  query: string;
+  results: ImageSearchCandidate[];
+  error?: SearchToolError;
+}
+
 export interface ScrapeResult {
   url: string;
   content?: string;
@@ -46,4 +60,5 @@ export interface SearchBackend {
   readonly name: string;
   createSearchTool(): AgentTool;
   createScrapeTool?(): AgentTool;
+  createImageSearchTool(): AgentTool;
 }

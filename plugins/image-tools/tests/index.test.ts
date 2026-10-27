@@ -4,8 +4,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("koishi", async () => import("@koishijs/core"));
 
 import { detectImageMediaType, RESOURCE_MAX_BYTES } from "../../../core/src/resources/index.js";
-import { PNG_BYTES } from "../../../core/tests/helpers/index.js";
 import { Config, apply } from "../src/index.js";
+import { PNG_BYTES } from "./helpers.js";
 
 type RegisteredChannelAgent = {
   name: string;
@@ -47,6 +47,19 @@ function runtime(config: Record<string, unknown>) {
 }
 
 describe("image-tools configuration", () => {
+  it("groups presentation without nesting or changing the existing configuration", () => {
+    expect(Config.type).toBe("intersect");
+    expect(Config.list?.map((group) => group.meta.description)).toEqual(["启用与连接", "模型选择", "请求限制"]);
+    const previous = { enabled: true, apiKey: "test", baseURL: "https://fixture.invalid/v1", model: "text-model", editModel: "reference-model", timeout: 7 };
+    expect(Config({ ...previous })).toEqual(previous);
+    expect(Config({ apiKey: "test" })).toMatchObject({ enabled: true, apiKey: "test", timeout: 120 });
+    expect(() => Config({ enabled: false } as never)).toThrow();
+  });
+
+  it.each([0, 601])("keeps the existing timeout bounds for %s seconds", (timeout) => {
+    expect(() => Config({ apiKey: "test", model: "image-model", timeout })).toThrow();
+  });
+
   it("defaults to enabled with a bounded timeout", () => {
     const configured = runtime({ apiKey: "test", model: "image-model" });
     expect(configured.normalized).toMatchObject({ enabled: true, model: "image-model", timeout: 120 });
@@ -82,6 +95,52 @@ describe("image-tools registration", () => {
     expect(configured.disposeAgent).toHaveBeenCalledOnce();
   });
 
+  it.each([undefined, "reference-model", "  reference-model  ", " "])("preserves shared credentials and model routing with editModel %s", async (editModel) => {
+    const requests: Array<{ url: string; model: string; authorization: string | null }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof globalThis.fetch>(async (url, init) => {
+        requests.push({ url: String(url), model: JSON.parse(String(init?.body)).model, authorization: new Headers(init?.headers).get("authorization") });
+        return new Response(JSON.stringify({ data: [{ b64_json: Buffer.from(PNG_BYTES).toString("base64") }] }), {
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+    const configured = runtime({
+      apiKey: "test",
+      baseURL: "https://fixture.invalid/v1",
+      model: "text-model",
+      ...(editModel === undefined ? {} : { editModel }),
+      timeout: 7,
+    });
+    const plugin = configured.agent.use.mock.calls[0]?.[0] as RegisteredChannelPlugin;
+    const channel = await plugin.setup({}, {}, { imageProjection: new EphemeralImageProjectionStore() });
+    const tools = channel?.tools() ?? [];
+    const generate = tools.find((tool) => tool.name === "generate_image")!;
+    const edit = tools.find((tool) => tool.name === "edit_image")!;
+    const context = (toolCallId: string) => ({ toolCallId, turnId: "routing", messages: [] }) as never;
+    await expect(generate.execute({ subjectType: "generic", prompt: "a landscape" } as never, context("text"))).resolves.toMatchObject({
+      ok: true,
+      model: "text-model",
+    });
+    const referenceModel = editModel?.trim() || "text-model";
+    await expect(
+      generate.execute(
+        { subjectType: "specific", prompt: "same subject", referenceUris: ["asset://0123456789abcdef0123456789abcdef"] } as never,
+        context("reference"),
+      ),
+    ).resolves.toMatchObject({ ok: true, model: referenceModel });
+    await expect(
+      edit.execute({ uri: "asset://0123456789abcdef0123456789abcdef", prompt: "change background" } as never, context("edit")),
+    ).resolves.toMatchObject({ ok: true, model: referenceModel });
+    expect(requests).toEqual([
+      { url: "https://fixture.invalid/v1/images/generations", model: "text-model", authorization: "Bearer test" },
+      { url: "https://fixture.invalid/v1/images/edits", model: referenceModel, authorization: "Bearer test" },
+      { url: "https://fixture.invalid/v1/images/edits", model: referenceModel, authorization: "Bearer test" },
+    ]);
+    channel?.onTurnFinish?.({}, { turnId: "routing" });
+  });
+
   it("shares a three-output budget across generation and editing, then clears it", async () => {
     const fetch = vi.fn<typeof globalThis.fetch>(
       async () =>
@@ -100,9 +159,9 @@ describe("image-tools registration", () => {
     const edit = tools.find((tool) => tool.name === "edit_image");
     const context = (toolCallId: string) => ({ toolCallId, turnId: "turn-1", abortSignal: undefined, messages: [] }) as never;
 
-    await expect(generate?.execute({ prompt: "one" } as never, context("one"))).resolves.toMatchObject({ ok: true });
+    await expect(generate?.execute({ subjectType: "generic", prompt: "one" } as never, context("one"))).resolves.toMatchObject({ ok: true });
     await expect(edit?.execute({ uri: "artifact://generate_image/source", prompt: "two" } as never, context("two"))).resolves.toMatchObject({ ok: true });
-    await expect(generate?.execute({ prompt: "three" } as never, context("three"))).resolves.toMatchObject({ ok: true });
+    await expect(generate?.execute({ subjectType: "generic", prompt: "three" } as never, context("three"))).resolves.toMatchObject({ ok: true });
     await expect(edit?.execute({ uri: "artifact://generate_image/source", prompt: "four" } as never, context("four"))).resolves.toMatchObject({
       ok: false,
       error: { code: "image_budget_exhausted" },

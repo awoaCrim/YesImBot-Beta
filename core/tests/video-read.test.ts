@@ -7,7 +7,8 @@ import { EphemeralImageProjectionStore, EphemeralVideoProjectionStore } from "@y
 import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("koishi", async () => import("@koishijs/core"));
 import { createReadTool } from "../src/agents/tools.js";
-import { ChannelResources, RESOURCE_MAX_BYTES } from "../src/resources/index.js";
+import { ChannelResources, RESOURCE_MAX_BYTES, VIDEO_MAX_BYTES } from "../src/resources/index.js";
+import * as compression from "../src/resources/video-compression.js";
 import { PNG_BYTES } from "./helpers/index.js";
 import { VIDEO_BYTES, paddedVideo, createVideoPolicy } from "./helpers/video.js";
 
@@ -15,6 +16,7 @@ const roots: string[] = [];
 const stores: EphemeralVideoProjectionStore[] = [];
 afterEach(async () => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   stores.splice(0).forEach((store) => store.clearAll());
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
@@ -32,6 +34,51 @@ async function fixture(enabled = true, native = true, ttlMs = 60_000) {
 }
 
 describe("on-demand same-main video read", () => {
+  it("stages only the compressed derivative and retains the original asset", async () => {
+    const f = await fixture();
+    const original = paddedVideo(VIDEO_MAX_BYTES + 8);
+    const id = await f.resources.assets.put(original);
+    const uri = "asset://" + id;
+    const compress = vi.spyOn(compression, "prepareVideoForModel").mockResolvedValue(VIDEO_BYTES);
+    const result = await f.execute("compressed", "turn", undefined, uri);
+    expect(result).toMatchObject({ videoMode: "native", videoCompressed: true, sourceBytes: original.byteLength });
+    expect(result.text).toContain("压缩版");
+    expect(f.projection.get("compressed")?.bytes).toEqual(VIDEO_BYTES);
+    expect((await f.resources.openVideoAssetStrict(uri)).bytes.byteLength).toBe(original.byteLength);
+    expect((await f.execute("second", "turn", undefined, uri)).error).toBe("video_turn_limit");
+    expect(compress).toHaveBeenCalledOnce();
+  });
+
+  it("refunds a failed compression reservation without staging oversized bytes", async () => {
+    const f = await fixture();
+    const uri = "asset://" + (await f.resources.assets.put(paddedVideo(VIDEO_MAX_BYTES + 8)));
+    vi.spyOn(compression, "prepareVideoForModel")
+      .mockRejectedValueOnce(new compression.VideoCompressionError("video_compression_unavailable"))
+      .mockResolvedValue(VIDEO_BYTES);
+    expect(await f.execute("failed", "turn", undefined, uri)).toMatchObject({ videoMode: "unavailable", error: "video_compression_unavailable" });
+    expect(f.projection.has("failed")).toBe(false);
+    expect(await f.execute("retry", "turn", undefined, uri)).toMatchObject({ videoMode: "native", videoCompressed: true });
+  });
+
+  it("rejects a late compression result after cancellation", async () => {
+    const f = await fixture();
+    const uri = "asset://" + (await f.resources.assets.put(paddedVideo(VIDEO_MAX_BYTES + 8)));
+    let complete!: (bytes: Uint8Array) => void;
+    const compress = vi.spyOn(compression, "prepareVideoForModel").mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          complete = resolve;
+        }),
+    );
+    const controller = new AbortController();
+    const pending = f.execute("cancelled", "turn", controller.signal, uri);
+    await vi.waitFor(() => expect(compress).toHaveBeenCalledOnce());
+    controller.abort();
+    complete(VIDEO_BYTES);
+    expect(await pending).toMatchObject({ videoMode: "unavailable", error: "resource_read_aborted" });
+    expect(f.projection.has("cancelled")).toBe(false);
+  });
+
   it("returns only safe metadata durably, projecting actual file-data for the matching live call", async () => {
     const f = await fixture();
     const result = await f.execute();

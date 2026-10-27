@@ -1,0 +1,30 @@
+{
+  "name": "koishi-plugin-adapter-wechat-local",
+  "version": "0.0.1",
+  "private": true,
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "scripts": {
+    "build": "pkgroll --sourcemap=inline",
+    "check-types": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "koishi": "^4.18.10",
+    "vitest": "^4.0.18"
+  },
+  "peerDependencies": {
+    "@satorijs/core": "^4.6.0",
+    "koishi": "^4.18.10"
+  }
+}

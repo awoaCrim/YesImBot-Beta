@@ -1,3 +1,55 @@
+export interface XiaoheiheActivity {
+  id: string;
+  at: number;
+  kind: string;
+  outcome: "ok" | "failed" | "blocked";
+  postId?: string;
+  title?: string;
+  source?: string;
+  count?: number;
+  errorCode?: string;
+  accountId: string;
+}
+
+export interface XiaoheiheAccountView {
+  accountId: string;
+  connection: "online" | "connecting" | "offline" | "failed" | "disabled" | "unknown";
+  config: {
+    enabled: boolean | null;
+    readOnly: boolean | null;
+    dailyPostLimit: number | null;
+    dailyInteractionLimit: number | null;
+    communities: string[] | null;
+    browseCommunities: string[] | null;
+    candidateTopics: string[] | null;
+  };
+  stateStatus: "ready" | "missing" | "invalid" | "unreadable" | "unsafe" | "too_large";
+  errorCode: string | null;
+  paused: string | null;
+  lastBrowseAt: number | null;
+  watchedPosts: number | null;
+  pendingVisits: number | null;
+  quota: {
+    day: string;
+    postsUsed: number;
+    interactionsUsed: number;
+    postsRemaining: number | null;
+    interactionsRemaining: number | null;
+    pending: number;
+    uncertain: number;
+  } | null;
+  activityStatus: "ready" | "legacy" | "partial" | "unavailable";
+}
+
+export interface XiaoheihePayload {
+  generatedAt: string;
+  status: "ready" | "partial" | "unavailable" | "empty";
+  issues: string[];
+  accounts: XiaoheiheAccountView[];
+  activities: XiaoheiheActivity[];
+  conversations: ConversationIndex | null;
+}
+
 export interface ConversationRequest {
   channel: string;
   session: string;
@@ -26,12 +78,6 @@ export interface ConversationChannelSummary {
   sessions: ConversationSessionSummary[];
   totalSizeBytes: number;
   lastActivityAt: number | null;
-  will: ConversationChannelWill;
-}
-
-export interface ConversationChannelWill {
-  matched: ConversationWillPolicy | null;
-  candidates: ConversationWillPolicy[];
 }
 
 export interface ConversationIndex {
@@ -40,21 +86,6 @@ export interface ConversationIndex {
   totalChannels: number;
   totalSessions: number;
   totalSizeBytes: number;
-  will: ConversationWillSummary;
-}
-
-export interface ConversationWillPolicy {
-  id: string;
-  enabled: boolean;
-  engine: "routing" | "willingness";
-  priority?: number;
-  config?: Record<string, unknown>;
-}
-
-export interface ConversationWillSummary {
-  installed: boolean;
-  defaultLabel: string;
-  policies: ConversationWillPolicy[];
 }
 
 export interface ConversationEntryView {

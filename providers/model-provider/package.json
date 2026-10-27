@@ -1,0 +1,77 @@
+{
+  "name": "koishi-plugin-yesimbot-model-provider",
+  "version": "0.0.1",
+  "description": "Reusable native model-provider connections for YesImBot",
+  "license": "MIT",
+  "contributors": [
+    "MiaowFISH <miaowfish@qq.com>"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YesWeAreBot/YesImBot.git",
+    "directory": "providers/model-provider"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "build": "npx pkgroll --sourcemap=inline",
+    "check-types": "tsc --noEmit",
+    "clean": "rimraf .turbo && rimraf dist && rimraf tsconfig.tsbuildinfo",
+    "fmt": "oxfmt",
+    "lint": "oxlint",
+    "pub": "yarn npm publish --access public",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.0",
+    "@ai-sdk/deepseek": "^2.0.0",
+    "@ai-sdk/google": "^3.0.0",
+    "@ai-sdk/openai": "^3.0.0",
+    "ai": "^6.0.0"
+  },
+  "devDependencies": {
+    "@yesimbot/agent-runtime": "workspace:^",
+    "koishi": "^4.18.10",
+    "koishi-plugin-yesimbot": "workspace:^",
+    "vitest": "^4.0.18",
+    "zod": "^3.25.76"
+  },
+  "peerDependencies": {
+    "@yesimbot/agent-runtime": "workspace:^",
+    "koishi": "^4.18.10",
+    "koishi-plugin-yesimbot": "workspace:^",
+    "zod": "^3.25.76"
+  },
+  "koishi": {
+    "description": {
+      "zh": "统一 OpenAI、Anthropic、Google、DeepSeek 模型接入，支持克隆多个连接",
+      "en": "Reusable native OpenAI, Anthropic, Google and DeepSeek connections"
+    },
+    "yesimbot": {
+      "kind": "provider",
+      "label": "模型接入"
+    },
+    "service": {
+      "required": [
+        "yesimbot"
+      ]
+    }
+  }
+}

@@ -1,5 +1,7 @@
-/** Maximum bytes accepted for one MP4 while the platform source is live. */
-export const VIDEO_MAX_BYTES = 10 * 1024 * 1024;
+/** Maximum MP4 bytes projected into one model request. */
+export const VIDEO_MAX_BYTES = 50 * 1024 * 1024;
+
+export const VIDEO_SOURCE_MAX_BYTES = 200 * 1024 * 1024;
 
 /**
  * MP4-family major brands. Anything else — including QuickTime (`qt  `) and unknown ASCII

@@ -8,8 +8,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("koishi", async () => import("@koishijs/core"));
 
-import { apply as applyAnthropic } from "../../providers/anthropic/src/index.js";
-import { apply as applyGoogle } from "../../providers/google/src/index.js";
+import { apply as applyAnthropic } from "../../providers/model-provider/src/anthropic.js";
+import { apply as applyGoogle } from "../../providers/model-provider/src/google.js";
 import { ModelService, type ChatModelConfig } from "../src/models/index.js";
 
 const roots: string[] = [];

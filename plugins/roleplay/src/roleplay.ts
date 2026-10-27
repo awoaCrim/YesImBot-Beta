@@ -4,7 +4,6 @@ import { createAssistantMessage, createMessageEntry, type AgentPlugin } from "@y
 import type { CBSContext } from "./cbs.js";
 import { renderCBS } from "./cbs.js";
 import { assembleRoleplayPrompts, type RoleplayPromptMaterial } from "./prompt.js";
-import { createVisualReferenceMessage, type VisualReference } from "./visual-reference.js";
 
 export interface RoleplayAgentPluginOptions {
   readonly card: CharacterCardV3;
@@ -18,8 +17,6 @@ export interface RoleplayAgentPluginOptions {
   readonly exampleDialoguesAsHistory?: boolean;
   /** Reuse the channel render already supplied to Core; never rerender random/roll fields. */
   readonly material?: RoleplayPromptMaterial;
-  /** Cached operator-supplied image; request-only and never part of canonical history. */
-  readonly visualReference?: VisualReference;
 }
 
 export function createRoleplayPlugin(options: RoleplayAgentPluginOptions): AgentPlugin {
@@ -33,9 +30,9 @@ export function createRoleplayPlugin(options: RoleplayAgentPluginOptions): Agent
   // Old managed callers need no card render; resolved channel material carries optional history.
   const material: RoleplayPromptMaterial =
     options.material ??
-    (delegate && options.exampleDialoguesAsHistory !== true && !options.visualReference
+    (delegate && options.exampleDialoguesAsHistory !== true
       ? { roleProfile: {}, dialogueHistory: [] }
-      : assembleRoleplayPrompts(options.card, context, options.exampleDialoguesAsHistory === true, options.visualReference !== undefined));
+      : assembleRoleplayPrompts(options.card, context, options.exampleDialoguesAsHistory === true));
   const profile = material.roleProfile;
   const cardSection = [profile.characterDefinition, profile.roleInstructions].filter(Boolean).join("\n\n");
   const greeting = renderCBS(options.greeting, context).text;
@@ -54,16 +51,16 @@ export function createRoleplayPlugin(options: RoleplayAgentPluginOptions): Agent
     plugin.appendSystemPrompt = () => cardSection || undefined;
   }
 
-  const prefix = options.visualReference ? [createVisualReferenceMessage(options.visualReference), ...material.dialogueHistory] : material.dialogueHistory;
-  if (prefix.length > 0) {
-    const prefixObjects = new Set<object>(prefix);
+  if (material.dialogueHistory.length > 0) {
+    const history = material.dialogueHistory;
+    const historyObjects = new Set<object>(history);
     plugin.prepareStep = (messages, context) => {
-      // Rebuilt steps need the same fixed background. Never deduplicate real speech by content.
-      const retained = messages.filter((message) => !prefixObjects.has(message));
-      for (const message of prefix) context.projection?.register(message, { kind: "mandatory", sourceEntryIds: [] });
+      // Rebuilt steps need the same batch. Remove only our own objects, never identical real speech.
+      const retained = messages.filter((message) => !historyObjects.has(message));
+      for (const message of history) context.projection?.register(message, { kind: "mandatory", sourceEntryIds: [] });
       const firstDialogue = retained.findIndex((message) => message.role !== "system");
       const insertion = firstDialogue < 0 ? retained.length : firstDialogue;
-      return [...retained.slice(0, insertion), ...prefix, ...retained.slice(insertion)];
+      return [...retained.slice(0, insertion), ...history, ...retained.slice(insertion)];
     };
   }
 

@@ -8,9 +8,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("koishi", async () => import("@koishijs/core"));
 
 import { ChannelResources, detectImageMediaType, RESOURCE_MAX_BYTES, ResourceReadError } from "../../../core/src/resources/index.js";
-import { PNG_BYTES } from "../../../core/tests/helpers/index.js";
 import { createEditImageTool as createProviderEditImageTool, type EditImageToolOptions } from "../src/image-edit.js";
 import { ImageOutputBudget } from "../src/image-output.js";
+import { PNG_BYTES } from "./helpers.js";
 
 const roots: string[] = [];
 const EDIT_URI = "artifact://edit_image/018f1234-5678-7abc-8def-0123456789ab";
@@ -153,8 +153,8 @@ describe("edit_image tool", () => {
     const resources = new ChannelResources(root);
     const assetId = await resources.assets.put(PNG_BYTES);
     const sourceUri = `asset://${assetId}`;
-    const edit = vi.fn(async ({ sourceDataUrl, prompt }: { sourceDataUrl: string; prompt: string }) => {
-      expect(sourceDataUrl).toBe(`data:image/png;base64,${Buffer.from(PNG_BYTES).toString("base64")}`);
+    const edit = vi.fn(async ({ sourceDataUrls, prompt }: { sourceDataUrls: readonly string[]; prompt: string }) => {
+      expect(sourceDataUrls).toEqual([`data:image/png;base64,${Buffer.from(PNG_BYTES).toString("base64")}`]);
       expect(prompt).toBe("remove the background");
       return { images: [{ uint8Array: PNG_BYTES }] };
     });
@@ -262,6 +262,33 @@ describe("edit_image tool", () => {
     const aborted = abortTool.execute({ uri: "artifact://generate_image/id", prompt: "edit" }, toolContext("abort", controller.signal));
     controller.abort();
     await expect(aborted).resolves.toEqual({ ok: false, error: { code: "aborted", message: "The image request was aborted.", retryable: false } });
+  });
+
+  it("does not report a successful edit canceled during artifact persistence", async () => {
+    const fixture = mockResources();
+    const controller = new AbortController();
+    let finish!: (uri: string) => void;
+    let started!: () => void;
+    const writing = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    fixture.put.mockImplementation(() => {
+      started();
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    });
+    const tool = createEditImageTool({
+      apiKey: "test",
+      timeoutMs: 1000,
+      resources: fixture.resources as never,
+      edit: async () => ({ images: [{ uint8Array: PNG_BYTES }] }),
+    });
+    const pending = tool.execute({ uri: "asset://0123456789abcdef0123456789abcdef", prompt: "edit" }, toolContext("cancel-write", controller.signal));
+    await writing;
+    controller.abort();
+    finish(EDIT_URI);
+    await expect(pending).resolves.toMatchObject({ ok: false, error: { code: "aborted" } });
   });
 
   it("uses one shared three-output budget across generation and editing primitives", async () => {

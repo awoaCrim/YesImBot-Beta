@@ -34,6 +34,7 @@ export interface HostExecConfig {
 
 export interface WorkspacePluginConfig {
   readonly sharedPath?: string;
+  readonly htmlRendererUrl?: string;
   readonly bash?: SandboxBashConfig;
   readonly hostExec?: HostExecConfig;
   readonly skillPaths?: string[];

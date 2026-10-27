@@ -9,7 +9,8 @@
 - [`core/`](../core/) 是 `koishi-plugin-yesimbot`，负责 Koishi 接入、模型注册、Messenger、Channel、Conversation、Agent 和 Runtime。
 - [`packages/agent-runtime/`](../packages/agent-runtime/) 是通用 Agent runtime，负责 turn queue、消息存储、工具执行、插件钩子和运行时事件。
 - [`plugins/`](../plugins/) 是可选 Koishi 插件。插件通过 `ctx.yesimbot.agent.use()`、`agent.will()` 或资源扩展点接入。
-- [`providers/`](../providers/) 是模型 Provider。Provider 通过 AI SDK 创建模型并注册到 Core 的模型服务。
+- [`providers/model-provider/`](../providers/model-provider/) 是统一模型接入插件，按 `type` 选择原生协议，并通过 AI SDK 将每个独立连接注册到 Core；不把协议差异压成一个通用 HTTP 请求。
+- Core 默认对私聊和明确 @ 触发；原可选 `will-policy` 已移除，但通用 Will 扩展、普通消息防抖和主动通知路径保持独立。旧包/配置需按 [迁移说明](setup-koishi.md#模型接入与-will-policy-迁移) 显式处理。
 - [`openspec/`](../openspec/) 保存功能契约和变更说明。实现前先确认对应契约是否已有约束。
 - [`.trellis/`](../.trellis/) 保存任务、项目规范、工作流和研究记录。
 

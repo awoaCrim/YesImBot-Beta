@@ -2224,7 +2224,7 @@ describe("Runtimes identity", () => {
       resolveChatModel: vi.fn((_id: string) => ({
         model: {} as never,
         entry: { modalities: { input: video ? ["text", "video"] : ["text"] } },
-        capabilities: { imageToolResult: "unsupported", videoToolResult: transport },
+        capabilities: { imageToolResult: "unsupported", videoInput: transport },
       })),
     };
     const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root, videoInput: enabled }, new Agents(ctx));

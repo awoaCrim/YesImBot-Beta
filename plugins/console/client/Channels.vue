@@ -42,33 +42,12 @@
       </section>
 
       <section class="yib-will-panel">
-        <div class="yib-will-panel__head">
-          <div class="yib-will-panel__title">
-            <span class="yib-will-panel__icon">
-              <k-icon name="filter"></k-icon>
-            </span>
-            <div>
-              <h2>Will 策略</h2>
-              <p>没安装 will-policy 时也会显示 Core 默认策略；启用插件后这里会展示实例参数。</p>
-            </div>
+        <div class="yib-will-panel__title">
+          <span class="yib-will-panel__icon"><k-icon name="filter"></k-icon></span>
+          <div>
+            <h2>默认触发规则</h2>
+            <p>Core 默认仅对私聊和明确 @ 当前 Bot 的消息触发，其余群消息等待；第三方 Will 插件可覆盖默认规则。</p>
           </div>
-          <span class="yib-refresh-hint">每 10 秒刷新</span>
-        </div>
-        <div class="yib-will-grid">
-          <article v-if="!panel.will.installed" class="yib-will-card">
-            <span class="yib-will-card__engine">默认策略</span>
-            <strong>{{ panel.will.defaultLabel }}</strong>
-            <p>Core 默认 WillEngine：只对私聊和 @ 当前 Bot 的消息触发，其余群消息等待。</p>
-          </article>
-          <article v-for="policy in panel.will.policies" :key="policy.id" class="yib-will-card" :class="{ 'is-disabled': !policy.enabled }">
-            <div class="yib-will-card__row">
-              <span class="yib-will-card__engine">{{ policy.engine === "willingness" ? "意愿值" : "固定规则" }}</span>
-              <span v-if="!policy.enabled" class="yib-tag yib-tag--disabled">未启用</span>
-              <span v-if="policy.priority !== undefined" class="yib-mono">优先级 {{ policy.priority }}</span>
-            </div>
-            <strong>{{ willPolicyTitle(policy) }}</strong>
-            <p>{{ willPolicyDetail(policy) }}</p>
-          </article>
         </div>
       </section>
 
@@ -93,7 +72,6 @@
           <div class="yib-channel-card__meta">
             <span>{{ channel.sessions.length }} 个会话</span>
             <span>{{ formatSize(channel.totalSizeBytes) }}</span>
-            <span>Will · {{ channelWillLabel(channel) }}</span>
             <span v-if="channel.activeSession" class="yib-text-success">活动会话存在</span>
             <span v-else class="yib-text-muted">无活动会话</span>
           </div>
@@ -134,7 +112,7 @@
 import { store } from "@koishijs/client";
 import { computed, ref } from "vue";
 
-import type { ConversationChannelSummary, ConversationIndex, ConversationWillPolicy } from "./types";
+import type { ConversationChannelSummary, ConversationIndex } from "./types";
 
 const panel = computed(() => (store as { yesimbotConversations?: ConversationIndex }).yesimbotConversations ?? emptyIndex());
 
@@ -177,11 +155,6 @@ function channelLabel(channel: ConversationChannelSummary): string {
   return channel.guildId || channel.channelId;
 }
 
-function channelWillLabel(channel: ConversationChannelSummary): string {
-  if (!channel.will.matched) return "默认策略";
-  return channel.will.matched.engine === "willingness" ? "意愿值" : "固定规则";
-}
-
 function typeLabel(type: ConversationChannelSummary["type"]): string {
   if (type === "direct") return "私聊";
   if (type === "guild") return "群聊";
@@ -218,26 +191,7 @@ function emptyIndex(): ConversationIndex {
     totalChannels: 0,
     totalSessions: 0,
     totalSizeBytes: 0,
-    will: { installed: false, defaultLabel: "默认策略：私聊与 @ 触发，普通群聊等待", policies: [] },
   };
-}
-
-function willPolicyTitle(policy: ConversationWillPolicy): string {
-  return policy.engine === "willingness" ? "意愿值引擎" : "固定规则引擎";
-}
-
-function willPolicyDetail(policy: ConversationWillPolicy): string {
-  if (policy.engine === "routing") {
-    const routing = policy.config?.routing as Record<string, unknown> | undefined;
-    if (!routing) return "使用默认 routing 规则。";
-    const direct = routing.direct === "trigger" ? "私聊触发" : "私聊等待";
-    const mention = routing.mention === "trigger" ? " @ 触发" : " @ 等待";
-    const group = routing.group === "trigger" ? "群聊触发" : "群聊等待";
-    return `${direct} ·${mention} · ${group}`;
-  }
-  const willingness = policy.config?.willingness as Record<string, unknown> | undefined;
-  if (!willingness) return "使用默认意愿值参数。";
-  return `阈值 ${String(willingness.probabilityThreshold ?? 55)} · 上限 ${String(willingness.maxScore ?? 100)} · 回复成本 ${String(willingness.replyCost ?? 35)}`;
 }
 </script>
 
@@ -573,14 +527,6 @@ function willPolicyDetail(policy: ConversationWillPolicy): string {
   border: 1px solid var(--k-color-divider);
   border-radius: 8px;
 
-  &__head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 12px;
-    margin-bottom: 12px;
-  }
-
   &__title {
     display: flex;
     align-items: flex-start;
@@ -610,64 +556,6 @@ function willPolicyDetail(policy: ConversationWillPolicy): string {
     border: 1px solid var(--k-color-divider);
     color: var(--k-color-primary, #409eff);
   }
-}
-
-.yib-refresh-hint {
-  flex: 0 0 auto;
-  color: var(--k-text-normal, #666);
-  font-size: 11px;
-}
-
-.yib-will-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 10px;
-}
-
-.yib-will-card {
-  min-width: 0;
-  padding: 12px 14px;
-  border: 1px solid var(--k-color-divider);
-  border-radius: 8px;
-  background: transparent;
-
-  &.is-disabled {
-    opacity: 0.55;
-  }
-
-  &__row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 8px;
-  }
-
-  &__engine {
-    display: inline-flex;
-    padding: 2px 8px;
-    border-radius: 4px;
-    background: var(--k-color-primary, #409eff);
-    color: #fff;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.04em;
-  }
-
-  strong {
-    display: block;
-    font-size: 13px;
-  }
-
-  p {
-    margin: 5px 0 0;
-    color: var(--k-text-normal, #666);
-    font-size: 12px;
-    line-height: 1.5;
-  }
-}
-
-.yib-tag--disabled {
-  color: var(--k-text-normal, #666);
 }
 
 @media screen and (max-width: 900px) {

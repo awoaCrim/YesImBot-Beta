@@ -138,7 +138,9 @@ export default class ChatLearningPlugin {
     this.disposeCommands();
     this.disposeAgentPlugin?.();
     this.logger.debug("chat_learning.start");
-    this.disposeAgentPlugin = this.ctx.yesimbot.agent.use({ setup: (scope, bot) => this.createAgentPlugin({ ...scope, selfId: bot.selfId }) });
+    this.disposeAgentPlugin = this.ctx.yesimbot.agent.use({
+      setup: (scope, bot) => (scope.platform === "xiaoheihe" ? null : this.createAgentPlugin({ ...scope, selfId: bot.selfId })),
+    });
     if (this.config.observeAllChannels) {
       this.observeDispose = this.ctx.middleware(async (session, next) => {
         try {

@@ -1,0 +1,50 @@
+{
+  "name": "koishi-plugin-yesimbot-xiaoheihe",
+  "version": "0.0.1",
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "pkgroll --sourcemap && node --input-type=module -e \"import { copyFileSync } from 'node:fs'; copyFileSync('src/community-mcp.py', 'dist/community-mcp.py');\"",
+    "check-types": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "koishi-plugin-yesimbot-mcp-client": "workspace:^",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@yesimbot/agent-runtime": "workspace:^",
+    "koishi": "^4.18.11",
+    "koishi-plugin-yesimbot": "workspace:^",
+    "vitest": "^4.0.18"
+  },
+  "peerDependencies": {
+    "@satorijs/core": "^4.6.0",
+    "@yesimbot/agent-runtime": "workspace:^",
+    "koishi": "^4.18.11",
+    "koishi-plugin-yesimbot": "workspace:^"
+  },
+  "koishi": {
+    "description": {
+      "zh": "小黑盒平台适配器：独立会话、MCP 接入与受限自主活动"
+    },
+    "service": {
+      "required": [
+        "yesimbot"
+      ]
+    }
+  }
+}

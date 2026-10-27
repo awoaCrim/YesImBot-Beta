@@ -2,19 +2,27 @@ import { AgentTool, jsonSchema } from "@yesimbot/agent-runtime";
 import type { Context, Logger } from "koishi";
 import { Schema } from "koishi";
 
-import type { SearchBackend, SearchRuntimeConfig, WebScrapeOutput, WebSearchOutput } from "../types";
-import { clampLimit, compileBlacklist, dedupeByUrl, filterBlockedResults, normalizeUrlList } from "../utils";
+import type { ImageSearchOutput, SearchBackend, SearchRuntimeConfig, WebScrapeOutput, WebSearchOutput } from "../types";
+import { clampLimit, compileBlacklist, dedupeByUrl, filterBlockedResults, MAX_IMAGE_CANDIDATES, normalizeImageCandidates, normalizeUrlList } from "../utils";
 
-export const tavilyConfigSchema: Schema<TavilyConfig> = Schema.object({
-  apiKey: Schema.string().required().description("Tavily API Key"),
-  searchEndpoint: Schema.string().default("https://api.tavily.com/search").description("Tavily 搜索端点"),
-  extractEndpoint: Schema.string().default("https://api.tavily.com/extract").description("Tavily 提取端点"),
-  searchDepth: Schema.union([Schema.const("basic"), Schema.const("advanced")])
-    .default("basic")
-    .description("搜索深度"),
-  topic: Schema.union([Schema.const("general"), Schema.const("news"), Schema.const("finance")]).description("搜索主题"),
-  timeRange: Schema.union([Schema.const("day"), Schema.const("week"), Schema.const("month"), Schema.const("year")]).description("时间范围"),
-});
+export const tavilyConfigSchema: Schema<TavilyConfig> = Schema.intersect([
+  Schema.object({
+    apiKey: Schema.string().required().description("Tavily 搜索与网页提取共用的 API Key。"),
+    searchEndpoint: Schema.string().default("https://api.tavily.com/search").description("网页搜索与图片搜索共用的完整请求地址。"),
+    extractEndpoint: Schema.string().default("https://api.tavily.com/extract").description("网页正文提取的完整请求地址；不用于参考图片下载。"),
+  }).description("Tavily 连接"),
+  Schema.object({
+    searchDepth: Schema.union([Schema.const("basic"), Schema.const("advanced")])
+      .default("basic")
+      .description("网页与图片搜索的默认深度；网页搜索可在单次调用中覆盖。"),
+    topic: Schema.union([Schema.const("general"), Schema.const("news"), Schema.const("finance")]).description(
+      "仅网页搜索的默认主题；单次调用可覆盖，不影响图片搜索。",
+    ),
+    timeRange: Schema.union([Schema.const("day"), Schema.const("week"), Schema.const("month"), Schema.const("year")]).description(
+      "仅网页搜索的默认时间范围；单次调用可覆盖，不影响图片搜索。",
+    ),
+  }).description("搜索默认行为"),
+]);
 
 const MAX_URLS_PER_SCRAPE = 20;
 
@@ -37,6 +45,21 @@ const scrapeInputSchema = jsonSchema<TavilyScrapeInput>({
   type: "object",
   properties: { urls: { type: "array", items: { type: "string", format: "uri" }, minItems: 1, description: "HTTP or HTTPS URLs to extract." } },
   required: ["urls"],
+});
+
+const imageSearchInputSchema = jsonSchema<TavilyImageSearchInput>({
+  type: "object",
+  properties: {
+    query: {
+      type: "string",
+      minLength: 1,
+      maxLength: 512,
+      pattern: "\\S",
+      description: "Image search query naming the public subject, character, or product.",
+    },
+    limit: { type: "integer", minimum: 1, maximum: MAX_IMAGE_CANDIDATES, description: "Maximum number of image candidates." },
+  },
+  required: ["query"],
 });
 
 type TavilySearchDepth = "basic" | "advanced";
@@ -80,6 +103,16 @@ interface TavilyScrapeInput {
   urls: string[];
 }
 
+interface TavilyImageSearchInput {
+  query: string;
+  limit?: number;
+}
+
+interface TavilyImageEntry {
+  url?: string | null;
+  description?: string | null;
+}
+
 interface TavilySearchResult {
   url: string;
   title: string;
@@ -88,10 +121,12 @@ interface TavilySearchResult {
   raw_content?: string | null;
   favicon?: string | null;
   published_date?: string | null;
+  images?: Array<TavilyImageEntry | string> | null;
 }
 
 interface TavilySearchResponse {
   results?: TavilySearchResult[];
+  images?: Array<TavilyImageEntry | string> | null;
 }
 
 interface TavilyExtractResult {
@@ -124,6 +159,19 @@ class TavilyBackend implements SearchBackend {
 
       inputSchema: searchInputSchema,
       execute: async (input) => this.search(input),
+    };
+  }
+
+  public createImageSearchTool(): AgentTool<TavilyImageSearchInput, ImageSearchOutput> {
+    return {
+      name: "tavily_image_search",
+      description: [
+        "Find publicly hosted image candidates for an identifiable person, character, product, or object.",
+        "Results are candidate clues (image URL, optional source page, title/description), never identity proof.",
+        "Inspect the actual pixels with import_image_reference before using one as a generation reference.",
+      ].join(" "),
+      inputSchema: imageSearchInputSchema,
+      execute: async (input) => this.imageSearch(input),
     };
   }
 
@@ -187,6 +235,48 @@ class TavilyBackend implements SearchBackend {
     }
   }
 
+  private async imageSearch(input: TavilyImageSearchInput): Promise<ImageSearchOutput> {
+    if (!input.query.trim() || input.query.length > 512)
+      return { provider: this.name, query: "", results: [], error: { code: "invalid_query", message: "Provide a public-subject query of 1-512 characters." } };
+    const limit = Math.min(clampLimit(input.limit, this.config.defaultLimit, this.config.maxLimit), MAX_IMAGE_CANDIDATES);
+    const body = {
+      query: input.query,
+      search_depth: this.config.searchDepth,
+      max_results: limit,
+      include_images: true,
+      include_image_descriptions: true,
+    };
+
+    try {
+      const response = await this.ctx.http.post<TavilySearchResponse>(this.config.searchEndpoint, body, {
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.config.apiKey}` },
+        timeout: this.config.timeoutMs,
+      });
+
+      const rawResults = Array.isArray(response.results) ? response.results : [];
+      const topLevel = Array.isArray(response.images) ? response.images : [];
+      const candidates = normalizeImageCandidates(
+        [
+          ...rawResults
+            .slice(0, 16)
+            .flatMap((result) =>
+              Array.isArray(result.images)
+                ? result.images.slice(0, 16).map((image) => ({ ...toImageCandidate(image), sourcePageUrl: result.url, title: result.title }))
+                : [],
+            ),
+          ...topLevel.slice(0, 32).map(toImageCandidate),
+        ],
+        { blacklist: this.blacklist, limit },
+      );
+
+      return { provider: this.name, query: input.query, results: candidates };
+    } catch {
+      const message = "Image search failed. Retry later or ask the user for a reference image.";
+      this.logger.error("[TavilyBackend] Image search failed");
+      return { provider: this.name, query: input.query, results: [], error: { message, code: "request_failed" } };
+    }
+  }
+
   private async scrape(urls: string[]): Promise<WebScrapeOutput> {
     try {
       const response = await this.ctx.http.post<TavilyExtractResponse>(
@@ -236,4 +326,10 @@ export function createTavilyBackend(ctx: Context, config: TavilyConfig | undefin
     },
     logger,
   );
+}
+
+function toImageCandidate(value: unknown) {
+  if (typeof value === "string") return { imageUrl: value };
+  if (!value || typeof value !== "object") return { imageUrl: undefined };
+  return { imageUrl: "url" in value ? value.url : undefined, description: "description" in value ? value.description : undefined };
 }

@@ -85,6 +85,25 @@ async function getTools(plugin: AgentPlugin): Promise<AgentTool[]> {
 }
 
 describe("GlobalBrainPlugin", () => {
+  it("does not expose private digests or immediate shares to the public Xiaoheihe account", async () => {
+    await withTempDir(async (baseDir) => {
+      const { ctx, trigger } = createContext(baseDir);
+      const plugin = new GlobalBrainPlugin(
+        ctx as never,
+        { storageDir: baseDir, maxDigestThreads: 5, maxDigestReplies: 5, maxDigestContentLength: 80 } as never,
+      );
+      await plugin.start();
+      const publicScope = { ...channelScope("account:bot"), platform: "xiaoheihe" };
+      expect(await plugin.setup(publicScope as never, { selfId: "bot" } as never)).toBeNull();
+      expect(ctx.yesimbot.resource.get).not.toHaveBeenCalled();
+      const privatePlugin = await plugin.setup(channelScope("private") as never, { selfId: "bot" } as never);
+      const deposit = (await getTools(privatePlugin!)).find((tool) => tool.name === "brain_deposit")!;
+      await deposit.execute?.({ kind: "share", content: "PRIVATE_CANARY", shareImmediately: true }, {} as never);
+      await Promise.resolve();
+      expect(trigger).not.toHaveBeenCalled();
+      await plugin.stop();
+    });
+  });
   it("loads the custom prompt through the named agent plugin", async () => {
     await withTempDir(async (baseDir) => {
       const { ctx, plugins } = createContext(baseDir);

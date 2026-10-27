@@ -7,7 +7,7 @@ import { ChannelArtifactStore, type ArtifactStore } from "./artifact.js";
 import { ChannelAssetStore, type AssetStore } from "./asset.js";
 import { persistElements as persistInboundElements } from "./input.js";
 import { detectImageMediaType } from "./media.js";
-import { detectVideoMediaType, VIDEO_MAX_BYTES } from "./video-media.js";
+import { detectVideoMediaType, VIDEO_SOURCE_MAX_BYTES } from "./video-media.js";
 
 export const RESOURCE_MAX_BYTES = 5 * 1024 * 1024;
 const COMPLETE_ASSET_ID = /^[a-f0-9]{32}$/;
@@ -122,7 +122,7 @@ export class ChannelResources {
       throw new ResourceReadError("invalid_resource_uri");
     }
     if (signal?.aborted) throw new ResourceReadError("resource_read_aborted");
-    const bytes = await this.readAssetBounded(parsed.hostname, VIDEO_MAX_BYTES, signal);
+    const bytes = await this.readAssetBounded(parsed.hostname, VIDEO_SOURCE_MAX_BYTES, signal);
     if (signal?.aborted) throw new ResourceReadError("resource_read_aborted");
     const mediaType = detectVideoMediaType(bytes);
     if (!mediaType) throw new ResourceReadError("resource_not_video");
@@ -325,7 +325,7 @@ function normalize(value: unknown): ResourceOpenResult {
 export { detectImageMediaType } from "./media.js";
 
 /** Narrow native-video allowance; ordinary readers, images and output stay at RESOURCE_MAX_BYTES. */
-export { detectVideoMediaType, VIDEO_MAX_BYTES } from "./video-media.js";
+export { detectVideoMediaType, VIDEO_MAX_BYTES, VIDEO_SOURCE_MAX_BYTES } from "./video-media.js";
 
 export { type ImageFailureCode, formatImageFailure, imageFailureLabel, isImageFailureCode } from "./image-failure.js";
 

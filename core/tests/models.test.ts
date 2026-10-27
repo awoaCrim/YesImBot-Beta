@@ -213,7 +213,7 @@ describe("models.json modalities", () => {
 
     expect(service.resolveChatModel("openai:gpt-4o").capabilities).toEqual({
       imageToolResult: "unknown",
-      videoToolResult: "unknown",
+      videoInput: "unknown",
       historyProjection: "default",
     });
   });
@@ -227,7 +227,7 @@ describe("models.json modalities", () => {
 
     expect(service.resolveChatModel("openai:gpt-4o").capabilities).toEqual({
       imageToolResult: "unsupported",
-      videoToolResult: "unknown",
+      videoInput: "unknown",
       historyProjection: "default",
     });
     expect(provider.chatCapabilities).toHaveBeenCalledWith("gpt-4o");
@@ -242,11 +242,11 @@ describe("models.json modalities", () => {
   ])("normalizes explicit video transport %s without inferring from image support", async (declared, expected) => {
     const provider: ModelProvider = {
       ...createProviderWithImage(),
-      chatCapabilities: vi.fn(() => ({ imageToolResult: "native", videoToolResult: declared }) as never),
+      chatCapabilities: vi.fn(() => ({ imageToolResult: "native", videoInput: declared }) as never),
     };
     const service = await createModelService({}, undefined, provider);
     const resolved = service.resolveChatModel("openai:gpt-4o");
-    expect(resolved.capabilities.videoToolResult).toBe(expected);
+    expect(resolved.capabilities.videoInput).toBe(expected);
     expect(resolved.capabilities.imageToolResult).toBe("native");
   });
 

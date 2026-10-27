@@ -63,7 +63,7 @@ Core MUST provide the Agent's current-Bot send tool with an explicit channel ID.
 
 ### Requirement: Delivery-Confirmed Will Reservation
 
-Tool completion MUST NOT by itself confirm a willingness reservation. Core MUST confirm only on the first `send_message.onDelivered` callback for the producing turn, current conversation channel, and a non-empty platform message ID. At least one successful segment commits even when a later segment fails. Empty ID arrays, all-failed sends, cross-channel delivery, and model text without a send MUST leave the turn unconfirmed so its terminal path releases the reservation.
+Tool completion MUST NOT by itself confirm an optional Will reservation. Core MUST confirm only on the first `send_message.onDelivered` callback for the producing turn, current conversation channel, and a non-empty platform message ID. At least one successful segment commits even when a later segment fails. Empty ID arrays, all-failed sends, cross-channel delivery, and model text without a send MUST leave the turn unconfirmed so its terminal path releases the reservation.
 
 #### Scenario: Partial send
 

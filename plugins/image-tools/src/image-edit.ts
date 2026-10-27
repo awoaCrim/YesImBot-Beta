@@ -1,8 +1,10 @@
 import { EphemeralImageProjectionStore, jsonSchema, type AgentTool } from "@yesimbot/agent-runtime";
-import { ResourceReadError, type ChannelResources } from "koishi-plugin-yesimbot";
+import type { ChannelResources } from "koishi-plugin-yesimbot";
 
 import {
+  classifySourceFailure,
   extensionFor,
+  isImageSourceUri,
   ImageCancellationError,
   ImageOutputBudget,
   IMAGE_PROMPT_MAX_LENGTH,
@@ -13,6 +15,7 @@ import {
   type ImageToolResources,
   type ImageToolResult,
 } from "./image-output.js";
+import { createOpenAIImageEditor, ImageEditTransportError, type ImageEditor, type ImageEditResponse } from "./image-transport.js";
 
 const INPUT_SCHEMA = jsonSchema<EditImageInput>({
   type: "object",
@@ -32,8 +35,6 @@ const INPUT_SCHEMA = jsonSchema<EditImageInput>({
 
 export type EditImageToolResult = ImageToolResult;
 
-export type ImageEditor = (options: ImageEditRequest) => Promise<ImageEditResponse>;
-
 export interface EditImageToolOptions {
   readonly baseURL?: string;
   readonly apiKey: string;
@@ -51,31 +52,11 @@ interface EditImageInput {
   readonly prompt: string;
 }
 
-interface ImageEditRequest {
-  readonly sourceDataUrl: string;
-  readonly prompt: string;
-  readonly abortSignal: AbortSignal;
-}
-
-interface ImageEditResponse {
-  readonly images: readonly { readonly uint8Array: Uint8Array }[];
-  readonly totalImages?: number;
-}
-
-class ImageEditTransportError extends Error {
-  public constructor(
-    public readonly code: "provider_error" | "content_refused" | "empty_result" | "invalid_image" | "image_too_large",
-    public readonly retryable: boolean,
-  ) {
-    super(code);
-  }
-}
-
 export function createEditImageTool(options: EditImageToolOptions): AgentTool<EditImageInput, EditImageToolResult> {
   const writer = options.resources.artifacts.forTool("edit_image");
   const imageProjection = options.imageProjection ?? new EphemeralImageProjectionStore();
   const budget = options.budget ?? new ImageOutputBudget();
-  const edit = options.edit ?? createOpenAIImageEditor(options);
+  const edit = options.edit ?? createOpenAIImageEditor({ ...options, maxBytes: options.resources.maxBytes });
 
   return {
     name: "edit_image",
@@ -93,7 +74,7 @@ export function createEditImageTool(options: EditImageToolOptions): AgentTool<Ed
       if (!budget.reserve(execution.turnId)) return imageToolFailure("image_budget_exhausted");
       let committed = false;
       try {
-        if (!input.uri.startsWith("asset://") && !input.uri.startsWith("artifact://")) return imageToolFailure("invalid_source_uri");
+        if (!isImageSourceUri(input.uri)) return imageToolFailure("invalid_source_uri");
         let opened: Awaited<ReturnType<ChannelResources["openStrict"]>>;
         try {
           opened = await options.resources.openStrict(input.uri, execution.abortSignal);
@@ -110,7 +91,7 @@ export function createEditImageTool(options: EditImageToolOptions): AgentTool<Ed
             signal: execution.abortSignal,
             operation: (abortSignal) =>
               edit({
-                sourceDataUrl: `data:${source.mediaType};base64,${Buffer.from(source.bytes).toString("base64")}`,
+                sourceDataUrls: [`data:${source.mediaType};base64,${Buffer.from(source.bytes).toString("base64")}`],
                 prompt: input.prompt.trim(),
                 abortSignal,
               }),
@@ -126,12 +107,14 @@ export function createEditImageTool(options: EditImageToolOptions): AgentTool<Ed
         const validated = validateImageBytes(image.uint8Array, options.resources);
         if ("error" in validated) return imageToolFailure(validated.error);
         const filename = `edited-1.${extensionFor(validated.mediaType)}`;
+        if (execution.abortSignal?.aborted) return imageToolFailure("aborted");
         let uri: string;
         try {
           uri = await writer.put(validated.bytes, { mediaType: validated.mediaType, filename });
         } catch {
-          return imageToolFailure("artifact_write_failed");
+          return imageToolFailure(execution.abortSignal?.aborted ? "aborted" : "artifact_write_failed");
         }
+        if (execution.abortSignal?.aborted) return imageToolFailure("aborted");
         committed = true;
         imageProjection.stage({
           toolCallId: execution.toolCallId,
@@ -143,7 +126,17 @@ export function createEditImageTool(options: EditImageToolOptions): AgentTool<Ed
         return {
           ok: true,
           model: options.modelId,
-          images: [{ uri, mediaType: validated.mediaType, filename, byteLength: validated.bytes.byteLength }],
+          images: [
+            {
+              uri,
+              mediaType: validated.mediaType,
+              filename,
+              byteLength: validated.bytes.byteLength,
+              width: validated.width,
+              height: validated.height,
+              orientation: validated.orientation,
+            },
+          ],
           sendMessageMarkup: [`<img src="${uri}"/>`],
           warnings: (edited.totalImages ?? edited.images.length) > 1 ? ["The provider returned multiple images; only the first was saved."] : [],
         };
@@ -153,113 +146,4 @@ export function createEditImageTool(options: EditImageToolOptions): AgentTool<Ed
     },
     toModelOutput: ({ toolCallId, output }) => imageToolModelOutput(imageProjection, toolCallId, output),
   };
-}
-
-function createOpenAIImageEditor(options: EditImageToolOptions): ImageEditor {
-  const endpoint = `${(options.baseURL ?? "https://api.openai.com/v1").replace(/\/+$/, "")}/images/edits`;
-  const fetch = options.fetch ?? globalThis.fetch;
-  return async ({ sourceDataUrl, prompt, abortSignal }) => {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: { authorization: `Bearer ${options.apiKey}`, "content-type": "application/json" },
-      body: JSON.stringify({
-        model: options.modelId,
-        prompt,
-        images: [{ image_url: sourceDataUrl }],
-        n: 1,
-        response_format: "b64_json",
-      }),
-      signal: abortSignal,
-    });
-    const maxResponseBytes = Math.ceil(options.resources.maxBytes / 3) * 4 + 65_536;
-    const text = await readBoundedResponseText(response, maxResponseBytes);
-    if (!response.ok) {
-      if (containsContentRefusal(text)) throw new ImageEditTransportError("content_refused", false);
-      throw new ImageEditTransportError("provider_error", response.status === 429 || response.status >= 500);
-    }
-    let value: unknown;
-    try {
-      value = JSON.parse(text);
-    } catch {
-      throw new ImageEditTransportError("provider_error", false);
-    }
-    const data = isRecord(value) && Array.isArray(value.data) ? value.data : [];
-    if (data.length === 0) throw new ImageEditTransportError("empty_result", true);
-    const encoded = readImageBase64(data[0]);
-    const bytes = decodeBase64(encoded, options.resources.maxBytes);
-    return { images: [{ uint8Array: bytes }], totalImages: data.length };
-  };
-}
-
-async function readBoundedResponseText(response: Response, maxBytes: number): Promise<string> {
-  if (!response.body) return "";
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let totalBytes = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      totalBytes += value.byteLength;
-      if (totalBytes > maxBytes) {
-        await reader.cancel().catch(() => undefined);
-        throw new ImageEditTransportError("image_too_large", false);
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  return Buffer.concat(chunks, totalBytes).toString("utf8");
-}
-
-function classifySourceFailure(cause: unknown): EditImageToolResult {
-  const code =
-    cause instanceof ResourceReadError
-      ? cause.code
-      : cause instanceof Error && cause.constructor.name === "ResourceReadError" && isRecord(cause) && typeof cause.code === "string"
-        ? cause.code
-        : undefined;
-  switch (code) {
-    case "invalid_resource_uri":
-      return imageToolFailure("invalid_source_uri");
-    case "resource_not_found":
-      return imageToolFailure("source_not_found");
-    case "resource_too_large":
-      return imageToolFailure("source_too_large");
-    case "resource_read_aborted":
-      return imageToolFailure("aborted");
-    case "timeout":
-      return imageToolFailure("timeout");
-    default:
-      return imageToolFailure("source_read_failed");
-  }
-}
-
-function readImageBase64(value: unknown): string {
-  if (!isRecord(value)) throw new ImageEditTransportError("invalid_image", true);
-  if (typeof value.b64_json === "string" && value.b64_json.length > 0) return value.b64_json;
-  if (typeof value.url === "string") {
-    const match = /^data:image\/[a-z0-9.+-]+;base64,([a-z0-9+/=]+)$/i.exec(value.url);
-    if (match?.[1]) return match[1];
-  }
-  throw new ImageEditTransportError("empty_result", true);
-}
-
-function decodeBase64(value: string, maxBytes: number): Uint8Array {
-  if (value.length > Math.ceil(maxBytes / 3) * 4 + 4) throw new ImageEditTransportError("image_too_large", false);
-  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
-    throw new ImageEditTransportError("invalid_image", true);
-  }
-  const bytes = new Uint8Array(Buffer.from(value, "base64"));
-  if (bytes.byteLength > maxBytes) throw new ImageEditTransportError("image_too_large", false);
-  return bytes;
-}
-
-function containsContentRefusal(value: string): boolean {
-  return /content[ _-]?policy|safety|moderation|refus(?:e|ed|al)|blocked|disallowed|unsafe/i.test(value.slice(0, 4096));
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }

@@ -190,3 +190,5 @@ function collectSecretValues(headers: Record<string, string>): string[] {
     return bearer?.[1] ? [value, bearer[1]] : [value];
   });
 }
+
+export type { McpServer } from "./types.js";

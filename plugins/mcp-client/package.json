@@ -12,6 +12,11 @@
       "types": "./dist/index.d.ts",
       "require": "./dist/index.cjs"
     },
+    "./transports": {
+      "types": "./dist/transports.d.ts",
+      "import": "./dist/transports.js",
+      "require": "./dist/transports.cjs"
+    },
     "./package.json": "./package.json"
   },
   "publishConfig": {

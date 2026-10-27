@@ -20,7 +20,7 @@ _让 AI 更像人类，让聊天更有温度_
 
 ## Features
 
-- **会看气氛的群聊机器人** — 不只会回复 @：能根据关键词、引用、图片和当前场景决定是加入、等待还是沉默。
+- **明确触发、按需回复** — 默认处理私聊与明确 @ 当前机器人的消息，普通群聊等待；模型仍可静默结束，定时任务与插件主动通知保持独立。
 - **多模型即插即用** — 接入 OpenAI、Anthropic、DeepSeek、Google 等模型，在配置里选一个聊天模型就能开始使用。
 - **可选长期记忆** — 安装 MemOS 或全局脑插件后，机器人可以记住跨会话的偏好、事实和经历。
 - **能做事而不只是聊天** — 通过工作区、搜索、MCP、OneBot 工具等插件，机器人可以处理文件、联网查资料、调用外部服务和群管理工具。
@@ -121,7 +121,7 @@ allowedChannels:
 
 #### 模型思考等级
 
-四个内置 Provider（Google、OpenAI、Anthropic、DeepSeek）支持在各自的 `chatModels` 模型行上配置统一的思考等级。等级固定为：
+统一模型接入插件支持 Google、OpenAI、Anthropic、DeepSeek 四种原生协议，可在每个连接的 `chatModels` 模型行上配置统一的思考等级。等级固定为：
 
 `off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`
 
@@ -176,14 +176,13 @@ OneBot Translator 内置于 `koishi-plugin-yesimbot`，通过同一 PlatformTran
 
 ### LLM Provider
 
-| Provider  | 包名                                         |
-| --------- | -------------------------------------------- |
-| OpenAI    | `@yesimbot/koishi-plugin-provider-openai`    |
-| Anthropic | `@yesimbot/koishi-plugin-provider-anthropic` |
-| DeepSeek  | `@yesimbot/koishi-plugin-provider-deepseek`  |
-| Google    | `@yesimbot/koishi-plugin-provider-google`    |
+| 插件     | 包名                                    | 协议                                |
+| -------- | --------------------------------------- | ----------------------------------- |
+| 模型接入 | `koishi-plugin-yesimbot-model-provider` | OpenAI、Anthropic、Google、DeepSeek |
 
-Provider 不绑定具体厂商：OpenAI Provider 可通过 `baseURL` 接入任意 OpenAI-compatible API；各 Provider 支持克隆多开，只需保证实例 `id` 唯一。
+启用 `yesimbot-model-provider`，通过 `type` 选择协议；每个克隆实例配置一个连接，并保持 `id` 唯一。OpenAI 类型也可通过 `baseURL` 接入 OpenAI-compatible API，其他类型保留各自原生 SDK 能力。配置字段与默认值见 [模型接入说明](providers/model-provider/README.md)。
+
+旧的四个 Provider 插件需要显式迁移，保留原来的 `id` 即可维持模型引用不变；接入脚本不会自动覆盖旧配置，详见[迁移步骤](docs/setup-koishi.md#模型接入与-will-policy-迁移)。
 
 ## Architecture
 

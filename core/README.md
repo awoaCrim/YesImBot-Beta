@@ -101,19 +101,36 @@ current model call; history is never re-requested from a platform API. Set
 `imageInput: false` to disable projection.
 
 Native QQ group/private video messages are opt-in with `videoInput: true`. Core
-persists one valid MP4 of at most 10 MiB per input persistence call in a separate
+persists one valid MP4 original of at most 200 MiB per input persistence call in a separate
 pool (image/text limits stay unchanged), strips platform transport URLs, and renders
 its exact asset URI in both ordinary and image-enabled current/quoted input. Video
-is not attached eagerly: `read` supplies the original file to the same main model
+is not attached eagerly: `read` supplies video to the same main model
 only when its explicit input modalities include `video` and the provider declares
-`videoToolResult: "native"`. Unknown/unsupported transport fails closed; no vision
+`videoInput: "native"`. Unknown/unsupported transport fails closed; no vision
 model, separate summary or frame-extraction fallback is used.
 
-The Google provider defaults `videoToolResultSupport` to `unknown`. Operators must
-opt their existing verified native-video route into `native` and add `video` to the
-selected main model override in `models.json`, preserving all other modalities and
-model settings. See [activation instructions](../docs/setup-koishi.md#qq-原生视频读取).
-This source change does not modify production configuration or select another model.
+The Google adapter declares native video input automatically and projects each live
+video into the owning user message's top-level media parts, not inside
+`functionResponse.parts`. The `read` result remains paired with its tool call, and no
+extra user record or model call is created. Core `videoInput` is the only feature
+switch; the selected model must still declare `video` input in `models.json`.
+Model modalities describe capabilities, not another enablement switch. This source
+change does not modify production configuration or select another model.
+
+Model input is capped at 50 MiB. Originals within that cap pass through unchanged
+and do not require external media tools. Larger originals are compressed only when
+`read` requests them; the original asset stays unchanged. Compression requires
+`ffmpeg` with H.264/AAC support and `ffprobe` on the Koishi process's `PATH`. It
+preserves the full main-video duration and primary audio, while lowering resolution,
+frame rate or bitrate as needed. Default tracks are preferred and cover art is
+excluded; without defaults it selects the longest video and first audio track. The tool receipt marks `videoCompressed: true` and
+reports `sourceBytes`; it never claims that the compressed bytes are the original.
+
+One encoder runs at a time, with a 120-second deadline including queue time. Child
+processes receive local private copies, never transport URLs; cancellation kills
+the process and temporary files are removed after success or failure. A missing
+executable, invalid output, lost audio/duration or output still above 50 MiB fails
+closed. Oversized originals are never sent to the model as a fallback.
 
 Only one successful native video read is admitted per turn, independent of TTL or
 call-id reuse. The original file remains in the scoped immutable assets store;
@@ -121,7 +138,11 @@ raw request payloads are ephemeral and removed from durable/replayed chat histor
 Timeout, abort, missing/expired projection and unsupported content produce explicit
 failures. Audio is retained in the file but audio recognition is not promised. The
 byte cap is not a duration/token guarantee, and upstream codec/context limits still
-apply. Web links, generic-file MP4 attachments and other containers are out of scope.
+apply. Reference OAuth-route probes accepted 10 and 50 MiB and rejected 100 MiB
+with HTTP 413. These used a three-second synthetic MP4 with valid `free`-box
+padding: they verify transport sizes, not arbitrary long-video processing or an
+exact upstream maximum. Web links, generic-file MP4 attachments and other
+containers are out of scope.
 
 ## Prompt composition
 

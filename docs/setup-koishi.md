@@ -165,10 +165,7 @@ node scripts/setup-koishi.mjs --create-app ../new-koishi --start
 plugins:
   group:yesimbot:
     yesimbot: {}
-    ~@yesimbot/provider-openai: {}
-    ~@yesimbot/provider-anthropic: {}
-    ~@yesimbot/provider-deepseek: {}
-    ~@yesimbot/provider-google: {}
+    ~yesimbot-model-provider: {}
     ~yesimbot-mcp-client: {}
     ~yesimbot-onebot-utils: {}
     ~yesimbot-schedule: {}
@@ -180,7 +177,7 @@ plugins:
 
 - 主插件 `yesimbot` 默认启用。
 - provider 和扩展插件默认以 `~` 禁用。
-- 禁用项也需要使用 Koishi 可识别的短名，例如 `yesimbot-workspace` 或 `@yesimbot/provider-openai`，不能写成 `koishi-plugin-` 完整包名。
+- 禁用项也需要使用 Koishi 可识别的短名，例如 `yesimbot-workspace` 或 `yesimbot-model-provider`，不能写成 `koishi-plugin-` 完整包名。
 - 如果已有配置中已经存在同名插件，脚本不会重复添加。
 
 ## 运行前的配置
@@ -188,9 +185,68 @@ plugins:
 启动 Koishi 后，在控制台启用至少一个 provider，并填写 API Key：
 
 1. 打开 Koishi 控制台。
-2. 启用 `@yesimbot/koishi-plugin-provider-openai` 或其它 provider。
-3. 填写 API Key 和模型列表。
-4. 给 `yesimbot.chatModel` 选择一个模型。
+2. 启用 `yesimbot-model-provider`，通过 `type` 选择 OpenAI、Anthropic、Google 或 DeepSeek。
+3. 填写独立的连接 `id`、API Key 和模型列表；多个连接使用克隆实例，每个 `id` 必须唯一。
+4. 给 `yesimbot.chatModel` 选择一个模型；模型完整引用仍为 `id:modelId`。
+
+## 模型接入与 will-policy 迁移
+
+这是源码包集合变化，不会自动修改已有应用或替换活动 Runtime。升级前备份应用配置与依赖清单，逐个迁移后再由运维安排激活；不要直接把它当作普通部署。
+
+| 旧 Koishi 配置键 | 新配置键 | 新增字段 |
+| --- | --- | --- |
+| `@yesimbot/provider-openai` | `yesimbot-model-provider` | `type: openai` |
+| `@yesimbot/provider-anthropic` | `yesimbot-model-provider` | `type: anthropic` |
+| `@yesimbot/provider-google` | `yesimbot-model-provider` | `type: google` |
+| `@yesimbot/provider-deepseek` | `yesimbot-model-provider` | `type: deepseek` |
+
+每个旧实例对应一个新克隆实例，保留原来的实例后缀、启用/禁用标记、`$filter`、`$label` 和所有连接、模型及协议选项。`id` 未显式配置时应沿用旧协议的默认 ID；不要把它改成插件名，也不要让新旧实例同时注册同一个 ID。
+
+例如下面的禁用 Google 连接：
+
+```yaml
+"~@yesimbot/provider-google:google-instance":
+  id: google-line
+  apiKey: "YOUR_GOOGLE_API_KEY"
+  baseURL: https://example.invalid/v1beta
+  $label: Google 连接
+  $filter:
+    channelId: example-room
+  chatModels:
+    - id: gemini-2.5-flash
+      toolCall: true
+      reasoning: true
+      thinkingLevel: high
+  embeddingModels: []
+  videoToolResultSupport: unknown
+```
+
+迁移后替换配置键、增加 `type`，并移除 Google 的 `videoToolResultSupport`；新版视频投影不再需要第二个提供商开关，其余有效字段原样保留：
+
+```yaml
+"~yesimbot-model-provider:google-instance":
+  type: google
+  id: google-line
+  apiKey: "YOUR_GOOGLE_API_KEY"
+  baseURL: https://example.invalid/v1beta
+  $label: Google 连接
+  $filter:
+    channelId: example-room
+  chatModels:
+    - id: gemini-2.5-flash
+      toolCall: true
+      reasoning: true
+      thinkingLevel: high
+  embeddingModels: []
+```
+
+因此 `google-line:gemini-2.5-flash`、`models.json` 的别名/覆盖以及主模型、辅助模型、视觉模型和额度路由的引用都不需要改名。其他显式选项（如图片 MIME、思考映射、OpenAI 格式与图片结果位置）也必须原样复制。
+
+应用依赖清单中删除旧的四个 `@yesimbot/koishi-plugin-provider-*` 包，改为 `koishi-plugin-yesimbot-model-provider: workspace:^`，使用 Yarn 更新应用依赖。移除所有启用、禁用和克隆的 `yesimbot-will-policy` 配置，以及 `koishi-plugin-yesimbot-will-policy` 应用依赖；旧 `willingness.json` 不需要删除或迁移。
+
+移除该插件后，Core 默认仅对私聊和明确 @ 当前 Bot 的消息触发；普通群消息、单纯引用、图片和拍一拍不单独触发。定时任务、插件主动通知、第三方 Will 扩展及历史 Will 日志仍保留。已创建的 Runtime 需要通过正常生命周期替换后才使用新策略。
+
+接入脚本仅发现根 `package.json` 声明的工作区，不扫描快照或构建副本。若发现旧配置（包括嵌套分组、禁用项和克隆）或旧应用依赖，会在应用文件修改、安装和启动前停止并提示迁移，不会替你清理或改写它们。生产发布的工作区变更保护保持不变，后续部署仍需单独批准。
 
 ## 会话压缩片段
 

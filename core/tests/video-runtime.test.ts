@@ -6,7 +6,10 @@ import { join } from "node:path";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { Context } from "@koishijs/core";
 import { EphemeralVideoProjectionStore } from "@yesimbot/agent-runtime";
+import { wrapLanguageModel } from "ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { googleVideoInputMiddleware } from "../../providers/model-provider/src/google.js";
 vi.mock("koishi", async () => import("@koishijs/core"));
 import { Channel } from "../src/channels/index.js";
 import { ChannelRuntime } from "../src/runtimes/channel.js";
@@ -49,7 +52,10 @@ async function fixture(mode: "native" | "unavailable" = "native", enabled = true
       { headers: { "content-type": "text/event-stream" } },
     );
   });
-  const model = createGoogleGenerativeAI({ apiKey: "test", baseURL: "https://fixture.invalid/v1beta", fetch }).chat("gemini-3.8-flash-high");
+  const model = wrapLanguageModel({
+    model: createGoogleGenerativeAI({ apiKey: "test", baseURL: "https://fixture.invalid/v1beta", fetch }).chat("gemini-3.8-flash-high"),
+    middleware: googleVideoInputMiddleware,
+  });
   const projection = new EphemeralVideoProjectionStore();
   const runtime = new ChannelRuntime(new Context(), {
     channel,
@@ -83,13 +89,17 @@ function responses(request: Request) {
 }
 
 function nativeResponse(request: Request, id: string) {
-  const response = responses(request).find((part) => part.id === id && part.parts?.length);
+  const response = responses(request).find((part) => part.id === id);
   expect(response).toBeDefined();
-  expect(response?.parts).toHaveLength(1);
-  expect(response!.parts![0]!.inlineData.mimeType).toBe("video/mp4");
-  expect(createHash("sha256").update(Buffer.from(response!.parts![0]!.inlineData.data, "base64")).digest("hex")).toBe(
-    createHash("sha256").update(VIDEO_BYTES).digest("hex"),
-  );
+  expect(response?.parts).toBeUndefined();
+  const media = request.contents
+    .filter((content) => content.role === "user")
+    .flatMap((content) => content.parts)
+    .filter((part) => "inlineData" in part);
+  expect(media).toHaveLength(1);
+  const video = media[0]!.inlineData as { mimeType: string; data: string };
+  expect(video.mimeType).toBe("video/mp4");
+  expect(createHash("sha256").update(Buffer.from(video.data, "base64")).digest("hex")).toBe(createHash("sha256").update(VIDEO_BYTES).digest("hex"));
 }
 
 describe("actual ChannelRuntime native video admission and lifecycle", () => {

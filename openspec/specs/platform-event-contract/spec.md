@@ -34,7 +34,7 @@ Core MUST keep using current Satori-shaped resources where they are explicitly p
 
 ### Requirement: Typed Poke Identity
 
-The `notice.poke` variant MUST expose optional `actorId` and required `targetId`. OneBot MUST populate `actorId` from `user_id` and `targetId` from `target_id`. Consumers MUST NOT infer actor or target identity from rendered `text`. Missing actor identity MUST remain representable for compatibility and MUST fail closed for willingness batch admission.
+The `notice.poke` variant MUST expose optional `actorId` and required `targetId`. OneBot MUST populate `actorId` from `user_id` and `targetId` from `target_id`. Consumers MUST NOT infer actor or target identity from rendered `text`. Missing actor identity MUST remain representable and MUST fail closed when an optional batch consumer requires an identified actor.
 
 #### Scenario: OneBot targeted poke
 

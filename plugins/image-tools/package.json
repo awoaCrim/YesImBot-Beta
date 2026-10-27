@@ -44,7 +44,8 @@
   },
   "dependencies": {
     "@ai-sdk/openai": "^3.0.0",
-    "ai": "^6.0.0"
+    "ai": "^6.0.0",
+    "image-size": "^2.0.2"
   },
   "devDependencies": {
     "@yesimbot/agent-runtime": "workspace:^",

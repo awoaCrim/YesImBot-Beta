@@ -11,8 +11,8 @@ vi.mock("koishi", async () => import("@koishijs/core"));
 
 import { createSendMessageTool } from "../../../core/src/agents/tools.js";
 import { ChannelResources, detectImageMediaType, RESOURCE_MAX_BYTES } from "../../../core/src/resources/index.js";
-import { PNG_BYTES } from "../../../core/tests/helpers/index.js";
 import { createGenerateImageTool } from "../src/image-generation.js";
+import { PNG_BYTES } from "./helpers.js";
 
 const MODEL_ID = "configured-image-model";
 const ARTIFACT_URI = "artifact://generate_image/018f1234-5678-7abc-8def-0123456789ab";
@@ -36,9 +36,10 @@ function createTool(overrides: Record<string, unknown> = {}) {
   const generate = vi.fn(async () => ({ images: [{ uint8Array: PNG_BYTES, mediaType: "image/png" }] }));
   const put = vi.fn(async () => ARTIFACT_URI);
   const forTool = vi.fn(() => ({ put }));
-  const resources = { artifacts: { forTool }, maxBytes: RESOURCE_MAX_BYTES, detectImageMediaType };
+  const resources = { artifacts: { forTool }, maxBytes: RESOURCE_MAX_BYTES, detectImageMediaType, openStrict: vi.fn(async () => ({ bytes: PNG_BYTES })) };
   const imageProjection = new EphemeralImageProjectionStore();
   const tool = createGenerateImageTool({
+    apiKey: "test",
     imageModel: imageModel as never,
     modelId: MODEL_ID,
     timeoutMs: 120_000,
@@ -56,7 +57,7 @@ afterEach(async () => {
 });
 
 describe("generate_image tool", () => {
-  it("exposes only prompt and orientation, generates one bounded image, and returns artifact metadata only", async () => {
+  it("declares subject grounding, generates one bounded image, and returns measured artifact metadata", async () => {
     const { tool, imageModel, generate, put, forTool } = createTool();
 
     expect(tool.name).toBe("generate_image");
@@ -70,9 +71,9 @@ describe("generate_image tool", () => {
     for (const forbidden of ["quality", "seed", "style", "fallback", "model", "n", "channel", "referenceUri", "sourceUri", "prototype", "search"])
       expect(schema).not.toContain(`"${forbidden}"`);
     expect(tool.description).not.toContain("原型图");
-    expect(tool.description).not.toContain("图片搜索");
+    expect(tool.description).toContain("图片搜索");
 
-    const result = await tool.execute({ prompt: "  A quiet lake at dawn  ", orientation: "landscape" }, toolContext());
+    const result = await tool.execute({ subjectType: "generic", prompt: "  A quiet lake at dawn  ", orientation: "landscape" }, toolContext());
 
     expect(generate).toHaveBeenCalledOnce();
     expect(generate).toHaveBeenCalledWith({
@@ -88,15 +89,28 @@ describe("generate_image tool", () => {
     expect(result).toEqual({
       ok: true,
       model: MODEL_ID,
-      images: [{ uri: ARTIFACT_URI, mediaType: "image/png", filename: "generated-1.png", byteLength: PNG_BYTES.byteLength }],
+      images: [
+        {
+          uri: ARTIFACT_URI,
+          mediaType: "image/png",
+          filename: "generated-1.png",
+          byteLength: PNG_BYTES.byteLength,
+          width: 1,
+          height: 1,
+          orientation: "square",
+        },
+      ],
+      referenceInput: { includedInRequest: false, uris: [] },
+      requestedOrientation: "landscape",
+      orientationMatches: false,
       sendMessageMarkup: [`<img src="${ARTIFACT_URI}"/>`],
-      warnings: [],
+      warnings: ["Requested orientation landscape, but received square (1x1). Inspect and regenerate or disclose the mismatch before sending."],
     });
     expect(JSON.stringify(result)).not.toContain(Buffer.from(PNG_BYTES).toString("base64"));
     expect(JSON.stringify(result)).not.toContain("A quiet lake at dawn");
     expect(tool.description).toContain("必须先实际查看");
     expect(tool.description).toContain("每轮合计最多输出 3 张图片");
-    const projected = await tool.toModelOutput!({ toolCallId: "generate-1", input: { prompt: "fixture" }, output: result });
+    const projected = await tool.toModelOutput!({ toolCallId: "generate-1", input: { subjectType: "generic", prompt: "fixture" }, output: result });
     expect(projected.type).toBe("content");
     if (projected.type !== "content") throw new Error("expected generated image projection");
     const image = projected.value.find((part) => part.type === "image-data");
@@ -112,7 +126,7 @@ describe("generate_image tool", () => {
       ],
     }));
     const { tool, put } = createTool({ generate });
-    const result = await tool.execute({ prompt: "fixture" }, toolContext());
+    const result = await tool.execute({ subjectType: "generic", prompt: "fixture" }, toolContext());
     expect(put).toHaveBeenCalledOnce();
     expect(result).toMatchObject({
       ok: true,
@@ -126,7 +140,7 @@ describe("generate_image tool", () => {
     ["portrait", "1024x1536"],
   ] as const)("maps orientation %s to size %s", async (orientation, size) => {
     const { tool, generate } = createTool();
-    await tool.execute({ prompt: "fixture", ...(orientation === undefined ? {} : { orientation }) }, toolContext());
+    await tool.execute({ subjectType: "generic", prompt: "fixture", ...(orientation === undefined ? {} : { orientation }) }, toolContext());
     expect(generate).toHaveBeenCalledWith(expect.objectContaining({ size }));
   });
 
@@ -138,7 +152,7 @@ describe("generate_image tool", () => {
     ] as const) {
       const generate = vi.fn(async () => ({ images }));
       const { tool, put } = createTool({ generate });
-      await expect(tool.execute({ prompt: "fixture" }, toolContext())).resolves.toMatchObject({ ok: false, error: { code } });
+      await expect(tool.execute({ subjectType: "generic", prompt: "fixture" }, toolContext())).resolves.toMatchObject({ ok: false, error: { code } });
       expect(put).not.toHaveBeenCalled();
     }
   });
@@ -152,9 +166,10 @@ describe("generate_image tool", () => {
         artifacts: { forTool: () => ({ put }) },
         maxBytes: RESOURCE_MAX_BYTES,
         detectImageMediaType,
+        openStrict: vi.fn(async () => ({ bytes: PNG_BYTES })),
       },
     });
-    const result = await tool.execute({ prompt: "fixture" }, toolContext());
+    const result = await tool.execute({ subjectType: "generic", prompt: "fixture" }, toolContext());
 
     expect(result).toEqual({ ok: false, error: { code: "artifact_write_failed", message: "The image could not be saved.", retryable: true } });
     expect(JSON.stringify(result)).not.toContain("/secret/channel/path");
@@ -195,7 +210,7 @@ describe("generate_image tool", () => {
         throw cause;
       });
       const { tool } = createTool({ generate });
-      const result = await tool.execute({ prompt: "secret prompt" }, toolContext());
+      const result = await tool.execute({ subjectType: "generic", prompt: "secret prompt" }, toolContext());
       expect(result).toEqual({ ok: false, error: expected });
       expect(JSON.stringify(result)).not.toMatch(/sk-secret|secret prompt|fixture\.invalid|responseBody/i);
       expect(JSON.stringify(result).length).toBeLessThan(240);
@@ -206,7 +221,7 @@ describe("generate_image tool", () => {
     vi.useFakeTimers();
     const generate = vi.fn(() => new Promise(() => undefined));
     const { tool } = createTool({ generate, timeoutMs: 50 });
-    const pending = tool.execute({ prompt: "fixture" }, toolContext());
+    const pending = tool.execute({ subjectType: "generic", prompt: "fixture" }, toolContext());
 
     await vi.advanceTimersByTimeAsync(51);
 
@@ -222,7 +237,7 @@ describe("generate_image tool", () => {
       const generate = vi.fn(() => new Promise(() => undefined));
       const { tool } = createTool({ generate });
       if (abortBefore) controller.abort(new Error("cancelled"));
-      const pending = tool.execute({ prompt: "fixture" }, toolContext(controller.signal));
+      const pending = tool.execute({ subjectType: "generic", prompt: "fixture" }, toolContext(controller.signal));
       if (!abortBefore) controller.abort(new Error("cancelled"));
 
       await expect(pending).resolves.toEqual({ ok: false, error: { code: "aborted", message: "The image request was aborted.", retryable: false } });
@@ -241,6 +256,7 @@ describe("generate_image tool", () => {
     const resources = new ChannelResources(root);
     const imageModel = { specificationVersion: "v3", provider: "fixture", modelId: MODEL_ID };
     const tool = createGenerateImageTool({
+      apiKey: "test",
       imageModel: imageModel as never,
       modelId: MODEL_ID,
       timeoutMs: 1000,
@@ -248,7 +264,7 @@ describe("generate_image tool", () => {
       generate: async () => ({ images: [{ uint8Array: PNG_BYTES, mediaType: "image/png" }] }),
     });
 
-    const result = await tool.execute({ prompt: "fixture" }, toolContext());
+    const result = await tool.execute({ subjectType: "generic", prompt: "fixture" }, toolContext());
     if (!result.ok) throw new Error(result.error.code);
     expect(JSON.stringify(result)).not.toContain(Buffer.from(PNG_BYTES).toString("base64"));
 
@@ -294,6 +310,7 @@ describe("OpenAI-compatible image request contract", () => {
     const client = createOpenAI({ apiKey: "test", baseURL: "https://fixture.invalid/v1", fetch });
     const put = vi.fn(async () => ARTIFACT_URI);
     const tool = createGenerateImageTool({
+      apiKey: "test",
       imageModel: client.image(MODEL_ID),
       modelId: MODEL_ID,
       timeoutMs: 1000,
@@ -301,10 +318,13 @@ describe("OpenAI-compatible image request contract", () => {
         artifacts: { forTool: () => ({ put }) } as never,
         maxBytes: RESOURCE_MAX_BYTES,
         detectImageMediaType,
+        openStrict: vi.fn(async () => ({ bytes: PNG_BYTES })),
       },
     });
 
-    await expect(tool.execute({ prompt: "fixture prompt", orientation: "portrait" }, toolContext())).resolves.toMatchObject({ ok: true });
+    await expect(tool.execute({ subjectType: "generic", prompt: "fixture prompt", orientation: "portrait" }, toolContext())).resolves.toMatchObject({
+      ok: true,
+    });
 
     expect(request?.url).toBe("https://fixture.invalid/v1/images/generations");
     expect(request?.body).toEqual({ model: MODEL_ID, prompt: "fixture prompt", n: 1, size: "1024x1536", response_format: "b64_json" });

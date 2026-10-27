@@ -10,6 +10,7 @@ import type { ChannelResources, ChannelContext, ResourceReader } from "koishi-pl
 import { createBashToolSet } from "./bash-tool";
 import { createHostRunner, type HostRunner } from "./host-engine";
 import { createHostExecTool } from "./host-tool";
+import { createHtmlRenderTool } from "./html-render";
 import { normalizeMounts, type NormalizedMountSpec } from "./mounts";
 import { formatHostExecPrompt, formatWorkspacePrompt } from "./prompt";
 import { formatSkillsForPrompt, loadSkills, type Skill } from "./skills";
@@ -28,6 +29,7 @@ export default class WorkspacePlugin {
 
   public static Config: Schema<WorkspacePluginConfig> = Schema.object({
     sharedPath: Schema.path({ allowCreate: true }).description("所有频道共用的工作区宿主路径；留空时按频道隔离"),
+    htmlRendererUrl: Schema.string().description("独立 HTML-to-PNG 渲染服务的 HTTP(S) 地址；配置后提供 render_html 图片工具，不操作桌面"),
     bash: Schema.object({
       cwd: Schema.string().default("/home/workspace").description("虚拟文件系统默认目录"),
       mounts: Schema.array(
@@ -173,6 +175,7 @@ export default class WorkspacePlugin {
       name: "workspace",
       tools: async () => {
         const tools = await createBashToolSet(await this.getOrCreateWorkspace(resources, sandbox, runtimeMounts));
+        if (this.config.htmlRendererUrl) tools.push(createHtmlRenderTool(this.config.htmlRendererUrl, resources));
         if (hostExecPotentiallyAllowed && hostRunner) {
           tools.push(createHostExecTool({ runner: hostRunner, defaultTimeoutMs: hostExecConfig?.timeoutMs ?? 60000 }));
         }

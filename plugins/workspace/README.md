@@ -7,6 +7,7 @@ Workspace tools for YesImBot agents, backed by `just-bash` and `bash-tool`.
 - `bash`: run supported Unix-style commands in a `just-bash` virtual sandbox.
 - `readFile`: read a known file from the virtual workspace.
 - `writeFile`: write a complete file into the virtual workspace.
+- `render_html`: render static HTML into a channel-scoped PNG artifact when `htmlRendererUrl` is configured; it does not operate the user desktop or send a message.
 - `hostExec`: optionally run a real Bash command in the isolated Anon Linux guest over a pinned SSH connection, but only for an explicit allowlist match. A `userId` rule also works in groups by matching the current sender; a channel-only rule authorizes that channel. This is disabled by default and is an operations entry point.
 
 The default writable workspace is channel-isolated. On channel initialization
@@ -31,6 +32,8 @@ tool-name-specific prompts to use `bash`, `readFile`, and `writeFile`.
 | `timeoutMs`     | Bash command timeout in milliseconds. Default: `30000`.                                                                              |
 | `enableNetwork` | Enables `just-bash` network support. Default: `false`.                                                                               |
 | `hostExec`      | Optional allowlist-scoped Anon Linux guest command capability; disabled by default and requires the guest SSH key/known-host mounts. |
+
+Set `htmlRendererUrl` to the isolated renderer endpoint, such as `http://renderer.internal/render`. The renderer must disable scripts and external resource requests. Use the returned `sendMessageMarkup` as the `text` of one `send_message.parts` item with `kind: "text"` and default element mode to deliver the image; a render result is not a delivery receipt.
 
 Without `sharedPath`, the writable workspace root comes from
 `ChannelResources.path`. With `sharedPath`, the configured path is resolved

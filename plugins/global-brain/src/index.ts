@@ -73,6 +73,8 @@ export default class GlobalBrainPlugin {
   }
 
   public async setup(scope: ChannelContext, bot: Bot): Promise<AgentPlugin | null> {
+    // Public social accounts must not receive private cross-chat digests or broadcasts.
+    if (scope.platform === "xiaoheihe") return null;
     this.scopes.set(scopeKey(scope), { scope, selfId: bot.selfId });
     const resources = await this.ctx.yesimbot.resource.get(scope);
     return this.createAgentPlugin(scope, resources);

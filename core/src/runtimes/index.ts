@@ -491,13 +491,9 @@ export function resolveReadImagePolicy(primary: ChatModelRef, vision: ChatModelR
   return { mode: "unavailable" };
 }
 
-/**
- * Native video admission gate, kept entirely separate from the image policy: the configured flag,
- * the primary model's `video` input modality and an explicit native video-tool-result transport
- * must all hold. Unknown/unsupported declarations and every auxiliary/vision route fail closed.
- */
+// Model modalities and adapter transport are capabilities, not additional operator switches.
 export function resolveReadVideoPolicy(primary: ChatModelRef, videoInput: boolean): Pick<ReadVideoPolicy, "mode"> {
-  const native = videoInput && (primary.entry.modalities?.input?.includes("video") ?? false) && primary.capabilities.videoToolResult === "native";
+  const native = videoInput && (primary.entry.modalities?.input?.includes("video") ?? false) && primary.capabilities.videoInput === "native";
   return { mode: native ? "native" : "unavailable" };
 }
 

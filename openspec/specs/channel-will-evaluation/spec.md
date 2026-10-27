@@ -2,22 +2,22 @@
 
 ## Purpose
 
-Define passive participation decisions, optional whole-batch willingness, reservation settlement, and the trusted active-post bypass.
+Define default passive participation, optional third-party Will capabilities, reservation settlement, and the trusted active-post bypass. The bundled routing/willingness policy plugin has been removed; its scoring, decay, keyword, and persistence settings are not Core configuration.
 
 ## Requirements
 
 ### Requirement: Fixed Core Will Selection
 
-Core MUST provide one fixed default WillEngine. Without a matching WillPlugin, a new ChannelRuntime MUST use that default. The default MUST trigger direct messages and explicit current-Bot mentions, and MUST wait for ordinary shared messages and non-message Events.
+Core MUST provide one fixed default WillEngine. Without a matching WillPlugin, a new ChannelRuntime MUST use that default. The default MUST trigger direct messages and explicit current-Bot mentions, and MUST wait for ordinary shared messages and non-message Events. Quotes, images, @all/@here, and mentions of other Bots MUST NOT independently trigger the default.
 
 #### Scenario: No Will plugin matches
 
 - **WHEN** Core creates a Runtime without a matching WillPlugin
-- **THEN** the fixed default MUST trigger a direct message and wait for an ordinary shared message
+- **THEN** the fixed default MUST trigger a direct message or explicit current-Bot mention and wait for other ordinary shared inputs
 
 ### Requirement: Optional Will Capabilities
 
-`WillEngine.decide(input, state)` remains required. Core MAY consume these optional capabilities without requiring legacy engines to change:
+`WillEngine.decide(input, state)` remains required. Core MAY consume these optional capabilities without requiring single-input engines to change:
 
 ```ts
 interface WillEngine {
@@ -28,96 +28,47 @@ interface WillEngine {
 }
 ```
 
-A routing engine, the Core default, and a third-party single-input engine MUST keep their existing ordered `decide()` behavior.
+Core MUST retain registration, priority selection, scope matching, disposal, and the existing ordered decide path. Removing a bundled implementation MUST NOT remove these third-party extension contracts or historical decision/debug records.
 
-#### Scenario: Legacy engine omits batch methods
+#### Scenario: Engine omits batch methods
 
 - **WHEN** a third-party WillEngine implements only `decide()`
 - **THEN** Core MUST continue calling that method in the existing ordered path
 
-### Requirement: Per-Conversation Per-Author State
+### Requirement: Default Will and Debounce
 
-Highest-candidate willingness MUST isolate state by ChannelResources path, Bot `selfId`, and author ID. Every batch input MUST update only its own author. No score may leak between conversations, Bots, or participants.
+Ordinary messages MUST retain their configured trailing-edge debounce. A batch MUST keep its existing per-input decision ordering and addressed-trigger request selection. Under the default Will engine, non-message events MUST NOT enter or refresh the message batch timer merely because a controller supports targeted poke.
 
-#### Scenario: Two authors share one batch
+#### Scenario: Mention followed by ordinary chatter
 
-- **WHEN** two authors contribute inputs to the same conversation batch
-- **THEN** each base gain MUST update only that author's state
+- **WHEN** a debounce batch contains a triggering current-Bot mention followed by an ordinary shared message
+- **THEN** Core MUST still trigger from the addressed request rather than silently replacing it with the waiting chatter
 
-### Requirement: Approved Batch Scoring
+### Requirement: Optional Reservation Settlement
 
-Highest-candidate mode MUST process the whole snapshot in chronological order using clamped input timestamps. For every accepted Message or targeted poke it MUST apply base interaction gain to confirmed state. Keyword matching MUST use NFKC, locale-independent lowercase, collapsed whitespace, and current-body text with quote/reply subtrees and persisted quote contents excluded.
+When an optional engine returns a reservation, Core MUST correlate it with the deferred turn. The first current-conversation send_message.onDelivered carrying a non-empty platform message ID MUST commit it. Partial delivery commits. Cross-channel delivery, zero IDs, tool success without delivery, or model text alone MUST NOT commit.
 
-Images, `@all`, and `@here` MUST receive no extra directed gain. A group quote receives `quoteGain` only when `quote.author.id === selfId`; no text/message-ID/isBot inference is allowed. A poke author MUST come from typed `actorId` and MUST target `selfId`.
-
-Direct, current-Bot mention, self quote, and targeted poke gains MUST remain temporary. When several directed signals occur for one author, the candidate MUST use their maximum rather than their sum.
-
-#### Scenario: Message contains several directed signals
-
-- **WHEN** one participant directly addresses, mentions, and quotes the current Bot in the same batch
-- **THEN** its candidate MUST use only the strongest configured directed gain
-- **AND** confirmed state MUST not persist that temporary gain
-
-### Requirement: Highest Candidate and Single Sampling
-
-After accumulating every author, Will MUST compute candidate score from confirmed base minus held reservation amount plus the strongest temporary directed gain. An author with any unresolved reservation MUST be ineligible for another reservation but MUST continue accumulating base gains. Will MUST select by highest score, then latest relevant timestamp, then latest input order, and call the random source exactly once for the winner.
-
-A batch MUST return at most one reservation and Core MUST start at most one deferred turn. No non-winning author may be charged.
-
-#### Scenario: Two candidates exceed threshold
-
-- **WHEN** two participants are eligible to trigger in one snapshot
-- **THEN** Will MUST sample only the deterministically highest candidate
-- **AND** Core MUST start at most one deferred turn
-
-### Requirement: Strict Half-Life Mode
-
-`decayMode: half-life` MUST use:
-
-```text
-score(t) = score(t0) × 2^(-(t - t0) / decayHalfLifeSeconds)
-```
-
-The approved profile uses `decayHalfLifeSeconds: 600`. The old hot/warm weighted decay remains the default for legacy configurations.
-
-#### Scenario: One half-life elapses
-
-- **WHEN** 600 seconds elapse from a score of 80 under the approved half-life mode
-- **THEN** the decayed score MUST be 40 before the next gain
-
-### Requirement: Reservation Before Start
-
-A triggering batch MUST durably create one reservation before returning trigger. `amount` MUST be `min(replyCost, availableBase)` and creation MUST not subtract confirmed score. Persistence failure MUST prevent Agent start.
-
-Core MUST correlate the reservation with the independent deferred turn. The first current-conversation `send_message.onDelivered` carrying a non-empty platform message ID MUST commit it. Partial delivery commits. Cross-channel delivery, zero IDs, tool success without delivery, or model text alone MUST not commit.
-
-Terminal done without delivery, failed, aborted, consume failure, and start failure MUST release. Settlement MUST be idempotent; delivery observed before a later failing terminal event wins.
+Terminal done without delivery, failed, aborted, consume failure, and start failure MUST release. Repeated or late settlement MUST preserve the existing idempotency and delivery-first behavior. The optional engine owns its state/persistence; Core MUST NOT introduce a bundled willingness state store.
 
 #### Scenario: Turn completes silently
 
 - **WHEN** a reserved turn reaches its terminal state without a current-conversation delivery ID
-- **THEN** Core MUST release the reservation without subtracting reply cost
+- **THEN** Core MUST release the reservation
 
 ### Requirement: Active Post Bypass
 
-`ctx.yesimbot.messenger.post()` MUST bypass Will decisions and reservations while retaining the normal FIFO, Agent, tool, delivery, and archive paths.
+`ctx.yesimbot.messenger.post()` MUST bypass Will decisions and reservations while retaining the normal FIFO, Agent, tool, delivery, and archive paths. Passive policy retirement MUST NOT remove schedule/plugin-initiated active notifications or weaken their independent delivery permissions.
 
 #### Scenario: Trusted active post
 
-- **WHEN** an authorized caller invokes `messenger.post()` with triggering enabled
-- **THEN** Core MUST start the active path without calling `decide()` or `decideBatch()`
+- **WHEN** an authorized caller invokes messenger.post() with triggering enabled
+- **THEN** Core MUST start the active path without calling decide() or decideBatch()
 
-### Requirement: Legacy Configuration Compatibility
+### Requirement: Explicit Retirement Boundary
 
-Existing willingness users MUST default to `batchDecision: per-input`, `decayMode: weighted`, and `persistState: false`. Routing MUST ignore willingness state. Switching back to routing MUST leave any willingness state file inert rather than deleting or applying it.
+Existing deployments MUST explicitly remove old will-policy configuration and dependencies before activation. Source changes MUST NOT silently rewrite operator configuration, delete willingness state, or pretend that an existing Runtime snapshot has already switched engines.
 
-#### Scenario: Existing willingness configuration is loaded
+#### Scenario: Old configuration remains
 
-- **WHEN** an existing configuration omits all new willingness options
-- **THEN** it MUST retain per-input weighted in-memory behavior
-
-### Requirement: Routing Rollback Isolation
-Configuration validation for willingness-only fields MUST run only when `engine: willingness` is active. Selecting `engine: routing` MUST NOT initialize, validate, read, or mutate retained willingness state.
-#### Scenario: Routing retains a stale willingness block
-- **WHEN** configuration selects routing and an unused willingness block is invalid under current willingness rules
-- **THEN** routing MUST still initialize and remain usable as the rollback switch
+- **WHEN** setup detects an enabled, disabled, cloned, or nested retired plugin entry or application dependency
+- **THEN** setup MUST stop with a migration hint before changing application files or installing/starting the application

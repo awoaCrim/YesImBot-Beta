@@ -69,6 +69,6 @@ export { createThinkingLevelMapSchema, getSupportedThinkingLevels, resolveThinki
 
 export { hasCompletedImageRead } from "./agents/image-read-evidence.js";
 
-export { detectImageMediaType, ResourceReadError, RESOURCE_MAX_BYTES } from "./resources/index.js";
+export { ResourceReadError, RESOURCE_MAX_BYTES } from "./resources/index.js";
 
 export type * from "./resources/index.js";
